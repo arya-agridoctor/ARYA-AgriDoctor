@@ -90,12 +90,14 @@ class AryaHomePage extends StatelessWidget {
         title: Text(title),
         subtitle: Text(subtitle),
         trailing: const Icon(Icons.arrow_forward_ios),
-        onTap: () => _openPage(
-          context,
-          title,
-          subtitle,
-          icon,
-        ),
+        onTap: () {
+          _openPage(
+            context,
+            title,
+            subtitle,
+            icon,
+          );
+        },
       ),
     );
   }
@@ -159,4 +161,5 @@ class AryaModulePage extends StatelessWidget {
         ),
       ),
     );
- 
+  }
+}
