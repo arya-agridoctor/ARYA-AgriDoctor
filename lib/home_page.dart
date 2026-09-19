@@ -3,6 +3,24 @@ import 'package:flutter/material.dart';
 class AryaHomePage extends StatelessWidget {
   const AryaHomePage({super.key});
 
+  void _openPage(
+    BuildContext context,
+    String title,
+    String description,
+    IconData icon,
+  ) {
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => AryaModulePage(
+          title: title,
+          description: description,
+          icon: icon,
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -14,45 +32,45 @@ class AryaHomePage extends StatelessWidget {
         children: [
           _menuItem(
             context,
-            icon: Icons.agriculture,
-            title: 'مزرعه و زمین',
-            subtitle: 'مدیریت زمین‌ها و اطلاعات کشت',
+            Icons.agriculture,
+            'مزرعه و زمین',
+            'مدیریت زمین‌ها و اطلاعات کشت',
           ),
           _menuItem(
             context,
-            icon: Icons.cloud,
-            title: 'آب‌وهوا',
-            subtitle: 'بررسی شرایط جوی و هشدارها',
+            Icons.cloud,
+            'آب‌وهوا',
+            'بررسی شرایط جوی و هشدارها',
           ),
           _menuItem(
             context,
-            icon: Icons.science,
-            title: 'خاک و آزمایشگاه',
-            subtitle: 'ثبت و تحلیل آزمایش خاک',
+            Icons.science,
+            'خاک و آزمایشگاه',
+            'ثبت و تحلیل آزمایش خاک',
           ),
           _menuItem(
             context,
-            icon: Icons.water_drop,
-            title: 'آبیاری',
-            subtitle: 'برنامه‌ریزی و یادآوری آبیاری',
+            Icons.water_drop,
+            'آبیاری',
+            'برنامه‌ریزی و یادآوری آبیاری',
           ),
           _menuItem(
             context,
-            icon: Icons.bug_report,
-            title: 'آفات و بیماری‌ها',
-            subtitle: 'شناسایی و مدیریت آفات و بیماری‌ها',
+            Icons.bug_report,
+            'آفات و بیماری‌ها',
+            'شناسایی و مدیریت آفات و بیماری‌ها',
           ),
           _menuItem(
             context,
-            icon: Icons.eco,
-            title: 'کود و تغذیه',
-            subtitle: 'مدیریت کوددهی و تغذیه گیاه',
+            Icons.eco,
+            'کود و تغذیه',
+            'مدیریت کوددهی و تغذیه گیاه',
           ),
           _menuItem(
             context,
-            icon: Icons.support_agent,
-            title: 'پشتیبانی',
-            subtitle: 'راهنما و ارتباط با پشتیبانی',
+            Icons.support_agent,
+            'پشتیبانی',
+            'راهنما و ارتباط با پشتیبانی',
           ),
         ],
       ),
@@ -60,11 +78,11 @@ class AryaHomePage extends StatelessWidget {
   }
 
   Widget _menuItem(
-    BuildContext context, {
-    required IconData icon,
-    required String title,
-    required String subtitle,
-  }) {
+    BuildContext context,
+    IconData icon,
+    String title,
+    String subtitle,
+  ) {
     return Card(
       margin: const EdgeInsets.only(bottom: 12),
       child: ListTile(
@@ -72,8 +90,73 @@ class AryaHomePage extends StatelessWidget {
         title: Text(title),
         subtitle: Text(subtitle),
         trailing: const Icon(Icons.arrow_forward_ios),
-        onTap: () {},
+        onTap: () => _openPage(
+          context,
+          title,
+          subtitle,
+          icon,
+        ),
       ),
     );
   }
 }
+
+class AryaModulePage extends StatelessWidget {
+  final String title;
+  final String description;
+  final IconData icon;
+
+  const AryaModulePage({
+    super.key,
+    required this.title,
+    required this.description,
+    required this.icon,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(
+        title: Text(title),
+      ),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(
+                icon,
+                size: 80,
+              ),
+              const SizedBox(height: 24),
+              Text(
+                title,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 26,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+              const SizedBox(height: 12),
+              Text(
+                description,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 17,
+                ),
+              ),
+              const SizedBox(height: 30),
+              const Text(
+                'ARYA AgriDoctor',
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+ 
