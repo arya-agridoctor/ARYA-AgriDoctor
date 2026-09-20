@@ -1908,3 +1908,209 @@ if __name__ == "__main__":
         port=int(os.getenv("PORT", "8000")),
         reload=False
     )
+# ============================================================
+# ARYA AgriDoctor - Dynamic Wallet & Payment API
+# ============================================================
+
+from fastapi import APIRouter, Header, HTTPException
+from typing import Optional
+
+from wallet_service import (
+    initialize_wallet_tables,
+    add_wallet,
+    deactivate_wallet,
+    list_active_wallets,
+    create_payment_intent,
+    get_payment_intent,
+    mark_payment_verified,
+    secure_compare,
+)
+
+initialize_wallet_tables()
+
+wallet_router = APIRouter(
+    prefix="/wallets",
+    tags=["Dynamic Wallets"],
+)
+
+
+def _check_owner_secret(
+    owner_secret: Optional[str],
+) -> None:
+    expected = os.getenv("ARYA_MASTER_SECRET", "").strip()
+
+    if not expected:
+        raise HTTPException(
+            status_code=503,
+            detail="Owner security is not configured.",
+        )
+
+    if not owner_secret or not secure_compare(
+        owner_secret,
+        expected,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Owner authorization failed.",
+        )
+
+
+@wallet_router.get("/active")
+def get_active_wallets(
+    currency: Optional[str] = None,
+    network: Optional[str] = None,
+):
+    return {
+        "ok": True,
+        "wallets": list_active_wallets(
+            currency=currency,
+            network=network,
+        ),
+    }
+
+
+@wallet_router.post("/owner/add")
+def owner_add_wallet(
+    currency: str,
+    network: str,
+    address: str,
+    label: Optional[str] = None,
+    x_owner_secret: Optional[str] = Header(
+        default=None,
+        alias="X-Owner-Secret",
+    ),
+):
+    _check_owner_secret(x_owner_secret)
+
+    try:
+        wallet_id = add_wallet(
+            currency=currency,
+            network=network,
+            address=address,
+            label=label,
+        )
+
+        return {
+            "ok": True,
+            "wallet_id": wallet_id,
+            "message": "Wallet added successfully.",
+        }
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+
+@wallet_router.post("/owner/{wallet_id}/deactivate")
+def owner_deactivate_wallet(
+    wallet_id: int,
+    x_owner_secret: Optional[str] = Header(
+        default=None,
+        alias="X-Owner-Secret",
+    ),
+):
+    _check_owner_secret(x_owner_secret)
+
+    success = deactivate_wallet(wallet_id)
+
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail="Wallet not found.",
+        )
+
+    return {
+        "ok": True,
+        "wallet_id": wallet_id,
+        "message": "Wallet deactivated.",
+    }
+
+
+@wallet_router.post("/payment-intent")
+def create_wallet_payment_intent(
+    user_id: Optional[int],
+    currency: str,
+    network: str,
+    amount: str,
+):
+    try:
+        payment = create_payment_intent(
+            user_id=user_id,
+            currency=currency,
+            network=network,
+            amount=amount,
+        )
+
+        return {
+            "ok": True,
+            "payment": payment,
+        }
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+
+@wallet_router.get("/payment-intent/{payment_id}")
+def get_wallet_payment_intent(
+    payment_id: int,
+):
+    payment = get_payment_intent(payment_id)
+
+    if payment is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Payment intent not found.",
+        )
+
+    return {
+        "ok": True,
+        "payment": payment,
+    }
+
+
+@wallet_router.post("/owner/payment/{payment_id}/verify")
+def owner_verify_wallet_payment(
+    payment_id: int,
+    transaction_id: str,
+    provider: Optional[str] = None,
+    verification_reference: Optional[str] = None,
+    x_owner_secret: Optional[str] = Header(
+        default=None,
+        alias="X-Owner-Secret",
+    ),
+):
+    _check_owner_secret(x_owner_secret)
+
+    try:
+        success = mark_payment_verified(
+            payment_id=payment_id,
+            transaction_id=transaction_id,
+            provider=provider,
+            verification_reference=verification_reference,
+        )
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        )
+
+    if not success:
+        raise HTTPException(
+            status_code=404,
+            detail="Payment intent not found.",
+        )
+
+    return {
+        "ok": True,
+        "payment_id": payment_id,
+        "status": "verified",
+    }
+
+
+app.include_router(wallet_router)
