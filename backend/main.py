@@ -7,19 +7,20 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from pydantic import BaseModel, Field
 
 
 # ============================================================
 # ARYA AgriDoctor Backend
-# Backend Foundation
+# Stage 2 - Security / Authentication
 # ============================================================
 
 APP_NAME = "ARYA AgriDoctor Backend"
 APP_VERSION = "1.0.0"
 
 DATABASE = os.getenv("ARYA_DATABASE", "arya.db")
+
 MASTER_EMAIL = os.getenv("ARYA_MASTER_EMAIL", "")
 MASTER_SECRET = os.getenv("ARYA_MASTER_SECRET", "")
 
@@ -32,9 +33,23 @@ DEVICE_LIMIT = int(os.getenv("ARYA_DEVICE_LIMIT", "3"))
 AI_INPUT_COST_PER_1M = float(
     os.getenv("AI_INPUT_COST_PER_1M", "0")
 )
+
 AI_OUTPUT_COST_PER_1M = float(
     os.getenv("AI_OUTPUT_COST_PER_1M", "0")
 )
+
+PASSWORD_ITERATIONS = int(
+    os.getenv("ARYA_PASSWORD_ITERATIONS", "200000")
+)
+
+USER_TOKEN_DAYS = int(
+    os.getenv("ARYA_USER_TOKEN_DAYS", "30")
+)
+
+OWNER_TOKEN_HOURS = int(
+    os.getenv("ARYA_OWNER_TOKEN_HOURS", "12")
+)
+
 
 app = FastAPI(
     title=APP_NAME,
@@ -52,6 +67,25 @@ def db():
     return connection
 
 
+def ensure_column(
+    connection,
+    table: str,
+    column: str,
+    definition: str,
+):
+    columns = {
+        row["name"]
+        for row in connection.execute(
+            f"PRAGMA table_info({table})"
+        ).fetchall()
+    }
+
+    if column not in columns:
+        connection.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
+        )
+
+
 def init_db():
     connection = db()
     cursor = connection.cursor()
@@ -66,6 +100,7 @@ def init_db():
             country TEXT,
             language TEXT DEFAULT 'fa',
             role TEXT DEFAULT 'user',
+            password_hash TEXT,
             created_at TEXT NOT NULL
         );
 
@@ -297,7 +332,26 @@ def init_db():
             value TEXT,
             updated_at TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS auth_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT UNIQUE NOT NULL,
+            user_id INTEGER,
+            role TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            revoked INTEGER DEFAULT 0,
+            last_seen TEXT
+        );
         """
+    )
+
+    # Migration for databases created by older versions.
+    ensure_column(
+        connection,
+        "users",
+        "password_hash",
+        "TEXT",
     )
 
     connection.commit()
@@ -308,7 +362,7 @@ init_db()
 
 
 # ============================================================
-# HELPERS
+# GENERAL HELPERS
 # ============================================================
 
 def now_iso():
@@ -316,39 +370,463 @@ def now_iso():
 
 
 def sha256(value: str):
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return hashlib.sha256(
+        value.encode("utf-8")
+    ).hexdigest()
 
 
-def audit(actor: str, action: str, target: str = "", details: Any = None):
+# ============================================================
+# PASSWORD SECURITY
+# ============================================================
+
+def hash_password(password: str):
+    if not password:
+        raise ValueError("Password cannot be empty.")
+
+    salt = secrets.token_bytes(32)
+
+    derived = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt,
+        PASSWORD_ITERATIONS,
+    )
+
+    return (
+        f"pbkdf2_sha256$"
+        f"{PASSWORD_ITERATIONS}$"
+        f"{salt.hex()}$"
+        f"{derived.hex()}"
+    )
+
+
+def verify_password(
+    password: str,
+    stored_hash: Optional[str],
+):
+    if not password or not stored_hash:
+        return False
+
+    try:
+        parts = stored_hash.split("$")
+
+        if len(parts) != 4:
+            return False
+
+        algorithm = parts[0]
+        iterations = int(parts[1])
+        salt = bytes.fromhex(parts[2])
+        expected = parts[3]
+
+        if algorithm != "pbkdf2_sha256":
+            return False
+
+        derived = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            salt,
+            iterations,
+        )
+
+        return secrets.compare_digest(
+            derived.hex(),
+            expected,
+        )
+
+    except Exception:
+        return False
+
+
+# ============================================================
+# AUDIT
+# ============================================================
+
+def audit(
+    actor: str,
+    action: str,
+    target: str = "",
+    details: Any = None,
+):
     connection = db()
+
     connection.execute(
         """
         INSERT INTO audit_logs
-        (actor, action, target, details, created_at)
+        (
+            actor,
+            action,
+            target,
+            details,
+            created_at
+        )
         VALUES (?, ?, ?, ?, ?)
         """,
         (
             actor,
             action,
             target,
-            json.dumps(details, ensure_ascii=False)
-            if details is not None else "",
+            json.dumps(
+                details,
+                ensure_ascii=False,
+            )
+            if details is not None
+            else "",
             now_iso(),
         ),
     )
+
     connection.commit()
     connection.close()
 
 
+# ============================================================
+# USER HELPERS
+# ============================================================
+
 def get_user(user_id: int):
     connection = db()
+
     row = connection.execute(
-        "SELECT * FROM users WHERE id = ?",
+        """
+        SELECT *
+        FROM users
+        WHERE id = ?
+        """,
         (user_id,),
     ).fetchone()
+
     connection.close()
+
     return row
 
+
+def get_user_by_email(email: str):
+    connection = db()
+
+    row = connection.execute(
+        """
+        SELECT *
+        FROM users
+        WHERE lower(email) = lower(?)
+        """,
+        (email,),
+    ).fetchone()
+
+    connection.close()
+
+    return row
+
+
+# ============================================================
+# AUTH TOKEN HELPERS
+# ============================================================
+
+def create_auth_token(
+    user_id: Optional[int],
+    role: str,
+    lifetime: timedelta,
+):
+    raw_token = secrets.token_urlsafe(48)
+
+    token_hash = sha256(raw_token)
+
+    created = datetime.now(timezone.utc)
+
+    expires = created + lifetime
+
+    connection = db()
+
+    connection.execute(
+        """
+        INSERT INTO auth_tokens
+        (
+            token_hash,
+            user_id,
+            role,
+            created_at,
+            expires_at,
+            revoked,
+            last_seen
+        )
+        VALUES (?, ?, ?, ?, ?, 0, ?)
+        """,
+        (
+            token_hash,
+            user_id,
+            role,
+            created.isoformat(),
+            expires.isoformat(),
+            created.isoformat(),
+        ),
+    )
+
+    connection.commit()
+    connection.close()
+
+    return raw_token, expires.isoformat()
+
+
+def extract_bearer_token(
+    authorization: Optional[str],
+):
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization token is required.",
+        )
+
+    parts = authorization.strip().split()
+
+    if len(parts) != 2:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authorization header.",
+        )
+
+    if parts[0].lower() != "bearer":
+        raise HTTPException(
+            status_code=401,
+            detail="Authorization must use Bearer token.",
+        )
+
+    if not parts[1]:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid bearer token.",
+        )
+
+    return parts[1]
+
+
+def authenticate(
+    authorization: Optional[str],
+):
+    raw_token = extract_bearer_token(
+        authorization
+    )
+
+    token_hash = sha256(raw_token)
+
+    connection = db()
+
+    row = connection.execute(
+        """
+        SELECT *
+        FROM auth_tokens
+        WHERE token_hash = ?
+        AND revoked = 0
+        """,
+        (token_hash,),
+    ).fetchone()
+
+    if not row:
+        connection.close()
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or revoked token.",
+        )
+
+    try:
+        expires = datetime.fromisoformat(
+            row["expires_at"]
+        )
+    except Exception:
+        connection.close()
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid token expiration.",
+        )
+
+    if expires <= datetime.now(timezone.utc):
+        connection.execute(
+            """
+            UPDATE auth_tokens
+            SET revoked = 1
+            WHERE id = ?
+            """,
+            (row["id"],),
+        )
+
+        connection.commit()
+        connection.close()
+
+        raise HTTPException(
+            status_code=401,
+            detail="Token expired.",
+        )
+
+    connection.execute(
+        """
+        UPDATE auth_tokens
+        SET last_seen = ?
+        WHERE id = ?
+        """,
+        (
+            now_iso(),
+            row["id"],
+        ),
+    )
+
+    connection.commit()
+    connection.close()
+
+    return {
+        "token_id": row["id"],
+        "user_id": row["user_id"],
+        "role": row["role"],
+    }
+
+
+def require_owner(
+    authorization: Optional[str],
+):
+    auth = authenticate(authorization)
+
+    if auth["role"] != "owner":
+        raise HTTPException(
+            status_code=403,
+            detail="OWNER access required.",
+        )
+
+    return auth
+
+
+def require_user(
+    user_id: int,
+    authorization: Optional[str],
+):
+    auth = authenticate(authorization)
+
+    if auth["role"] == "owner":
+        return auth
+
+    if auth["user_id"] != user_id:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied for this user.",
+        )
+
+    return auth
+
+
+# ============================================================
+# OWNERSHIP HELPERS
+# ============================================================
+
+def farm_owned_by_user(
+    farm_id: int,
+    user_id: int,
+):
+    connection = db()
+
+    row = connection.execute(
+        """
+        SELECT id
+        FROM farms
+        WHERE id = ?
+        AND user_id = ?
+        """,
+        (
+            farm_id,
+            user_id,
+        ),
+    ).fetchone()
+
+    connection.close()
+
+    return row is not None
+
+
+def land_owned_by_user(
+    land_id: int,
+    user_id: int,
+):
+    connection = db()
+
+    row = connection.execute(
+        """
+        SELECT lands.id
+        FROM lands
+        JOIN farms
+            ON farms.id = lands.farm_id
+        WHERE lands.id = ?
+        AND farms.user_id = ?
+        """,
+        (
+            land_id,
+            user_id,
+        ),
+    ).fetchone()
+
+    connection.close()
+
+    return row is not None
+
+
+def crop_owned_by_user(
+    farm_id: Optional[int],
+    land_id: Optional[int],
+    user_id: int,
+):
+    connection = db()
+
+    if farm_id is not None:
+        row = connection.execute(
+            """
+            SELECT crops.id
+            FROM crops
+            LEFT JOIN farms
+                ON farms.id = crops.farm_id
+            LEFT JOIN lands
+                ON lands.id = crops.land_id
+            LEFT JOIN farms AS land_farms
+                ON land_farms.id = lands.farm_id
+            WHERE (
+                farms.user_id = ?
+                OR land_farms.user_id = ?
+            )
+            AND crops.farm_id = ?
+            LIMIT 1
+            """,
+            (
+                user_id,
+                user_id,
+                farm_id,
+            ),
+        ).fetchone()
+
+    elif land_id is not None:
+        row = connection.execute(
+            """
+            SELECT crops.id
+            FROM crops
+            JOIN lands
+                ON lands.id = crops.land_id
+            JOIN farms
+                ON farms.id = lands.farm_id
+            WHERE crops.land_id = ?
+            AND farms.user_id = ?
+            LIMIT 1
+            """,
+            (
+                land_id,
+                user_id,
+            ),
+        ).fetchone()
+
+    else:
+        row = None
+
+    connection.close()
+
+    return row is not None
+
+
+# ============================================================
+# AI USAGE
+# ============================================================
 
 def ai_requests_today(user_id: int):
     connection = db()
@@ -363,12 +841,18 @@ def ai_requests_today(user_id: int):
         (
             user_id,
             datetime.now(timezone.utc)
-            .replace(hour=0, minute=0, second=0, microsecond=0)
+            .replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
             .isoformat(),
         ),
     ).fetchone()
 
     connection.close()
+
     return int(row["count"])
 
 
@@ -387,7 +871,9 @@ def save_ai_usage(
         output_tokens / 1_000_000
     ) * AI_OUTPUT_COST_PER_1M
 
-    total_cost = input_cost + output_cost
+    total_cost = (
+        input_cost + output_cost
+    )
 
     connection = db()
 
@@ -430,10 +916,24 @@ def save_ai_usage(
 
 class UserCreate(BaseModel):
     name: Optional[str] = None
-    email: Optional[str] = None
+    email: str
+    password: str = Field(
+        min_length=8,
+        max_length=128,
+    )
     phone: Optional[str] = None
     country: Optional[str] = None
     language: str = "fa"
+
+
+class UserLogin(BaseModel):
+    email: str
+    password: str
+
+
+class OwnerLogin(BaseModel):
+    email: str
+    secret: str
 
 
 class FarmCreate(BaseModel):
@@ -581,26 +1081,40 @@ def health():
 
 
 # ============================================================
-# USERS
+# AUTHENTICATION
 # ============================================================
 
-@app.post("/users")
-def create_user(data: UserCreate):
+@app.post("/auth/register")
+def auth_register(data: UserCreate):
+    password_hash = hash_password(
+        data.password
+    )
+
     connection = db()
 
     try:
         cursor = connection.execute(
             """
             INSERT INTO users
-            (name, email, phone, country, language, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (
+                name,
+                email,
+                phone,
+                country,
+                language,
+                role,
+                password_hash,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'user', ?, ?)
             """,
             (
                 data.name,
-                data.email,
+                data.email.strip(),
                 data.phone,
                 data.country,
                 data.language,
+                password_hash,
                 now_iso(),
             ),
         )
@@ -611,6 +1125,275 @@ def create_user(data: UserCreate):
 
     except sqlite3.IntegrityError:
         connection.close()
+
+        raise HTTPException(
+            status_code=409,
+            detail="User email already exists.",
+        )
+
+    connection.close()
+
+    audit(
+        "system",
+        "create_user",
+        str(user_id),
+    )
+
+    return {
+        "id": user_id,
+        "status": "created",
+        "login_required": True,
+    }
+
+
+@app.post("/auth/login")
+def auth_login(data: UserLogin):
+    user = get_user_by_email(
+        data.email.strip()
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+        )
+
+    if not verify_password(
+        data.password,
+        user["password_hash"],
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid email or password.",
+        )
+
+    role = user["role"] or "user"
+
+    token, expires_at = create_auth_token(
+        user_id=int(user["id"]),
+        role=role,
+        lifetime=timedelta(
+            days=USER_TOKEN_DAYS
+        ),
+    )
+
+    audit(
+        str(user["id"]),
+        "user_login",
+        str(user["id"]),
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": expires_at,
+        "user": {
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"],
+            "country": user["country"],
+            "language": user["language"],
+            "role": role,
+        },
+    }
+
+
+@app.post("/owner/login")
+def owner_login(data: OwnerLogin):
+    if not MASTER_EMAIL or not MASTER_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "OWNER credentials are not configured "
+                "on the backend."
+            ),
+        )
+
+    email_ok = secrets.compare_digest(
+        data.email.strip(),
+        MASTER_EMAIL,
+    )
+
+    secret_ok = secrets.compare_digest(
+        data.secret,
+        MASTER_SECRET,
+    )
+
+    if not email_ok or not secret_ok:
+        audit(
+            "unknown",
+            "owner_login_failed",
+        )
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid OWNER credentials.",
+        )
+
+    token, expires_at = create_auth_token(
+        user_id=None,
+        role="owner",
+        lifetime=timedelta(
+            hours=OWNER_TOKEN_HOURS
+        ),
+    )
+
+    audit(
+        "owner",
+        "owner_login",
+    )
+
+    return {
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": expires_at,
+        "role": "owner",
+    }
+
+
+@app.get("/auth/me")
+def auth_me(
+    authorization: Optional[str] = Header(None),
+):
+    auth = authenticate(
+        authorization
+    )
+
+    if auth["role"] == "owner":
+        return {
+            "authenticated": True,
+            "role": "owner",
+        }
+
+    user = get_user(
+        int(auth["user_id"])
+    )
+
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="User account not found.",
+        )
+
+    return {
+        "authenticated": True,
+        "role": user["role"] or "user",
+        "user": {
+            "id": user["id"],
+            "name": user["name"],
+            "email": user["email"],
+            "country": user["country"],
+            "language": user["language"],
+        },
+    }
+
+
+@app.post("/auth/logout")
+def auth_logout(
+    authorization: Optional[str] = Header(None),
+):
+    raw_token = extract_bearer_token(
+        authorization
+    )
+
+    token_hash = sha256(raw_token)
+
+    connection = db()
+
+    row = connection.execute(
+        """
+        SELECT *
+        FROM auth_tokens
+        WHERE token_hash = ?
+        AND revoked = 0
+        """,
+        (token_hash,),
+    ).fetchone()
+
+    if not row:
+        connection.close()
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or revoked token.",
+        )
+
+    connection.execute(
+        """
+        UPDATE auth_tokens
+        SET revoked = 1
+        WHERE id = ?
+        """,
+        (row["id"],),
+    )
+
+    connection.commit()
+    connection.close()
+
+    actor = (
+        "owner"
+        if row["role"] == "owner"
+        else str(row["user_id"])
+    )
+
+    audit(
+        actor,
+        "logout",
+    )
+
+    return {
+        "status": "logged_out",
+    }
+
+
+# ============================================================
+# USERS
+# ============================================================
+
+@app.post("/users")
+def create_user(
+    data: UserCreate,
+):
+    password_hash = hash_password(
+        data.password
+    )
+
+    connection = db()
+
+    try:
+        cursor = connection.execute(
+            """
+            INSERT INTO users
+            (
+                name,
+                email,
+                phone,
+                country,
+                language,
+                role,
+                password_hash,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'user', ?, ?)
+            """,
+            (
+                data.name,
+                data.email.strip(),
+                data.phone,
+                data.country,
+                data.language,
+                password_hash,
+                now_iso(),
+            ),
+        )
+
+        connection.commit()
+
+        user_id = cursor.lastrowid
+
+    except sqlite3.IntegrityError:
+        connection.close()
+
         raise HTTPException(
             status_code=409,
             detail="User email already exists.",
@@ -631,7 +1414,15 @@ def create_user(data: UserCreate):
 
 
 @app.get("/users/{user_id}")
-def user_details(user_id: int):
+def user_details(
+    user_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    require_user(
+        user_id,
+        authorization,
+    )
+
     user = get_user(user_id)
 
     if not user:
@@ -640,20 +1431,46 @@ def user_details(user_id: int):
             detail="User not found.",
         )
 
-    return dict(user)
+    result = dict(user)
+
+    # Never expose password hashes.
+    result.pop("password_hash", None)
+
+    return result
 
 
 @app.get("/users")
-def users():
+def users(
+    authorization: Optional[str] = Header(None),
+):
+    require_owner(
+        authorization
+    )
+
     connection = db()
 
     rows = connection.execute(
-        "SELECT * FROM users ORDER BY id DESC"
+        """
+        SELECT
+            id,
+            name,
+            email,
+            phone,
+            country,
+            language,
+            role,
+            created_at
+        FROM users
+        ORDER BY id DESC
+        """
     ).fetchall()
 
     connection.close()
 
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
@@ -661,7 +1478,15 @@ def users():
 # ============================================================
 
 @app.post("/farms")
-def create_farm(data: FarmCreate):
+def create_farm(
+    data: FarmCreate,
+    authorization: Optional[str] = Header(None),
+):
+    require_user(
+        data.user_id,
+        authorization,
+    )
+
     if not get_user(data.user_id):
         raise HTTPException(
             status_code=404,
@@ -698,7 +1523,9 @@ def create_farm(data: FarmCreate):
     )
 
     connection.commit()
+
     farm_id = cursor.lastrowid
+
     connection.close()
 
     return {
@@ -708,7 +1535,15 @@ def create_farm(data: FarmCreate):
 
 
 @app.get("/farms/{user_id}")
-def get_farms(user_id: int):
+def get_farms(
+    user_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    require_user(
+        user_id,
+        authorization,
+    )
+
     connection = db()
 
     rows = connection.execute(
@@ -723,7 +1558,10 @@ def get_farms(user_id: int):
 
     connection.close()
 
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
@@ -731,7 +1569,40 @@ def get_farms(user_id: int):
 # ============================================================
 
 @app.post("/lands")
-def create_land(data: LandCreate):
+def create_land(
+    data: LandCreate,
+    authorization: Optional[str] = Header(None),
+):
+    auth = authenticate(
+        authorization
+    )
+
+    connection = db()
+
+    farm = connection.execute(
+        """
+        SELECT *
+        FROM farms
+        WHERE id = ?
+        """,
+        (data.farm_id,),
+    ).fetchone()
+
+    connection.close()
+
+    if not farm:
+        raise HTTPException(
+            status_code=404,
+            detail="Farm not found.",
+        )
+
+    if auth["role"] != "owner":
+        if auth["user_id"] != farm["user_id"]:
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied for this farm.",
+            )
+
     connection = db()
 
     cursor = connection.execute(
@@ -766,7 +1637,9 @@ def create_land(data: LandCreate):
     )
 
     connection.commit()
+
     land_id = cursor.lastrowid
+
     connection.close()
 
     return {
@@ -776,14 +1649,62 @@ def create_land(data: LandCreate):
 
 
 @app.get("/lands")
-def lands(farm_id: Optional[int] = None):
+def lands(
+    farm_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    auth = authenticate(
+        authorization
+    )
+
     connection = db()
 
     if farm_id is None:
+        if auth["role"] != "owner":
+            connection.close()
+
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "farm_id is required for user access."
+                ),
+            )
+
         rows = connection.execute(
-            "SELECT * FROM lands ORDER BY id DESC"
+            """
+            SELECT *
+            FROM lands
+            ORDER BY id DESC
+            """
         ).fetchall()
+
     else:
+        if auth["role"] != "owner":
+            farm = connection.execute(
+                """
+                SELECT user_id
+                FROM farms
+                WHERE id = ?
+                """,
+                (farm_id,),
+            ).fetchone()
+
+            if not farm:
+                connection.close()
+
+                raise HTTPException(
+                    status_code=404,
+                    detail="Farm not found.",
+                )
+
+            if farm["user_id"] != auth["user_id"]:
+                connection.close()
+
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied.",
+                )
+
         rows = connection.execute(
             """
             SELECT *
@@ -796,7 +1717,10 @@ def lands(farm_id: Optional[int] = None):
 
     connection.close()
 
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
@@ -804,8 +1728,89 @@ def lands(farm_id: Optional[int] = None):
 # ============================================================
 
 @app.post("/crops")
-def create_crop(data: CropCreate):
+def create_crop(
+    data: CropCreate,
+    authorization: Optional[str] = Header(None),
+):
+    auth = authenticate(
+        authorization
+    )
+
+    if (
+        data.farm_id is None
+        and data.land_id is None
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "farm_id or land_id is required."
+            ),
+        )
+
     connection = db()
+
+    if data.land_id is not None:
+        land = connection.execute(
+            """
+            SELECT
+                lands.id,
+                lands.farm_id,
+                farms.user_id
+            FROM lands
+            JOIN farms
+                ON farms.id = lands.farm_id
+            WHERE lands.id = ?
+            """,
+            (data.land_id,),
+        ).fetchone()
+
+        if not land:
+            connection.close()
+
+            raise HTTPException(
+                status_code=404,
+                detail="Land not found.",
+            )
+
+        if (
+            auth["role"] != "owner"
+            and land["user_id"] != auth["user_id"]
+        ):
+            connection.close()
+
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied.",
+            )
+
+    if data.farm_id is not None:
+        farm = connection.execute(
+            """
+            SELECT user_id
+            FROM farms
+            WHERE id = ?
+            """,
+            (data.farm_id,),
+        ).fetchone()
+
+        if not farm:
+            connection.close()
+
+            raise HTTPException(
+                status_code=404,
+                detail="Farm not found.",
+            )
+
+        if (
+            auth["role"] != "owner"
+            and farm["user_id"] != auth["user_id"]
+        ):
+            connection.close()
+
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied.",
+            )
 
     cursor = connection.execute(
         """
@@ -835,7 +1840,9 @@ def create_crop(data: CropCreate):
     )
 
     connection.commit()
+
     crop_id = cursor.lastrowid
+
     connection.close()
 
     return {
@@ -848,10 +1855,88 @@ def create_crop(data: CropCreate):
 def crops(
     farm_id: Optional[int] = None,
     land_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
 ):
+    auth = authenticate(
+        authorization
+    )
+
     connection = db()
 
-    query = "SELECT * FROM crops WHERE 1=1"
+    if auth["role"] != "owner":
+
+        if (
+            farm_id is None
+            and land_id is None
+        ):
+            connection.close()
+
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "farm_id or land_id is required "
+                    "for user access."
+                ),
+            )
+
+        if farm_id is not None:
+            farm = connection.execute(
+                """
+                SELECT user_id
+                FROM farms
+                WHERE id = ?
+                """,
+                (farm_id,),
+            ).fetchone()
+
+            if not farm:
+                connection.close()
+
+                raise HTTPException(
+                    status_code=404,
+                    detail="Farm not found.",
+                )
+
+            if farm["user_id"] != auth["user_id"]:
+                connection.close()
+
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied.",
+                )
+
+        if land_id is not None:
+            land = connection.execute(
+                """
+                SELECT farms.user_id
+                FROM lands
+                JOIN farms
+                    ON farms.id = lands.farm_id
+                WHERE lands.id = ?
+                """,
+                (land_id,),
+            ).fetchone()
+
+            if not land:
+                connection.close()
+
+                raise HTTPException(
+                    status_code=404,
+                    detail="Land not found.",
+                )
+
+            if land["user_id"] != auth["user_id"]:
+                connection.close()
+
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied.",
+                )
+
+    query = (
+        "SELECT * FROM crops WHERE 1=1"
+    )
+
     params = []
 
     if farm_id is not None:
@@ -871,7 +1956,10 @@ def crops(
 
     connection.close()
 
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
@@ -879,8 +1967,42 @@ def crops(
 # ============================================================
 
 @app.post("/soil/lab")
-def save_soil_lab(data: SoilLabCreate):
+def save_soil_lab(
+    data: SoilLabCreate,
+    authorization: Optional[str] = Header(None),
+):
+    auth = authenticate(
+        authorization
+    )
+
+    if auth["role"] != "owner":
+        if not land_owned_by_user(
+            data.land_id,
+            auth["user_id"],
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied.",
+            )
+
     connection = db()
+
+    land = connection.execute(
+        """
+        SELECT id
+        FROM lands
+        WHERE id = ?
+        """,
+        (data.land_id,),
+    ).fetchone()
+
+    if not land:
+        connection.close()
+
+        raise HTTPException(
+            status_code=404,
+            detail="Land not found.",
+        )
 
     cursor = connection.execute(
         """
@@ -914,14 +2036,18 @@ def save_soil_lab(data: SoilLabCreate):
             data.laboratory,
             json.dumps(
                 data.raw_json,
-                ensure_ascii=False
-            ) if data.raw_json else None,
+                ensure_ascii=False,
+            )
+            if data.raw_json
+            else None,
             now_iso(),
         ),
     )
 
     connection.commit()
+
     record_id = cursor.lastrowid
+
     connection.close()
 
     return {
@@ -931,10 +2057,28 @@ def save_soil_lab(data: SoilLabCreate):
 
 
 @app.get("/soil/lab")
-def get_soil_lab(land_id: Optional[int] = None):
+def get_soil_lab(
+    land_id: Optional[int] = None,
+    authorization: Optional[str] = Header(None),
+):
+    auth = authenticate(
+        authorization
+    )
+
     connection = db()
 
     if land_id is None:
+
+        if auth["role"] != "owner":
+            connection.close()
+
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "land_id is required for user access."
+                ),
+            )
+
         rows = connection.execute(
             """
             SELECT *
@@ -942,7 +2086,37 @@ def get_soil_lab(land_id: Optional[int] = None):
             ORDER BY id DESC
             """
         ).fetchall()
+
     else:
+
+        if auth["role"] != "owner":
+            land = connection.execute(
+                """
+                SELECT farms.user_id
+                FROM lands
+                JOIN farms
+                    ON farms.id = lands.farm_id
+                WHERE lands.id = ?
+                """,
+                (land_id,),
+            ).fetchone()
+
+            if not land:
+                connection.close()
+
+                raise HTTPException(
+                    status_code=404,
+                    detail="Land not found.",
+                )
+
+            if land["user_id"] != auth["user_id"]:
+                connection.close()
+
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied.",
+                )
+
         rows = connection.execute(
             """
             SELECT *
@@ -955,7 +2129,10 @@ def get_soil_lab(land_id: Optional[int] = None):
 
     connection.close()
 
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
@@ -963,8 +2140,42 @@ def get_soil_lab(land_id: Optional[int] = None):
 # ============================================================
 
 @app.post("/water")
-def create_water_source(data: WaterSourceCreate):
+def create_water_source(
+    data: WaterSourceCreate,
+    authorization: Optional[str] = Header(None),
+):
+    auth = authenticate(
+        authorization
+    )
+
+    if auth["role"] != "owner":
+        if not farm_owned_by_user(
+            data.farm_id,
+            auth["user_id"],
+        ):
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied.",
+            )
+
     connection = db()
+
+    farm = connection.execute(
+        """
+        SELECT id
+        FROM farms
+        WHERE id = ?
+        """,
+        (data.farm_id,),
+    ).fetchone()
+
+    if not farm:
+        connection.close()
+
+        raise HTTPException(
+            status_code=404,
+            detail="Farm not found.",
+        )
 
     cursor = connection.execute(
         """
@@ -992,14 +2203,18 @@ def create_water_source(data: WaterSourceCreate):
             data.quality,
             json.dumps(
                 data.raw_json,
-                ensure_ascii=False
-            ) if data.raw_json else None,
+                ensure_ascii=False,
+            )
+            if data.raw_json
+            else None,
             now_iso(),
         ),
     )
 
     connection.commit()
+
     water_id = cursor.lastrowid
+
     connection.close()
 
     return {
@@ -1060,7 +2275,9 @@ def weather(
     except Exception as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Weather service error: {exc}",
+            detail=(
+                f"Weather service error: {exc}"
+            ),
         )
 
 
@@ -1068,7 +2285,10 @@ def weather(
 # AI
 # ============================================================
 
-def local_agri_answer(question: str, crop: Optional[str] = None):
+def local_agri_answer(
+    question: str,
+    crop: Optional[str] = None,
+):
     q = question.lower()
 
     if (
@@ -1123,7 +2343,10 @@ def local_agri_answer(question: str, crop: Optional[str] = None):
     )
 
 
-def openai_answer(question: str, language: str):
+def openai_answer(
+    question: str,
+    language: str,
+):
     try:
         from openai import OpenAI
 
@@ -1164,7 +2387,11 @@ You must:
 
         text = response.output_text
 
-        usage = getattr(response, "usage", None)
+        usage = getattr(
+            response,
+            "usage",
+            None,
+        )
 
         input_tokens = (
             getattr(
@@ -1172,7 +2399,8 @@ You must:
                 "input_tokens",
                 0,
             )
-            if usage else 0
+            if usage
+            else 0
         )
 
         output_tokens = (
@@ -1181,7 +2409,8 @@ You must:
                 "output_tokens",
                 0,
             )
-            if usage else 0
+            if usage
+            else 0
         )
 
         return (
@@ -1195,14 +2424,39 @@ You must:
 
 
 @app.post("/ai/ask")
-def ai_ask(data: AIAsk):
-    user = get_user(data.user_id)
+def ai_ask(
+    data: AIAsk,
+    authorization: Optional[str] = Header(None),
+):
+    require_user(
+        data.user_id,
+        authorization,
+    )
+
+    user = get_user(
+        data.user_id
+    )
 
     if not user:
         raise HTTPException(
             status_code=404,
             detail="User not found.",
         )
+
+    if data.farm_id is not None:
+        auth = authenticate(
+            authorization
+        )
+
+        if auth["role"] != "owner":
+            if not farm_owned_by_user(
+                data.farm_id,
+                data.user_id,
+            ):
+                raise HTTPException(
+                    status_code=403,
+                    detail="Access denied for this farm.",
+                )
 
     used_today = ai_requests_today(
         data.user_id
@@ -1227,8 +2481,10 @@ def ai_ask(data: AIAsk):
         missing.append("region")
 
     answer = None
+
     input_tokens = 0
     output_tokens = 0
+
     model = "local-rule-engine"
 
     if OPENAI_API_KEY:
@@ -1249,6 +2505,7 @@ def ai_ask(data: AIAsk):
                 data.question,
                 data.crop,
             )
+
     else:
         answer = local_agri_answer(
             data.question,
@@ -1317,7 +2574,9 @@ def ai_ask(data: AIAsk):
 # ============================================================
 
 @app.get("/pricing")
-def pricing(country: str):
+def pricing(
+    country: str,
+):
     connection = db()
 
     row = connection.execute(
@@ -1376,7 +2635,15 @@ def pricing(country: str):
 # ============================================================
 
 @app.post("/payments")
-def create_payment(data: PaymentCreate):
+def create_payment(
+    data: PaymentCreate,
+    authorization: Optional[str] = Header(None),
+):
+    require_user(
+        data.user_id,
+        authorization,
+    )
+
     if not get_user(data.user_id):
         raise HTTPException(
             status_code=404,
@@ -1412,8 +2679,16 @@ def create_payment(data: PaymentCreate):
     )
 
     connection.commit()
+
     payment_id = cursor.lastrowid
+
     connection.close()
+
+    audit(
+        str(data.user_id),
+        "create_payment",
+        str(payment_id),
+    )
 
     return {
         "payment_id": payment_id,
@@ -1422,7 +2697,14 @@ def create_payment(data: PaymentCreate):
 
 
 @app.post("/payments/{payment_id}/verify")
-def verify_payment(payment_id: int):
+def verify_payment(
+    payment_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    require_owner(
+        authorization
+    )
+
     connection = db()
 
     payment = connection.execute(
@@ -1436,10 +2718,35 @@ def verify_payment(payment_id: int):
 
     if not payment:
         connection.close()
+
         raise HTTPException(
             status_code=404,
             detail="Payment not found.",
         )
+
+    if payment["status"] == "verified":
+        existing_subscription = connection.execute(
+            """
+            SELECT *
+            FROM subscriptions
+            WHERE user_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (payment["user_id"],),
+        ).fetchone()
+
+        connection.close()
+
+        return {
+            "payment_id": payment_id,
+            "status": "already_verified",
+            "subscription": (
+                dict(existing_subscription)
+                if existing_subscription
+                else None
+            ),
+        }
 
     connection.execute(
         """
@@ -1454,8 +2761,14 @@ def verify_payment(payment_id: int):
         ),
     )
 
-    started = datetime.now(timezone.utc)
-    expires = started + timedelta(days=365)
+    started = datetime.now(
+        timezone.utc
+    )
+
+    expires = (
+        started
+        + timedelta(days=365)
+    )
 
     connection.execute(
         """
@@ -1497,7 +2810,15 @@ def verify_payment(payment_id: int):
 
 
 @app.get("/subscriptions/{user_id}")
-def subscription(user_id: int):
+def subscription(
+    user_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    require_user(
+        user_id,
+        authorization,
+    )
+
     connection = db()
 
     row = connection.execute(
@@ -1525,7 +2846,9 @@ def subscription(user_id: int):
             result["expires_at"]
         )
 
-        if expires <= datetime.now(timezone.utc):
+        if expires <= datetime.now(
+            timezone.utc
+        ):
             result["status"] = "expired"
 
     except Exception:
@@ -1541,9 +2864,31 @@ def subscription(user_id: int):
 @app.post("/owner/activation-code")
 def create_activation_code(
     duration_days: int = 365,
+    authorization: Optional[str] = Header(None),
 ):
+    require_owner(
+        authorization
+    )
+
+    if duration_days <= 0:
+        raise HTTPException(
+            status_code=400,
+            detail="duration_days must be positive.",
+        )
+
+    if duration_days > 3650:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "duration_days cannot exceed 3650."
+            ),
+        )
+
     raw_code = secrets.token_urlsafe(18)
-    code_hash = sha256(raw_code)
+
+    code_hash = sha256(
+        raw_code
+    )
 
     connection = db()
 
@@ -1581,8 +2926,16 @@ def create_activation_code(
 @app.post("/activation/use")
 def use_activation_code(
     data: ActivationUse,
+    authorization: Optional[str] = Header(None),
 ):
-    code_hash = sha256(data.code)
+    require_user(
+        data.user_id,
+        authorization,
+    )
+
+    code_hash = sha256(
+        data.code
+    )
 
     connection = db()
 
@@ -1601,13 +2954,23 @@ def use_activation_code(
 
         raise HTTPException(
             status_code=400,
-            detail="Invalid or already used activation code.",
+            detail=(
+                "Invalid or already used "
+                "activation code."
+            ),
         )
 
-    started = datetime.now(timezone.utc)
+    started = datetime.now(
+        timezone.utc
+    )
 
-    expires = started + timedelta(
-        days=int(row["duration_days"])
+    expires = (
+        started
+        + timedelta(
+            days=int(
+                row["duration_days"]
+            )
+        )
     )
 
     connection.execute(
@@ -1650,6 +3013,12 @@ def use_activation_code(
     connection.commit()
     connection.close()
 
+    audit(
+        str(data.user_id),
+        "use_activation_code",
+        str(row["id"]),
+    )
+
     return {
         "status": "activated",
         "expires_at": expires.isoformat(),
@@ -1661,14 +3030,24 @@ def use_activation_code(
 # ============================================================
 
 @app.post("/devices")
-def register_device(data: DeviceCreate):
+def register_device(
+    data: DeviceCreate,
+    authorization: Optional[str] = Header(None),
+):
+    require_user(
+        data.user_id,
+        authorization,
+    )
+
     if not get_user(data.user_id):
         raise HTTPException(
             status_code=404,
             detail="User not found.",
         )
 
-    device_hash = sha256(data.device_id)
+    device_hash = sha256(
+        data.device_id
+    )
 
     connection = db()
 
@@ -1747,8 +3126,16 @@ def register_device(data: DeviceCreate):
     )
 
     connection.commit()
+
     device_db_id = cursor.lastrowid
+
     connection.close()
+
+    audit(
+        str(data.user_id),
+        "register_device",
+        str(device_db_id),
+    )
 
     return {
         "status": "registered",
@@ -1761,7 +3148,20 @@ def register_device(data: DeviceCreate):
 # ============================================================
 
 @app.post("/feedback")
-def create_feedback(data: FeedbackCreate):
+def create_feedback(
+    data: FeedbackCreate,
+    authorization: Optional[str] = Header(None),
+):
+    if data.user_id is not None:
+        require_user(
+            data.user_id,
+            authorization,
+        )
+    else:
+        # Public feedback is allowed when no user account
+        # is associated with the message.
+        pass
+
     connection = db()
 
     cursor = connection.execute(
@@ -1791,7 +3191,9 @@ def create_feedback(data: FeedbackCreate):
     )
 
     connection.commit()
+
     feedback_id = cursor.lastrowid
+
     connection.close()
 
     return {
@@ -1804,7 +3206,12 @@ def create_feedback(data: FeedbackCreate):
 @app.get("/owner/feedback")
 def owner_feedback(
     status: Optional[str] = None,
+    authorization: Optional[str] = Header(None),
 ):
+    require_owner(
+        authorization
+    )
+
     connection = db()
 
     if status:
@@ -1817,6 +3224,7 @@ def owner_feedback(
             """,
             (status,),
         ).fetchall()
+
     else:
         rows = connection.execute(
             """
@@ -1828,7 +3236,10 @@ def owner_feedback(
 
     connection.close()
 
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
@@ -1838,7 +3249,12 @@ def owner_feedback(
 @app.post("/owner/ai/proposals")
 def create_ai_proposal(
     data: AIProposalCreate,
+    authorization: Optional[str] = Header(None),
 ):
+    require_owner(
+        authorization
+    )
+
     connection = db()
 
     cursor = connection.execute(
@@ -1858,18 +3274,22 @@ def create_ai_proposal(
             data.description,
             json.dumps(
                 data.change_json,
-                ensure_ascii=False
-            ) if data.change_json else None,
+                ensure_ascii=False,
+            )
+            if data.change_json
+            else None,
             now_iso(),
         ),
     )
 
     connection.commit()
+
     proposal_id = cursor.lastrowid
+
     connection.close()
 
     audit(
-        "ai",
+        "owner",
         "create_change_proposal",
         str(proposal_id),
     )
@@ -1881,7 +3301,13 @@ def create_ai_proposal(
 
 
 @app.get("/owner/ai/proposals")
-def ai_proposals():
+def ai_proposals(
+    authorization: Optional[str] = Header(None),
+):
+    require_owner(
+        authorization
+    )
+
     connection = db()
 
     rows = connection.execute(
@@ -1894,7 +3320,10 @@ def ai_proposals():
 
     connection.close()
 
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 @app.post(
@@ -1903,14 +3332,21 @@ def ai_proposals():
 def decide_ai_proposal(
     proposal_id: int,
     data: ProposalDecision,
+    authorization: Optional[str] = Header(None),
 ):
+    auth = require_owner(
+        authorization
+    )
+
     if data.decision not in (
         "approve",
         "reject",
     ):
         raise HTTPException(
             status_code=400,
-            detail="Decision must be approve or reject.",
+            detail=(
+                "Decision must be approve or reject."
+            ),
         )
 
     connection = db()
@@ -1938,6 +3374,12 @@ def decide_ai_proposal(
         else "rejected"
     )
 
+    reviewer = (
+        data.reviewer.strip()
+        if data.reviewer.strip()
+        else "owner"
+    )
+
     connection.execute(
         """
         UPDATE ai_change_proposals
@@ -1949,7 +3391,7 @@ def decide_ai_proposal(
         (
             status,
             now_iso(),
-            data.reviewer,
+            reviewer,
             proposal_id,
         ),
     )
@@ -1958,9 +3400,13 @@ def decide_ai_proposal(
     connection.close()
 
     audit(
-        data.reviewer,
+        "owner",
         f"ai_proposal_{status}",
         str(proposal_id),
+        {
+            "reviewer": reviewer,
+            "token_id": auth["token_id"],
+        },
     )
 
     return {
@@ -1976,7 +3422,12 @@ def decide_ai_proposal(
 @app.post("/owner/knowledge")
 def create_knowledge(
     data: KnowledgeCreate,
+    authorization: Optional[str] = Header(None),
 ):
+    require_owner(
+        authorization
+    )
+
     connection = db()
 
     cursor = connection.execute(
@@ -2000,7 +3451,9 @@ def create_knowledge(
     )
 
     connection.commit()
+
     knowledge_id = cursor.lastrowid
+
     connection.close()
 
     audit(
@@ -2020,7 +3473,14 @@ def create_knowledge(
 # ============================================================
 
 @app.get("/owner/audit")
-def owner_audit(limit: int = 100):
+def owner_audit(
+    limit: int = 100,
+    authorization: Optional[str] = Header(None),
+):
+    require_owner(
+        authorization
+    )
+
     limit = max(
         1,
         min(limit, 1000),
@@ -2040,7 +3500,10 @@ def owner_audit(limit: int = 100):
 
     connection.close()
 
-    return [dict(row) for row in rows]
+    return [
+        dict(row)
+        for row in rows
+    ]
 
 
 # ============================================================
@@ -2050,7 +3513,13 @@ def owner_audit(limit: int = 100):
 @app.post("/sync")
 def sync_operation(
     data: SyncCreate,
+    authorization: Optional[str] = Header(None),
 ):
+    require_user(
+        data.user_id,
+        authorization,
+    )
+
     connection = db()
 
     existing = connection.execute(
@@ -2111,11 +3580,15 @@ def sync_operation(
 
 @app.get("/server-time")
 def server_time():
-    current = datetime.now(timezone.utc)
+    current = datetime.now(
+        timezone.utc
+    )
 
     return {
         "utc": current.isoformat(),
-        "unix": int(current.timestamp()),
+        "unix": int(
+            current.timestamp()
+        ),
     }
 
 
@@ -2124,26 +3597,54 @@ def server_time():
 # ============================================================
 
 @app.get("/system/info")
-def system_info():
+def system_info(
+    authorization: Optional[str] = Header(None),
+):
+    require_owner(
+        authorization
+    )
+
     connection = db()
 
     users_count = connection.execute(
-        "SELECT COUNT(*) AS c FROM users"
+        """
+        SELECT COUNT(*) AS c
+        FROM users
+        """
     ).fetchone()["c"]
 
     farms_count = connection.execute(
-        "SELECT COUNT(*) AS c FROM farms"
+        """
+        SELECT COUNT(*) AS c
+        FROM farms
+        """
     ).fetchone()["c"]
 
     ai_count = connection.execute(
-        "SELECT COUNT(*) AS c FROM ai_usage"
+        """
+        SELECT COUNT(*) AS c
+        FROM ai_usage
+        """
     ).fetchone()["c"]
 
     ai_cost = connection.execute(
         """
-        SELECT COALESCE(SUM(total_cost), 0) AS c
+        SELECT COALESCE(
+            SUM(total_cost),
+            0
+        ) AS c
         FROM ai_usage
         """
+    ).fetchone()["c"]
+
+    active_tokens = connection.execute(
+        """
+        SELECT COUNT(*) AS c
+        FROM auth_tokens
+        WHERE revoked = 0
+        AND expires_at > ?
+        """,
+        (now_iso(),),
     ).fetchone()["c"]
 
     connection.close()
@@ -2155,6 +3656,7 @@ def system_info():
         "farms": farms_count,
         "ai_requests": ai_count,
         "ai_recorded_cost": ai_cost,
+        "active_auth_tokens": active_tokens,
         "daily_ai_limit": DAILY_AI_LIMIT,
         "device_limit": DEVICE_LIMIT,
         "time": now_iso(),
