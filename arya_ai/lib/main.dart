@@ -77,27 +77,45 @@ class _AryaAiHomePageState extends State<AryaAiHomePage> {
 
     _scrollToBottom();
 
-    final response = await _aiService.ask(
-      message: message,
-      language: 'fa',
-    );
-
-    if (!mounted) {
-      return;
-    }
-
-    setState(() {
-      _messages.add(
-        _ChatMessage(
-          text: response.answer,
-          isUser: false,
-          confidence: response.confidence,
-          requiresValidation: response.requiresValidation,
-          mode: response.mode,
-        ),
+    try {
+      final response = await _aiService.ask(
+        message: message,
+        language: 'fa',
       );
-      _loading = false;
-    });
+
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _messages.add(
+          _ChatMessage(
+            text: response.answer,
+            isUser: false,
+            confidence: response.confidence,
+            requiresValidation: response.requiresValidation,
+            mode: response.mode,
+          ),
+        );
+        _loading = false;
+      });
+    } catch (e) {
+      if (!mounted) {
+        return;
+      }
+
+      setState(() {
+        _messages.add(
+          const _ChatMessage(
+            text:
+                'در ارتباط با سامانه ARYA خطایی رخ داد.\n'
+                'لطفاً دوباره تلاش کنید.',
+            isUser: false,
+          ),
+        );
+        _loading = false;
+      });
+    }
 
     _scrollToBottom();
   }
@@ -171,20 +189,14 @@ class _AryaAiHomePageState extends State<AryaAiHomePage> {
             Expanded(
               child: ListView.builder(
                 controller: _scrollController,
-                padding: const EdgeInsets.fromLTRB(
-                  12,
-                  12,
-                  12,
-                  12,
-                ),
+                padding: const EdgeInsets.all(12),
                 itemCount: _messages.length,
                 itemBuilder: (context, index) {
-                  return _buildMessage(
-                    _messages[index],
-                  );
+                  return _buildMessage(_messages[index]);
                 },
               ),
             ),
+            if (_loading) _buildLoadingIndicator(),
             _buildSuggestions(),
             _buildInputArea(),
           ],
@@ -219,9 +231,7 @@ class _AryaAiHomePageState extends State<AryaAiHomePage> {
               configured
                   ? 'ARYA AI متصل به Backend است.'
                   : 'حالت محلی: Backend هنوز تنظیم نشده است.',
-              style: const TextStyle(
-                fontSize: 12,
-              ),
+              style: const TextStyle(fontSize: 12),
             ),
           ),
         ],
@@ -241,12 +251,8 @@ class _AryaAiHomePageState extends State<AryaAiHomePage> {
     return Align(
       alignment: alignment,
       child: Container(
-        constraints: const BoxConstraints(
-          maxWidth: 700,
-        ),
-        margin: const EdgeInsets.only(
-          bottom: 10,
-        ),
+        constraints: const BoxConstraints(maxWidth: 700),
+        margin: const EdgeInsets.only(bottom: 10),
         padding: const EdgeInsets.all(14),
         decoration: BoxDecoration(
           color: background,
@@ -299,6 +305,28 @@ class _AryaAiHomePageState extends State<AryaAiHomePage> {
     );
   }
 
+  Widget _buildLoadingIndicator() {
+    return const Padding(
+      padding: EdgeInsets.fromLTRB(16, 4, 16, 8),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+            ),
+          ),
+          SizedBox(width: 10),
+          Text(
+            'ARYA AI در حال تحلیل است...',
+            style: TextStyle(fontSize: 12),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildSuggestions() {
     const suggestions = [
       'بررسی بیماری گیاه',
@@ -310,22 +338,16 @@ class _AryaAiHomePageState extends State<AryaAiHomePage> {
     return SizedBox(
       height: 48,
       child: ListView.separated(
-        padding: const EdgeInsets.symmetric(
-          horizontal: 12,
-        ),
+        padding: const EdgeInsets.symmetric(horizontal: 12),
         scrollDirection: Axis.horizontal,
         itemCount: suggestions.length,
         separatorBuilder: (_, __) =>
             const SizedBox(width: 8),
         itemBuilder: (context, index) {
           return ActionChip(
-            label: Text(
-              suggestions[index],
-            ),
+            label: Text(suggestions[index]),
             onPressed: () {
-              _sendSuggestion(
-                suggestions[index],
-              );
+              _sendSuggestion(suggestions[index]);
             },
           );
         },
@@ -335,12 +357,7 @@ class _AryaAiHomePageState extends State<AryaAiHomePage> {
 
   Widget _buildInputArea() {
     return Container(
-      padding: const EdgeInsets.fromLTRB(
-        10,
-        8,
-        10,
-        10,
-      ),
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 10),
       decoration: BoxDecoration(
         color: Colors.white,
         boxShadow: [
@@ -351,4 +368,82 @@ class _AryaAiHomePageState extends State<AryaAiHomePage> {
         ],
       ),
       child: Row(
-        cross
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          Expanded(
+            child: TextField(
+              controller: _controller,
+              minLines: 1,
+              maxLines: 5,
+              textInputAction: TextInputAction.newline,
+              decoration: InputDecoration(
+                hintText: 'سؤال کشاورزی خود را بنویسید...',
+                filled: true,
+                fillColor: const Color(0xFFF5F7F5),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(18),
+                  borderSide: BorderSide.none,
+                ),
+                contentPadding:
+                    const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
+                ),
+              ),
+              onSubmitted: (_) {
+                _askAi();
+              },
+            ),
+          ),
+          const SizedBox(width: 8),
+          IconButton.filled(
+            tooltip: 'ارسال',
+            onPressed: _loading ? null : _askAi,
+            icon: const Icon(Icons.send),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ChatMessage {
+  const _ChatMessage({
+    required this.text,
+    required this.isUser,
+    this.confidence = 0,
+    this.requiresValidation = false,
+    this.mode,
+  });
+
+  final String text;
+  final bool isUser;
+  final double confidence;
+  final bool requiresValidation;
+  final String? mode;
+}
+
+class _InfoChip extends StatelessWidget {
+  const _InfoChip({
+    required this.icon,
+    required this.text,
+  });
+
+  final IconData icon;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Chip(
+      avatar: Icon(
+        icon,
+        size: 17,
+      ),
+      label: Text(
+        text,
+        style: const TextStyle(fontSize: 11),
+      ),
+      visualDensity: VisualDensity.compact,
+    );
+  }
+}
