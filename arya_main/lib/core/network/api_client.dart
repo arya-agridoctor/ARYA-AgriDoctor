@@ -24,7 +24,7 @@ class AryaApiClient {
   }) : baseUrl = (baseUrl ??
             const String.fromEnvironment(
               'ARYA_API_URL',
-              defaultValue: '',
+              defaultValue: 'https://arya-agridoctor.onrender.com',
             ))
             .trim()
             .replaceAll(RegExp(r'/$'), '');
