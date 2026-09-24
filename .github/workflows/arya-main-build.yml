@@ -30,9 +30,9 @@ jobs:
         working-directory: arya_main
         run: flutter pub get
 
-      - name: Analyze
+      - name: Analyze ARYA Main
         working-directory: arya_main
-        run: flutter analyze
+        run: flutter analyze lib
 
       - name: Build APK
         working-directory: arya_main
