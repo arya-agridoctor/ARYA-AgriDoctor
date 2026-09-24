@@ -1,25 +1,31 @@
+# backend/main.py
+# ARYA AgriDoctor - Integrated Backend
+# FastAPI + SQLite + Open-Meteo + OpenAI
+# نسخه یکپارچه
+
 import os
+import re
+import json
 import sqlite3
 import hashlib
 import secrets
-import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 import requests
 from fastapi import FastAPI, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 
 # ============================================================
-# ARYA AgriDoctor Backend
-# Stage 2 - Security / Authentication
+# CONFIG
 # ============================================================
 
-APP_NAME = "ARYA AgriDoctor Backend"
-APP_VERSION = "1.0.0"
+APP_NAME = "ARYA AgriDoctor"
+VERSION = "2.0.0"
 
-DATABASE = os.getenv("ARYA_DATABASE", "arya.db")
+DB_PATH = os.getenv("ARYA_DB_PATH", "arya.db")
 
 MASTER_EMAIL = os.getenv("ARYA_MASTER_EMAIL", "")
 MASTER_SECRET = os.getenv("ARYA_MASTER_SECRET", "")
@@ -30,31 +36,107 @@ OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
 DAILY_AI_LIMIT = int(os.getenv("ARYA_DAILY_AI_LIMIT", "30"))
 DEVICE_LIMIT = int(os.getenv("ARYA_DEVICE_LIMIT", "3"))
 
-AI_INPUT_COST_PER_1M = float(
-    os.getenv("AI_INPUT_COST_PER_1M", "0")
-)
+ACCESS_TOKEN_DAYS = int(os.getenv("ARYA_ACCESS_TOKEN_DAYS", "30"))
+RESET_TOKEN_HOURS = int(os.getenv("ARYA_RESET_TOKEN_HOURS", "2"))
 
-AI_OUTPUT_COST_PER_1M = float(
-    os.getenv("AI_OUTPUT_COST_PER_1M", "0")
-)
+PBKDF2_ITERATIONS = 310000
 
-PASSWORD_ITERATIONS = int(
-    os.getenv("ARYA_PASSWORD_ITERATIONS", "200000")
-)
+OPEN_METEO_TIMEOUT = 20
 
-USER_TOKEN_DAYS = int(
-    os.getenv("ARYA_USER_TOKEN_DAYS", "30")
-)
 
-OWNER_TOKEN_HOURS = int(
-    os.getenv("ARYA_OWNER_TOKEN_HOURS", "12")
-)
-
+# ============================================================
+# APP
+# ============================================================
 
 app = FastAPI(
     title=APP_NAME,
-    version=APP_VERSION,
+    version=VERSION,
+    description="ARYA AgriDoctor Agricultural Intelligence Backend",
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ============================================================
+# GENERAL HELPERS
+# ============================================================
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def today_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def json_loads(value: Any, default=None):
+    if value is None:
+        return default
+
+    if isinstance(value, (dict, list)):
+        return value
+
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def hash_password(password: str, salt: Optional[str] = None) -> str:
+    if not password:
+        raise ValueError("password required")
+
+    if salt is None:
+        salt = secrets.token_hex(16)
+
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt),
+        PBKDF2_ITERATIONS,
+    )
+
+    return f"{salt}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        salt, digest = stored.split("$", 1)
+
+        calculated = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes.fromhex(salt),
+            PBKDF2_ITERATIONS,
+        ).hex()
+
+        return secrets.compare_digest(calculated, digest)
+    except Exception:
+        return False
+
+
+def normalize_text(value: Optional[str]) -> str:
+    if not value:
+        return ""
+
+    return re.sub(r"\s+", " ", value.strip())
+
+
+def safe_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return None
 
 
 # ============================================================
@@ -62,71 +144,84 @@ app = FastAPI(
 # ============================================================
 
 def db():
-    connection = sqlite3.connect(DATABASE)
-    connection.row_factory = sqlite3.Row
-    return connection
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
-def ensure_column(
-    connection,
-    table: str,
-    column: str,
-    definition: str,
+def execute(
+    sql: str,
+    params: tuple = (),
+    commit: bool = False,
 ):
-    columns = {
-        row["name"]
-        for row in connection.execute(
-            f"PRAGMA table_info({table})"
-        ).fetchall()
-    }
+    conn = db()
 
-    if column not in columns:
-        connection.execute(
-            f"ALTER TABLE {table} ADD COLUMN {column} {definition}"
-        )
+    try:
+        cur = conn.execute(sql, params)
+
+        if commit:
+            conn.commit()
+
+        return cur
+    finally:
+        conn.close()
+
+
+def fetchone(sql: str, params: tuple = ()):
+    conn = db()
+
+    try:
+        return conn.execute(sql, params).fetchone()
+    finally:
+        conn.close()
+
+
+def fetchall(sql: str, params: tuple = ()):
+    conn = db()
+
+    try:
+        return conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
 
 
 def init_db():
-    connection = db()
-    cursor = connection.cursor()
 
-    cursor.executescript(
+    conn = db()
+
+    conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT,
-            email TEXT UNIQUE,
-            phone TEXT,
-            country TEXT,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            name TEXT DEFAULT '',
             language TEXT DEFAULT 'fa',
             role TEXT DEFAULT 'user',
-            password_hash TEXT,
+            active INTEGER DEFAULT 1,
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS farms (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER NOT NULL,
-            name TEXT,
-            country TEXT,
-            region TEXT,
+            name TEXT DEFAULT '',
+            region TEXT DEFAULT '',
+            address TEXT DEFAULT '',
             latitude REAL,
             longitude REAL,
-            climate TEXT,
+            climate TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS lands (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             farm_id INTEGER NOT NULL,
-            name TEXT,
+            name TEXT DEFAULT '',
             area REAL,
-            area_unit TEXT DEFAULT 'hectare',
-            soil_type TEXT,
-            irrigation_type TEXT,
-            latitude REAL,
-            longitude REAL,
-            boundary_json TEXT,
+            soil_type TEXT DEFAULT '',
+            irrigation TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
 
@@ -134,154 +229,126 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             farm_id INTEGER,
             land_id INTEGER,
-            name TEXT,
-            variety TEXT,
-            planting_date TEXT,
-            area REAL,
-            status TEXT,
+            name TEXT NOT NULL,
+            variety TEXT DEFAULT '',
+            growth_stage TEXT DEFAULT '',
+            planting_date TEXT DEFAULT '',
+            notes TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS soil_lab_tests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            farm_id INTEGER NOT NULL,
             land_id INTEGER,
-            test_date TEXT,
-            ph REAL,
-            ec REAL,
-            nitrogen REAL,
-            phosphorus REAL,
-            potassium REAL,
-            organic_matter REAL,
-            salinity TEXT,
-            laboratory TEXT,
-            raw_json TEXT,
+            data TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS water_sources (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            farm_id INTEGER,
-            name TEXT,
-            source_type TEXT,
-            latitude REAL,
-            longitude REAL,
-            quantity REAL,
-            quality TEXT,
-            raw_json TEXT,
+            farm_id INTEGER NOT NULL,
+            name TEXT DEFAULT '',
+            source_type TEXT DEFAULT '',
+            salinity REAL,
+            ph REAL,
+            data TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS weather_observations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             farm_id INTEGER,
-            location TEXT,
             latitude REAL,
             longitude REAL,
-            observed_at TEXT,
-            temperature REAL,
-            humidity REAL,
-            rainfall REAL,
-            wind_speed REAL,
-            raw_json TEXT,
+            data TEXT NOT NULL,
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS recommendations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            user_id INTEGER NOT NULL,
             farm_id INTEGER,
-            category TEXT,
             question TEXT,
-            recommendation TEXT,
+            answer TEXT,
             confidence REAL,
-            risk TEXT,
+            data TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS ai_usage (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            request_id TEXT,
-            model TEXT,
-            input_tokens INTEGER DEFAULT 0,
-            output_tokens INTEGER DEFAULT 0,
-            input_cost REAL DEFAULT 0,
-            output_cost REAL DEFAULT 0,
-            total_cost REAL DEFAULT 0,
-            created_at TEXT NOT NULL
+            user_id INTEGER NOT NULL,
+            usage_date TEXT NOT NULL,
+            count INTEGER DEFAULT 0,
+            UNIQUE(user_id, usage_date)
         );
 
         CREATE TABLE IF NOT EXISTS payments (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            country TEXT,
-            method TEXT,
             amount REAL,
             currency TEXT,
-            reference TEXT,
+            method TEXT,
+            destination TEXT DEFAULT '',
+            transaction_id TEXT DEFAULT '',
             status TEXT DEFAULT 'pending',
-            verified_at TEXT,
+            data TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS subscriptions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            plan TEXT,
-            started_at TEXT,
-            expires_at TEXT,
+            user_id INTEGER NOT NULL,
+            plan TEXT DEFAULT '',
             status TEXT DEFAULT 'inactive',
+            expires_at TEXT,
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS activation_codes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code_hash TEXT UNIQUE,
-            duration_days INTEGER DEFAULT 365,
-            used INTEGER DEFAULT 0,
-            used_by INTEGER,
-            created_at TEXT NOT NULL,
-            used_at TEXT
+            code TEXT UNIQUE NOT NULL,
+            user_id INTEGER,
+            active INTEGER DEFAULT 1,
+            expires_at TEXT,
+            created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS devices (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            device_hash TEXT,
-            device_name TEXT,
+            user_id INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            platform TEXT DEFAULT '',
+            last_seen TEXT NOT NULL,
             active INTEGER DEFAULT 1,
-            created_at TEXT NOT NULL,
-            last_seen TEXT
+            UNIQUE(user_id, device_id)
         );
 
         CREATE TABLE IF NOT EXISTS feedback (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            category TEXT,
-            original_language TEXT,
-            original_text TEXT,
-            persian_translation TEXT,
+            language TEXT DEFAULT 'fa',
+            message TEXT NOT NULL,
+            translated_message TEXT DEFAULT '',
             status TEXT DEFAULT 'new',
-            attachment TEXT,
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS feedback_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            feedback_id INTEGER,
-            sender_role TEXT,
-            original_language TEXT,
-            original_text TEXT,
-            persian_text TEXT,
+            feedback_id INTEGER NOT NULL,
+            sender TEXT NOT NULL,
+            message TEXT NOT NULL,
+            language TEXT DEFAULT 'fa',
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            actor TEXT,
-            action TEXT,
-            target TEXT,
-            details TEXT,
+            user_id INTEGER,
+            action TEXT NOT NULL,
+            data TEXT DEFAULT '',
             created_at TEXT NOT NULL
         );
 
@@ -289,708 +356,125 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
             description TEXT,
-            change_json TEXT,
             status TEXT DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            reviewed_at TEXT,
-            reviewed_by TEXT
+            created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS knowledge_versions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            version TEXT,
-            title TEXT,
-            content TEXT,
-            status TEXT DEFAULT 'draft',
-            created_at TEXT NOT NULL,
-            approved_at TEXT
+            version TEXT NOT NULL,
+            title TEXT DEFAULT '',
+            content TEXT DEFAULT '',
+            active INTEGER DEFAULT 1,
+            created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS sync_queue (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
-            operation_id TEXT UNIQUE,
-            operation TEXT,
-            payload TEXT,
+            data TEXT NOT NULL,
             status TEXT DEFAULT 'pending',
-            created_at TEXT NOT NULL,
-            processed_at TEXT
+            created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
             title TEXT,
-            body TEXT,
-            type TEXT,
+            message TEXT,
             read INTEGER DEFAULT 0,
             created_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS system_settings (
             key TEXT PRIMARY KEY,
-            value TEXT,
+            value TEXT DEFAULT '',
             updated_at TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS auth_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            token_hash TEXT UNIQUE NOT NULL,
-            user_id INTEGER,
-            role TEXT NOT NULL,
-            created_at TEXT NOT NULL,
+            user_id INTEGER NOT NULL,
+            token TEXT UNIQUE NOT NULL,
             expires_at TEXT NOT NULL,
-            revoked INTEGER DEFAULT 0,
-            last_seen TEXT
+            created_at TEXT NOT NULL
         );
         """
     )
 
-    # Migration for databases created by older versions.
-    ensure_column(
-        connection,
-        "users",
-        "password_hash",
-        "TEXT",
-    )
-
-    connection.commit()
-    connection.close()
+    conn.commit()
+    conn.close()
 
 
 init_db()
 
 
 # ============================================================
-# GENERAL HELPERS
-# ============================================================
-
-def now_iso():
-    return datetime.now(timezone.utc).isoformat()
-
-
-def sha256(value: str):
-    return hashlib.sha256(
-        value.encode("utf-8")
-    ).hexdigest()
-
-
-# ============================================================
-# PASSWORD SECURITY
-# ============================================================
-
-def hash_password(password: str):
-    if not password:
-        raise ValueError("Password cannot be empty.")
-
-    salt = secrets.token_bytes(32)
-
-    derived = hashlib.pbkdf2_hmac(
-        "sha256",
-        password.encode("utf-8"),
-        salt,
-        PASSWORD_ITERATIONS,
-    )
-
-    return (
-        f"pbkdf2_sha256$"
-        f"{PASSWORD_ITERATIONS}$"
-        f"{salt.hex()}$"
-        f"{derived.hex()}"
-    )
-
-
-def verify_password(
-    password: str,
-    stored_hash: Optional[str],
-):
-    if not password or not stored_hash:
-        return False
-
-    try:
-        parts = stored_hash.split("$")
-
-        if len(parts) != 4:
-            return False
-
-        algorithm = parts[0]
-        iterations = int(parts[1])
-        salt = bytes.fromhex(parts[2])
-        expected = parts[3]
-
-        if algorithm != "pbkdf2_sha256":
-            return False
-
-        derived = hashlib.pbkdf2_hmac(
-            "sha256",
-            password.encode("utf-8"),
-            salt,
-            iterations,
-        )
-
-        return secrets.compare_digest(
-            derived.hex(),
-            expected,
-        )
-
-    except Exception:
-        return False
-
-
-# ============================================================
-# AUDIT
-# ============================================================
-
-def audit(
-    actor: str,
-    action: str,
-    target: str = "",
-    details: Any = None,
-):
-    connection = db()
-
-    connection.execute(
-        """
-        INSERT INTO audit_logs
-        (
-            actor,
-            action,
-            target,
-            details,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            actor,
-            action,
-            target,
-            json.dumps(
-                details,
-                ensure_ascii=False,
-            )
-            if details is not None
-            else "",
-            now_iso(),
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-
-# ============================================================
-# USER HELPERS
-# ============================================================
-
-def get_user(user_id: int):
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE id = ?
-        """,
-        (user_id,),
-    ).fetchone()
-
-    connection.close()
-
-    return row
-
-
-def get_user_by_email(email: str):
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT *
-        FROM users
-        WHERE lower(email) = lower(?)
-        """,
-        (email,),
-    ).fetchone()
-
-    connection.close()
-
-    return row
-
-
-# ============================================================
-# AUTH TOKEN HELPERS
-# ============================================================
-
-def create_auth_token(
-    user_id: Optional[int],
-    role: str,
-    lifetime: timedelta,
-):
-    raw_token = secrets.token_urlsafe(48)
-
-    token_hash = sha256(raw_token)
-
-    created = datetime.now(timezone.utc)
-
-    expires = created + lifetime
-
-    connection = db()
-
-    connection.execute(
-        """
-        INSERT INTO auth_tokens
-        (
-            token_hash,
-            user_id,
-            role,
-            created_at,
-            expires_at,
-            revoked,
-            last_seen
-        )
-        VALUES (?, ?, ?, ?, ?, 0, ?)
-        """,
-        (
-            token_hash,
-            user_id,
-            role,
-            created.isoformat(),
-            expires.isoformat(),
-            created.isoformat(),
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-    return raw_token, expires.isoformat()
-
-
-def extract_bearer_token(
-    authorization: Optional[str],
-):
-    if not authorization:
-        raise HTTPException(
-            status_code=401,
-            detail="Authorization token is required.",
-        )
-
-    parts = authorization.strip().split()
-
-    if len(parts) != 2:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authorization header.",
-        )
-
-    if parts[0].lower() != "bearer":
-        raise HTTPException(
-            status_code=401,
-            detail="Authorization must use Bearer token.",
-        )
-
-    if not parts[1]:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid bearer token.",
-        )
-
-    return parts[1]
-
-
-def authenticate(
-    authorization: Optional[str],
-):
-    raw_token = extract_bearer_token(
-        authorization
-    )
-
-    token_hash = sha256(raw_token)
-
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT *
-        FROM auth_tokens
-        WHERE token_hash = ?
-        AND revoked = 0
-        """,
-        (token_hash,),
-    ).fetchone()
-
-    if not row:
-        connection.close()
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or revoked token.",
-        )
-
-    try:
-        expires = datetime.fromisoformat(
-            row["expires_at"]
-        )
-    except Exception:
-        connection.close()
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid token expiration.",
-        )
-
-    if expires <= datetime.now(timezone.utc):
-        connection.execute(
-            """
-            UPDATE auth_tokens
-            SET revoked = 1
-            WHERE id = ?
-            """,
-            (row["id"],),
-        )
-
-        connection.commit()
-        connection.close()
-
-        raise HTTPException(
-            status_code=401,
-            detail="Token expired.",
-        )
-
-    connection.execute(
-        """
-        UPDATE auth_tokens
-        SET last_seen = ?
-        WHERE id = ?
-        """,
-        (
-            now_iso(),
-            row["id"],
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-    return {
-        "token_id": row["id"],
-        "user_id": row["user_id"],
-        "role": row["role"],
-    }
-
-
-def require_owner(
-    authorization: Optional[str],
-):
-    auth = authenticate(authorization)
-
-    if auth["role"] != "owner":
-        raise HTTPException(
-            status_code=403,
-            detail="OWNER access required.",
-        )
-
-    return auth
-
-
-def require_user(
-    user_id: int,
-    authorization: Optional[str],
-):
-    auth = authenticate(authorization)
-
-    if auth["role"] == "owner":
-        return auth
-
-    if auth["user_id"] != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="Access denied for this user.",
-        )
-
-    return auth
-
-
-# ============================================================
-# OWNERSHIP HELPERS
-# ============================================================
-
-def farm_owned_by_user(
-    farm_id: int,
-    user_id: int,
-):
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT id
-        FROM farms
-        WHERE id = ?
-        AND user_id = ?
-        """,
-        (
-            farm_id,
-            user_id,
-        ),
-    ).fetchone()
-
-    connection.close()
-
-    return row is not None
-
-
-def land_owned_by_user(
-    land_id: int,
-    user_id: int,
-):
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT lands.id
-        FROM lands
-        JOIN farms
-            ON farms.id = lands.farm_id
-        WHERE lands.id = ?
-        AND farms.user_id = ?
-        """,
-        (
-            land_id,
-            user_id,
-        ),
-    ).fetchone()
-
-    connection.close()
-
-    return row is not None
-
-
-def crop_owned_by_user(
-    farm_id: Optional[int],
-    land_id: Optional[int],
-    user_id: int,
-):
-    connection = db()
-
-    if farm_id is not None:
-        row = connection.execute(
-            """
-            SELECT crops.id
-            FROM crops
-            LEFT JOIN farms
-                ON farms.id = crops.farm_id
-            LEFT JOIN lands
-                ON lands.id = crops.land_id
-            LEFT JOIN farms AS land_farms
-                ON land_farms.id = lands.farm_id
-            WHERE (
-                farms.user_id = ?
-                OR land_farms.user_id = ?
-            )
-            AND crops.farm_id = ?
-            LIMIT 1
-            """,
-            (
-                user_id,
-                user_id,
-                farm_id,
-            ),
-        ).fetchone()
-
-    elif land_id is not None:
-        row = connection.execute(
-            """
-            SELECT crops.id
-            FROM crops
-            JOIN lands
-                ON lands.id = crops.land_id
-            JOIN farms
-                ON farms.id = lands.farm_id
-            WHERE crops.land_id = ?
-            AND farms.user_id = ?
-            LIMIT 1
-            """,
-            (
-                land_id,
-                user_id,
-            ),
-        ).fetchone()
-
-    else:
-        row = None
-
-    connection.close()
-
-    return row is not None
-
-
-# ============================================================
-# AI USAGE
-# ============================================================
-
-def ai_requests_today(user_id: int):
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT COUNT(*) AS count
-        FROM ai_usage
-        WHERE user_id = ?
-        AND created_at >= ?
-        """,
-        (
-            user_id,
-            datetime.now(timezone.utc)
-            .replace(
-                hour=0,
-                minute=0,
-                second=0,
-                microsecond=0,
-            )
-            .isoformat(),
-        ),
-    ).fetchone()
-
-    connection.close()
-
-    return int(row["count"])
-
-
-def save_ai_usage(
-    user_id: int,
-    request_id: str,
-    model: str,
-    input_tokens: int,
-    output_tokens: int,
-):
-    input_cost = (
-        input_tokens / 1_000_000
-    ) * AI_INPUT_COST_PER_1M
-
-    output_cost = (
-        output_tokens / 1_000_000
-    ) * AI_OUTPUT_COST_PER_1M
-
-    total_cost = (
-        input_cost + output_cost
-    )
-
-    connection = db()
-
-    connection.execute(
-        """
-        INSERT INTO ai_usage
-        (
-            user_id,
-            request_id,
-            model,
-            input_tokens,
-            output_tokens,
-            input_cost,
-            output_cost,
-            total_cost,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            user_id,
-            request_id,
-            model,
-            input_tokens,
-            output_tokens,
-            input_cost,
-            output_cost,
-            total_cost,
-            now_iso(),
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-
-# ============================================================
 # MODELS
 # ============================================================
 
-class UserCreate(BaseModel):
-    name: Optional[str] = None
+class RegisterRequest(BaseModel):
     email: str
-    password: str = Field(
-        min_length=8,
-        max_length=128,
-    )
-    phone: Optional[str] = None
-    country: Optional[str] = None
+    password: str
+    name: str = ""
     language: str = "fa"
 
 
-class UserLogin(BaseModel):
+class LoginRequest(BaseModel):
     email: str
     password: str
 
 
-class OwnerLogin(BaseModel):
-    email: str
-    secret: str
-
-
 class FarmCreate(BaseModel):
     user_id: int
-    name: str
-    country: Optional[str] = None
-    region: Optional[str] = None
+    name: str = ""
+    region: str = ""
+    address: str = ""
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-    climate: Optional[str] = None
 
 
 class LandCreate(BaseModel):
+    user_id: int
     farm_id: int
-    name: str
+    name: str = ""
     area: Optional[float] = None
-    area_unit: str = "hectare"
-    soil_type: Optional[str] = None
-    irrigation_type: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    boundary_json: Optional[str] = None
+    soil_type: str = ""
+    irrigation: str = ""
+    notes: str = ""
 
 
 class CropCreate(BaseModel):
-    farm_id: Optional[int] = None
+    user_id: int
+    farm_id: int
     land_id: Optional[int] = None
     name: str
-    variety: Optional[str] = None
-    planting_date: Optional[str] = None
-    area: Optional[float] = None
-    status: Optional[str] = "active"
+    variety: str = ""
+    growth_stage: str = ""
+    planting_date: str = ""
+    notes: str = ""
 
 
-class SoilLabCreate(BaseModel):
-    land_id: int
-    test_date: Optional[str] = None
-    ph: Optional[float] = None
-    ec: Optional[float] = None
-    nitrogen: Optional[float] = None
-    phosphorus: Optional[float] = None
-    potassium: Optional[float] = None
-    organic_matter: Optional[float] = None
-    salinity: Optional[str] = None
-    laboratory: Optional[str] = None
-    raw_json: Optional[dict] = None
-
-
-class WaterSourceCreate(BaseModel):
+class SoilLabRequest(BaseModel):
+    user_id: int
     farm_id: int
-    name: str
-    source_type: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    quantity: Optional[float] = None
-    quality: Optional[str] = None
-    raw_json: Optional[dict] = None
+    land_id: Optional[int] = None
+    data: dict = {}
+
+
+class WaterCreate(BaseModel):
+    user_id: int
+    farm_id: int
+    name: str = ""
+    source_type: str = ""
+    salinity: Optional[float] = None
+    ph: Optional[float] = None
+    data: dict = {}
+
+
+class WeatherRequest(BaseModel):
+    latitude: float
+    longitude: float
 
 
 class AIAsk(BaseModel):
@@ -1000,73 +484,156 @@ class AIAsk(BaseModel):
     crop: Optional[str] = None
     region: Optional[str] = None
     language: str = "fa"
+
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    address: Optional[str] = None
+
+    use_current_location: bool = False
+    use_user_provided_data: bool = True
+    use_global_knowledge: bool = True
+
+    deep_agricultural_analysis: bool = True
+    validate_user_information: bool = True
+    generate_alternatives: bool = True
+    generate_action_plan: bool = True
+    generate_schedule: bool = True
+    generate_alerts: bool = True
+
+    weather_analysis: bool = True
+    climate_analysis: bool = True
+    soil_analysis: bool = True
+    water_analysis: bool = True
+    crop_suitability: bool = True
+    pest_disease_analysis: bool = True
+    fertilizer_analysis: bool = True
+    image_analysis_ready: bool = True
+
+
+class RegionAnalysisRequest(BaseModel):
+    user_id: int
+    language: str = "fa"
+
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    address: Optional[str] = None
+    region: Optional[str] = None
+
+    use_current_location: bool = False
+    use_global_knowledge: bool = True
+
+
+class LocationResolveRequest(BaseModel):
+    address: Optional[str] = None
+    region: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
 
 
-class PaymentCreate(BaseModel):
+class FeedbackRequest(BaseModel):
     user_id: int
-    country: str
-    method: str
+    message: str
+    language: str = "fa"
+
+
+class PaymentRequest(BaseModel):
+    user_id: int
     amount: float
     currency: str
-    reference: Optional[str] = None
-
-
-class ActivationUse(BaseModel):
-    user_id: int
-    code: str
-    device_id: Optional[str] = None
-
-
-class DeviceCreate(BaseModel):
-    user_id: int
-    device_id: str
-    device_name: Optional[str] = None
-
-
-class FeedbackCreate(BaseModel):
-    user_id: Optional[int] = None
-    category: str
-    original_language: str
-    original_text: str
-    attachment: Optional[str] = None
-
-
-class AIProposalCreate(BaseModel):
-    title: str
-    description: str
-    change_json: Optional[dict] = None
-
-
-class ProposalDecision(BaseModel):
-    decision: str
-    reviewer: str
-
-
-class KnowledgeCreate(BaseModel):
-    version: str
-    title: str
-    content: str
-
-
-class SyncCreate(BaseModel):
-    user_id: int
-    operation_id: str
-    operation: str
-    payload: dict
+    method: str
+    transaction_id: str = ""
+    destination: str = ""
 
 
 # ============================================================
-# ROOT / HEALTH
+# AUTH
+# ============================================================
+
+def create_token(user_id: int) -> str:
+
+    token = secrets.token_urlsafe(48)
+
+    expires = (
+        datetime.now(timezone.utc)
+        + timedelta(days=ACCESS_TOKEN_DAYS)
+    ).isoformat()
+
+    execute(
+        """
+        INSERT INTO auth_tokens
+        (user_id, token, expires_at, created_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (user_id, token, expires, utc_now()),
+        True,
+    )
+
+    return token
+
+
+def get_user_from_token(token: Optional[str]):
+    if not token:
+        return None
+
+    row = fetchone(
+        """
+        SELECT u.*
+        FROM auth_tokens t
+        JOIN users u ON u.id=t.user_id
+        WHERE t.token=?
+        """,
+        (token,),
+    )
+
+    if not row:
+        return None
+
+    try:
+        expires = datetime.fromisoformat(row["expires_at"])
+
+        if expires < datetime.now(timezone.utc):
+            return None
+    except Exception:
+        return None
+
+    return row
+
+
+def require_user(
+    authorization: Optional[str],
+    user_id: Optional[int] = None,
+):
+
+    if not authorization:
+        raise HTTPException(401, "Authentication required")
+
+    token = authorization
+
+    if authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+
+    user = get_user_from_token(token)
+
+    if not user:
+        raise HTTPException(401, "Invalid or expired token")
+
+    if user_id is not None and int(user["id"]) != int(user_id):
+        if user["role"] != "owner":
+            raise HTTPException(403, "Access denied")
+
+    return user
+
+
+# ============================================================
+# HEALTH
 # ============================================================
 
 @app.get("/")
 def root():
     return {
-        "name": APP_NAME,
-        "version": APP_VERSION,
-        "status": "online",
+        "service": APP_NAME,
+        "version": VERSION,
+        "status": "ok",
     }
 
 
@@ -1075,179 +642,91 @@ def health():
     return {
         "status": "ok",
         "service": APP_NAME,
-        "version": APP_VERSION,
-        "time": now_iso(),
+        "version": VERSION,
+        "timestamp": utc_now(),
     }
 
 
 # ============================================================
-# AUTHENTICATION
+# REGISTER / LOGIN
 # ============================================================
 
 @app.post("/auth/register")
-def auth_register(data: UserCreate):
-    password_hash = hash_password(
-        data.password
+def register(data: RegisterRequest):
+
+    email = normalize_text(data.email).lower()
+
+    if not email or "@" not in email:
+        raise HTTPException(400, "Invalid email")
+
+    if len(data.password) < 6:
+        raise HTTPException(400, "Password must contain at least 6 characters")
+
+    exists = fetchone(
+        "SELECT id FROM users WHERE email=?",
+        (email,),
     )
 
-    connection = db()
+    if exists:
+        raise HTTPException(409, "Email already registered")
 
-    try:
-        cursor = connection.execute(
-            """
-            INSERT INTO users
-            (
-                name,
-                email,
-                phone,
-                country,
-                language,
-                role,
-                password_hash,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, 'user', ?, ?)
-            """,
-            (
-                data.name,
-                data.email.strip(),
-                data.phone,
-                data.country,
-                data.language,
-                password_hash,
-                now_iso(),
-            ),
-        )
+    password_hash = hash_password(data.password)
 
-        connection.commit()
-
-        user_id = cursor.lastrowid
-
-    except sqlite3.IntegrityError:
-        connection.close()
-
-        raise HTTPException(
-            status_code=409,
-            detail="User email already exists.",
-        )
-
-    connection.close()
-
-    audit(
-        "system",
-        "create_user",
-        str(user_id),
+    cur = execute(
+        """
+        INSERT INTO users
+        (email,password_hash,name,language,role,active,created_at)
+        VALUES (?,?,?,?,?,?,?)
+        """,
+        (
+            email,
+            password_hash,
+            normalize_text(data.name),
+            data.language,
+            "user",
+            1,
+            utc_now(),
+        ),
+        True,
     )
+
+    user_id = cur.lastrowid
+
+    token = create_token(user_id)
 
     return {
-        "id": user_id,
-        "status": "created",
-        "login_required": True,
+        "status": "ok",
+        "user_id": user_id,
+        "token": token,
     }
 
 
 @app.post("/auth/login")
-def auth_login(data: UserLogin):
-    user = get_user_by_email(
-        data.email.strip()
+def login(data: LoginRequest):
+
+    email = normalize_text(data.email).lower()
+
+    user = fetchone(
+        "SELECT * FROM users WHERE email=?",
+        (email,),
     )
 
-    if not user:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password.",
-        )
-
-    if not verify_password(
+    if not user or not verify_password(
         data.password,
         user["password_hash"],
     ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid email or password.",
-        )
+        raise HTTPException(401, "Invalid email or password")
 
-    role = user["role"] or "user"
+    if not user["active"]:
+        raise HTTPException(403, "Account disabled")
 
-    token, expires_at = create_auth_token(
-        user_id=int(user["id"]),
-        role=role,
-        lifetime=timedelta(
-            days=USER_TOKEN_DAYS
-        ),
-    )
-
-    audit(
-        str(user["id"]),
-        "user_login",
-        str(user["id"]),
-    )
+    token = create_token(user["id"])
 
     return {
-        "access_token": token,
-        "token_type": "bearer",
-        "expires_at": expires_at,
-        "user": {
-            "id": user["id"],
-            "name": user["name"],
-            "email": user["email"],
-            "country": user["country"],
-            "language": user["language"],
-            "role": role,
-        },
-    }
-
-
-@app.post("/owner/login")
-def owner_login(data: OwnerLogin):
-    if not MASTER_EMAIL or not MASTER_SECRET:
-        raise HTTPException(
-            status_code=503,
-            detail=(
-                "OWNER credentials are not configured "
-                "on the backend."
-            ),
-        )
-
-    email_ok = secrets.compare_digest(
-        data.email.strip(),
-        MASTER_EMAIL,
-    )
-
-    secret_ok = secrets.compare_digest(
-        data.secret,
-        MASTER_SECRET,
-    )
-
-    if not email_ok or not secret_ok:
-        audit(
-            "unknown",
-            "owner_login_failed",
-        )
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid OWNER credentials.",
-        )
-
-    token, expires_at = create_auth_token(
-        user_id=None,
-        role="owner",
-        lifetime=timedelta(
-            hours=OWNER_TOKEN_HOURS
-        ),
-    )
-
-    audit(
-        "owner",
-        "owner_login",
-    )
-
-    return {
-        "access_token": token,
-        "token_type": "bearer",
-        "expires_at": expires_at,
-        "role": "owner",
+        "status": "ok",
+        "user_id": user["id"],
+        "token": token,
+        "role": user["role"],
     }
 
 
@@ -1255,222 +734,40 @@ def owner_login(data: OwnerLogin):
 def auth_me(
     authorization: Optional[str] = Header(None),
 ):
-    auth = authenticate(
-        authorization
-    )
 
-    if auth["role"] == "owner":
-        return {
-            "authenticated": True,
-            "role": "owner",
-        }
-
-    user = get_user(
-        int(auth["user_id"])
-    )
-
-    if not user:
-        raise HTTPException(
-            status_code=401,
-            detail="User account not found.",
-        )
+    user = require_user(authorization)
 
     return {
-        "authenticated": True,
-        "role": user["role"] or "user",
+        "status": "ok",
         "user": {
             "id": user["id"],
-            "name": user["name"],
             "email": user["email"],
-            "country": user["country"],
+            "name": user["name"],
             "language": user["language"],
+            "role": user["role"],
         },
     }
 
 
 @app.post("/auth/logout")
-def auth_logout(
+def logout(
     authorization: Optional[str] = Header(None),
 ):
-    raw_token = extract_bearer_token(
-        authorization
-    )
 
-    token_hash = sha256(raw_token)
+    if authorization:
 
-    connection = db()
+        token = authorization
 
-    row = connection.execute(
-        """
-        SELECT *
-        FROM auth_tokens
-        WHERE token_hash = ?
-        AND revoked = 0
-        """,
-        (token_hash,),
-    ).fetchone()
+        if authorization.lower().startswith("bearer "):
+            token = authorization[7:].strip()
 
-    if not row:
-        connection.close()
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or revoked token.",
+        execute(
+            "DELETE FROM auth_tokens WHERE token=?",
+            (token,),
+            True,
         )
 
-    connection.execute(
-        """
-        UPDATE auth_tokens
-        SET revoked = 1
-        WHERE id = ?
-        """,
-        (row["id"],),
-    )
-
-    connection.commit()
-    connection.close()
-
-    actor = (
-        "owner"
-        if row["role"] == "owner"
-        else str(row["user_id"])
-    )
-
-    audit(
-        actor,
-        "logout",
-    )
-
-    return {
-        "status": "logged_out",
-    }
-
-
-# ============================================================
-# USERS
-# ============================================================
-
-@app.post("/users")
-def create_user(
-    data: UserCreate,
-):
-    password_hash = hash_password(
-        data.password
-    )
-
-    connection = db()
-
-    try:
-        cursor = connection.execute(
-            """
-            INSERT INTO users
-            (
-                name,
-                email,
-                phone,
-                country,
-                language,
-                role,
-                password_hash,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?, 'user', ?, ?)
-            """,
-            (
-                data.name,
-                data.email.strip(),
-                data.phone,
-                data.country,
-                data.language,
-                password_hash,
-                now_iso(),
-            ),
-        )
-
-        connection.commit()
-
-        user_id = cursor.lastrowid
-
-    except sqlite3.IntegrityError:
-        connection.close()
-
-        raise HTTPException(
-            status_code=409,
-            detail="User email already exists.",
-        )
-
-    connection.close()
-
-    audit(
-        "system",
-        "create_user",
-        str(user_id),
-    )
-
-    return {
-        "id": user_id,
-        "status": "created",
-    }
-
-
-@app.get("/users/{user_id}")
-def user_details(
-    user_id: int,
-    authorization: Optional[str] = Header(None),
-):
-    require_user(
-        user_id,
-        authorization,
-    )
-
-    user = get_user(user_id)
-
-    if not user:
-        raise HTTPException(
-            status_code=404,
-            detail="User not found.",
-        )
-
-    result = dict(user)
-
-    # Never expose password hashes.
-    result.pop("password_hash", None)
-
-    return result
-
-
-@app.get("/users")
-def users(
-    authorization: Optional[str] = Header(None),
-):
-    require_owner(
-        authorization
-    )
-
-    connection = db()
-
-    rows = connection.execute(
-        """
-        SELECT
-            id,
-            name,
-            email,
-            phone,
-            country,
-            language,
-            role,
-            created_at
-        FROM users
-        ORDER BY id DESC
-        """
-    ).fetchall()
-
-    connection.close()
-
-    return [
-        dict(row)
-        for row in rows
-    ]
+    return {"status": "ok"}
 
 
 # ============================================================
@@ -1482,55 +779,30 @@ def create_farm(
     data: FarmCreate,
     authorization: Optional[str] = Header(None),
 ):
-    require_user(
-        data.user_id,
-        authorization,
-    )
 
-    if not get_user(data.user_id):
-        raise HTTPException(
-            status_code=404,
-            detail="User not found.",
-        )
+    require_user(authorization, data.user_id)
 
-    connection = db()
-
-    cursor = connection.execute(
+    cur = execute(
         """
         INSERT INTO farms
-        (
-            user_id,
-            name,
-            country,
-            region,
-            latitude,
-            longitude,
-            climate,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id,name,region,address,latitude,longitude,created_at)
+        VALUES (?,?,?,?,?,?,?)
         """,
         (
             data.user_id,
             data.name,
-            data.country,
             data.region,
+            data.address,
             data.latitude,
             data.longitude,
-            data.climate,
-            now_iso(),
+            utc_now(),
         ),
+        True,
     )
 
-    connection.commit()
-
-    farm_id = cursor.lastrowid
-
-    connection.close()
-
     return {
-        "id": farm_id,
-        "status": "created",
+        "status": "ok",
+        "farm_id": cur.lastrowid,
     }
 
 
@@ -1539,29 +811,31 @@ def get_farms(
     user_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    require_user(
-        user_id,
-        authorization,
+
+    require_user(authorization, user_id)
+
+    rows = fetchall(
+        "SELECT * FROM farms WHERE user_id=? ORDER BY id DESC",
+        (user_id,),
     )
 
-    connection = db()
+    return {
+        "status": "ok",
+        "farms": [dict(r) for r in rows],
+    }
 
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM farms
-        WHERE user_id = ?
-        ORDER BY id DESC
-        """,
-        (user_id,),
-    ).fetchall()
 
-    connection.close()
+def verify_farm_owner(user_id: int, farm_id: int):
 
-    return [
-        dict(row)
-        for row in rows
-    ]
+    row = fetchone(
+        "SELECT * FROM farms WHERE id=? AND user_id=?",
+        (farm_id, user_id),
+    )
+
+    if not row:
+        raise HTTPException(403, "Farm not found or access denied")
+
+    return row
 
 
 # ============================================================
@@ -1573,154 +847,55 @@ def create_land(
     data: LandCreate,
     authorization: Optional[str] = Header(None),
 ):
-    auth = authenticate(
-        authorization
-    )
 
-    connection = db()
+    require_user(authorization, data.user_id)
 
-    farm = connection.execute(
-        """
-        SELECT *
-        FROM farms
-        WHERE id = ?
-        """,
-        (data.farm_id,),
-    ).fetchone()
+    verify_farm_owner(data.user_id, data.farm_id)
 
-    connection.close()
-
-    if not farm:
-        raise HTTPException(
-            status_code=404,
-            detail="Farm not found.",
-        )
-
-    if auth["role"] != "owner":
-        if auth["user_id"] != farm["user_id"]:
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied for this farm.",
-            )
-
-    connection = db()
-
-    cursor = connection.execute(
+    cur = execute(
         """
         INSERT INTO lands
-        (
-            farm_id,
-            name,
-            area,
-            area_unit,
-            soil_type,
-            irrigation_type,
-            latitude,
-            longitude,
-            boundary_json,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (farm_id,name,area,soil_type,irrigation,notes,created_at)
+        VALUES (?,?,?,?,?,?,?)
         """,
         (
             data.farm_id,
             data.name,
             data.area,
-            data.area_unit,
             data.soil_type,
-            data.irrigation_type,
-            data.latitude,
-            data.longitude,
-            data.boundary_json,
-            now_iso(),
+            data.irrigation,
+            data.notes,
+            utc_now(),
         ),
+        True,
     )
 
-    connection.commit()
-
-    land_id = cursor.lastrowid
-
-    connection.close()
-
     return {
-        "id": land_id,
-        "status": "created",
+        "status": "ok",
+        "land_id": cur.lastrowid,
     }
 
 
-@app.get("/lands")
-def lands(
-    farm_id: Optional[int] = None,
+@app.get("/lands/{farm_id}")
+def get_lands(
+    farm_id: int,
+    user_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    auth = authenticate(
-        authorization
+
+    require_user(authorization, user_id)
+
+    verify_farm_owner(user_id, farm_id)
+
+    rows = fetchall(
+        "SELECT * FROM lands WHERE farm_id=?",
+        (farm_id,),
     )
 
-    connection = db()
-
-    if farm_id is None:
-        if auth["role"] != "owner":
-            connection.close()
-
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "farm_id is required for user access."
-                ),
-            )
-
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM lands
-            ORDER BY id DESC
-            """
-        ).fetchall()
-
-    else:
-        if auth["role"] != "owner":
-            farm = connection.execute(
-                """
-                SELECT user_id
-                FROM farms
-                WHERE id = ?
-                """,
-                (farm_id,),
-            ).fetchone()
-
-            if not farm:
-                connection.close()
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Farm not found.",
-                )
-
-            if farm["user_id"] != auth["user_id"]:
-                connection.close()
-
-                raise HTTPException(
-                    status_code=403,
-                    detail="Access denied.",
-                )
-
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM lands
-            WHERE farm_id = ?
-            ORDER BY id DESC
-            """,
-            (farm_id,),
-        ).fetchall()
-
-    connection.close()
-
-    return [
-        dict(row)
-        for row in rows
-    ]
+    return {
+        "status": "ok",
+        "lands": [dict(r) for r in rows],
+    }
 
 
 # ============================================================
@@ -1732,234 +907,57 @@ def create_crop(
     data: CropCreate,
     authorization: Optional[str] = Header(None),
 ):
-    auth = authenticate(
-        authorization
-    )
 
-    if (
-        data.farm_id is None
-        and data.land_id is None
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "farm_id or land_id is required."
-            ),
-        )
+    require_user(authorization, data.user_id)
 
-    connection = db()
+    verify_farm_owner(data.user_id, data.farm_id)
 
-    if data.land_id is not None:
-        land = connection.execute(
-            """
-            SELECT
-                lands.id,
-                lands.farm_id,
-                farms.user_id
-            FROM lands
-            JOIN farms
-                ON farms.id = lands.farm_id
-            WHERE lands.id = ?
-            """,
-            (data.land_id,),
-        ).fetchone()
-
-        if not land:
-            connection.close()
-
-            raise HTTPException(
-                status_code=404,
-                detail="Land not found.",
-            )
-
-        if (
-            auth["role"] != "owner"
-            and land["user_id"] != auth["user_id"]
-        ):
-            connection.close()
-
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied.",
-            )
-
-    if data.farm_id is not None:
-        farm = connection.execute(
-            """
-            SELECT user_id
-            FROM farms
-            WHERE id = ?
-            """,
-            (data.farm_id,),
-        ).fetchone()
-
-        if not farm:
-            connection.close()
-
-            raise HTTPException(
-                status_code=404,
-                detail="Farm not found.",
-            )
-
-        if (
-            auth["role"] != "owner"
-            and farm["user_id"] != auth["user_id"]
-        ):
-            connection.close()
-
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied.",
-            )
-
-    cursor = connection.execute(
+    cur = execute(
         """
         INSERT INTO crops
-        (
-            farm_id,
-            land_id,
-            name,
-            variety,
-            planting_date,
-            area,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (farm_id,land_id,name,variety,growth_stage,
+         planting_date,notes,created_at)
+        VALUES (?,?,?,?,?,?,?,?)
         """,
         (
             data.farm_id,
             data.land_id,
             data.name,
             data.variety,
+            data.growth_stage,
             data.planting_date,
-            data.area,
-            data.status,
-            now_iso(),
+            data.notes,
+            utc_now(),
         ),
+        True,
     )
 
-    connection.commit()
-
-    crop_id = cursor.lastrowid
-
-    connection.close()
-
     return {
-        "id": crop_id,
-        "status": "created",
+        "status": "ok",
+        "crop_id": cur.lastrowid,
     }
 
 
-@app.get("/crops")
-def crops(
-    farm_id: Optional[int] = None,
-    land_id: Optional[int] = None,
+@app.get("/crops/{farm_id}")
+def get_crops(
+    farm_id: int,
+    user_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    auth = authenticate(
-        authorization
+
+    require_user(authorization, user_id)
+
+    verify_farm_owner(user_id, farm_id)
+
+    rows = fetchall(
+        "SELECT * FROM crops WHERE farm_id=?",
+        (farm_id,),
     )
 
-    connection = db()
-
-    if auth["role"] != "owner":
-
-        if (
-            farm_id is None
-            and land_id is None
-        ):
-            connection.close()
-
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "farm_id or land_id is required "
-                    "for user access."
-                ),
-            )
-
-        if farm_id is not None:
-            farm = connection.execute(
-                """
-                SELECT user_id
-                FROM farms
-                WHERE id = ?
-                """,
-                (farm_id,),
-            ).fetchone()
-
-            if not farm:
-                connection.close()
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Farm not found.",
-                )
-
-            if farm["user_id"] != auth["user_id"]:
-                connection.close()
-
-                raise HTTPException(
-                    status_code=403,
-                    detail="Access denied.",
-                )
-
-        if land_id is not None:
-            land = connection.execute(
-                """
-                SELECT farms.user_id
-                FROM lands
-                JOIN farms
-                    ON farms.id = lands.farm_id
-                WHERE lands.id = ?
-                """,
-                (land_id,),
-            ).fetchone()
-
-            if not land:
-                connection.close()
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Land not found.",
-                )
-
-            if land["user_id"] != auth["user_id"]:
-                connection.close()
-
-                raise HTTPException(
-                    status_code=403,
-                    detail="Access denied.",
-                )
-
-    query = (
-        "SELECT * FROM crops WHERE 1=1"
-    )
-
-    params = []
-
-    if farm_id is not None:
-        query += " AND farm_id = ?"
-        params.append(farm_id)
-
-    if land_id is not None:
-        query += " AND land_id = ?"
-        params.append(land_id)
-
-    query += " ORDER BY id DESC"
-
-    rows = connection.execute(
-        query,
-        params,
-    ).fetchall()
-
-    connection.close()
-
-    return [
-        dict(row)
-        for row in rows
-    ]
+    return {
+        "status": "ok",
+        "crops": [dict(r) for r in rows],
+    }
 
 
 # ============================================================
@@ -1968,171 +966,68 @@ def crops(
 
 @app.post("/soil/lab")
 def save_soil_lab(
-    data: SoilLabCreate,
+    data: SoilLabRequest,
     authorization: Optional[str] = Header(None),
 ):
-    auth = authenticate(
-        authorization
-    )
 
-    if auth["role"] != "owner":
-        if not land_owned_by_user(
-            data.land_id,
-            auth["user_id"],
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied.",
-            )
+    require_user(authorization, data.user_id)
 
-    connection = db()
+    verify_farm_owner(data.user_id, data.farm_id)
 
-    land = connection.execute(
-        """
-        SELECT id
-        FROM lands
-        WHERE id = ?
-        """,
-        (data.land_id,),
-    ).fetchone()
-
-    if not land:
-        connection.close()
-
-        raise HTTPException(
-            status_code=404,
-            detail="Land not found.",
-        )
-
-    cursor = connection.execute(
+    cur = execute(
         """
         INSERT INTO soil_lab_tests
-        (
-            land_id,
-            test_date,
-            ph,
-            ec,
-            nitrogen,
-            phosphorus,
-            potassium,
-            organic_matter,
-            salinity,
-            laboratory,
-            raw_json,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (farm_id,land_id,data,created_at)
+        VALUES (?,?,?,?)
         """,
         (
+            data.farm_id,
             data.land_id,
-            data.test_date,
-            data.ph,
-            data.ec,
-            data.nitrogen,
-            data.phosphorus,
-            data.potassium,
-            data.organic_matter,
-            data.salinity,
-            data.laboratory,
-            json.dumps(
-                data.raw_json,
-                ensure_ascii=False,
-            )
-            if data.raw_json
-            else None,
-            now_iso(),
+            json_dumps(data.data),
+            utc_now(),
         ),
+        True,
     )
 
-    connection.commit()
-
-    record_id = cursor.lastrowid
-
-    connection.close()
-
     return {
-        "id": record_id,
-        "status": "saved",
+        "status": "ok",
+        "soil_lab_id": cur.lastrowid,
     }
 
 
-@app.get("/soil/lab")
+@app.get("/soil/lab/{farm_id}")
 def get_soil_lab(
-    land_id: Optional[int] = None,
+    farm_id: int,
+    user_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    auth = authenticate(
-        authorization
+
+    require_user(authorization, user_id)
+
+    verify_farm_owner(user_id, farm_id)
+
+    rows = fetchall(
+        """
+        SELECT * FROM soil_lab_tests
+        WHERE farm_id=?
+        ORDER BY id DESC
+        """,
+        (farm_id,),
     )
 
-    connection = db()
+    result = []
 
-    if land_id is None:
+    for row in rows:
 
-        if auth["role"] != "owner":
-            connection.close()
+        item = dict(row)
+        item["data"] = json_loads(item["data"], {})
 
-            raise HTTPException(
-                status_code=403,
-                detail=(
-                    "land_id is required for user access."
-                ),
-            )
+        result.append(item)
 
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM soil_lab_tests
-            ORDER BY id DESC
-            """
-        ).fetchall()
-
-    else:
-
-        if auth["role"] != "owner":
-            land = connection.execute(
-                """
-                SELECT farms.user_id
-                FROM lands
-                JOIN farms
-                    ON farms.id = lands.farm_id
-                WHERE lands.id = ?
-                """,
-                (land_id,),
-            ).fetchone()
-
-            if not land:
-                connection.close()
-
-                raise HTTPException(
-                    status_code=404,
-                    detail="Land not found.",
-                )
-
-            if land["user_id"] != auth["user_id"]:
-                connection.close()
-
-                raise HTTPException(
-                    status_code=403,
-                    detail="Access denied.",
-                )
-
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM soil_lab_tests
-            WHERE land_id = ?
-            ORDER BY id DESC
-            """,
-            (land_id,),
-        ).fetchall()
-
-    connection.close()
-
-    return [
-        dict(row)
-        for row in rows
-    ]
+    return {
+        "status": "ok",
+        "tests": result,
+    }
 
 
 # ============================================================
@@ -2140,86 +1035,67 @@ def get_soil_lab(
 # ============================================================
 
 @app.post("/water")
-def create_water_source(
-    data: WaterSourceCreate,
+def create_water(
+    data: WaterCreate,
     authorization: Optional[str] = Header(None),
 ):
-    auth = authenticate(
-        authorization
-    )
 
-    if auth["role"] != "owner":
-        if not farm_owned_by_user(
-            data.farm_id,
-            auth["user_id"],
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied.",
-            )
+    require_user(authorization, data.user_id)
 
-    connection = db()
+    verify_farm_owner(data.user_id, data.farm_id)
 
-    farm = connection.execute(
-        """
-        SELECT id
-        FROM farms
-        WHERE id = ?
-        """,
-        (data.farm_id,),
-    ).fetchone()
-
-    if not farm:
-        connection.close()
-
-        raise HTTPException(
-            status_code=404,
-            detail="Farm not found.",
-        )
-
-    cursor = connection.execute(
+    cur = execute(
         """
         INSERT INTO water_sources
-        (
-            farm_id,
-            name,
-            source_type,
-            latitude,
-            longitude,
-            quantity,
-            quality,
-            raw_json,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        (farm_id,name,source_type,salinity,ph,data,created_at)
+        VALUES (?,?,?,?,?,?,?)
         """,
         (
             data.farm_id,
             data.name,
             data.source_type,
-            data.latitude,
-            data.longitude,
-            data.quantity,
-            data.quality,
-            json.dumps(
-                data.raw_json,
-                ensure_ascii=False,
-            )
-            if data.raw_json
-            else None,
-            now_iso(),
+            data.salinity,
+            data.ph,
+            json_dumps(data.data),
+            utc_now(),
         ),
+        True,
     )
 
-    connection.commit()
+    return {
+        "status": "ok",
+        "water_id": cur.lastrowid,
+    }
 
-    water_id = cursor.lastrowid
 
-    connection.close()
+@app.get("/water/{farm_id}")
+def get_water(
+    farm_id: int,
+    user_id: int,
+    authorization: Optional[str] = Header(None),
+):
+
+    require_user(authorization, user_id)
+
+    verify_farm_owner(user_id, farm_id)
+
+    rows = fetchall(
+        "SELECT * FROM water_sources WHERE farm_id=?",
+        (farm_id,),
+    )
+
+    result = []
+
+    for row in rows:
+
+        item = dict(row)
+        item["data"] = json_loads(item["data"], {})
+
+        result.append(item)
 
     return {
-        "id": water_id,
-        "status": "created",
+        "status": "ok",
+        "water": result,
     }
 
 
@@ -2227,345 +1103,1272 @@ def create_water_source(
 # WEATHER
 # ============================================================
 
-@app.get("/weather")
+def get_weather_data(latitude: float, longitude: float):
+
+    url = "https://api.open-meteo.com/v1/forecast"
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "current": (
+            "temperature_2m,"
+            "relative_humidity_2m,"
+            "precipitation,"
+            "wind_speed_10m,"
+            "weather_code"
+        ),
+        "daily": (
+            "temperature_2m_max,"
+            "temperature_2m_min,"
+            "precipitation_sum,"
+            "wind_speed_10m_max,"
+            "relative_humidity_2m_max,"
+            "relative_humidity_2m_min"
+        ),
+        "forecast_days": 7,
+        "timezone": "auto",
+    }
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=OPEN_METEO_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+@app.post("/weather")
 def weather(
-    latitude: float,
-    longitude: float,
+    data: WeatherRequest,
 ):
+
     try:
-        forecast_url = (
-            "https://api.open-meteo.com/v1/forecast"
+
+        result = get_weather_data(
+            data.latitude,
+            data.longitude,
         )
-
-        params = {
-            "latitude": latitude,
-            "longitude": longitude,
-            "current": (
-                "temperature_2m,"
-                "relative_humidity_2m,"
-                "precipitation,"
-                "wind_speed_10m"
-            ),
-            "daily": (
-                "temperature_2m_max,"
-                "temperature_2m_min,"
-                "precipitation_sum"
-            ),
-            "timezone": "auto",
-            "forecast_days": 7,
-        }
-
-        response = requests.get(
-            forecast_url,
-            params=params,
-            timeout=15,
-        )
-
-        response.raise_for_status()
-
-        result = response.json()
 
         return {
             "status": "ok",
-            "latitude": latitude,
-            "longitude": longitude,
+            "latitude": data.latitude,
+            "longitude": data.longitude,
             "data": result,
         }
 
     except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                f"Weather service error: {exc}"
-            ),
-        )
+
+        return {
+            "status": "error",
+            "message": str(exc),
+        }
 
 
 # ============================================================
-# AI
+# CLIMATE / MULTI-YEAR DATA
+# ============================================================
+
+def get_climate_data(
+    latitude: float,
+    longitude: float,
+    years: int = 5,
+):
+
+    end = datetime.now(timezone.utc).date()
+
+    start = end.replace(
+        year=max(1940, end.year - years)
+    )
+
+    url = "https://archive-api.open-meteo.com/v1/archive"
+
+    params = {
+        "latitude": latitude,
+        "longitude": longitude,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "daily": (
+            "temperature_2m_mean,"
+            "temperature_2m_max,"
+            "temperature_2m_min,"
+            "precipitation_sum"
+        ),
+        "timezone": "auto",
+    }
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=OPEN_METEO_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+# ============================================================
+# GEOCODING
+# ============================================================
+
+def geocode_address(address: str):
+
+    if not address:
+        return None
+
+    response = requests.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={
+            "name": address,
+            "count": 5,
+            "language": "en",
+            "format": "json",
+        },
+        timeout=OPEN_METEO_TIMEOUT,
+    )
+
+    response.raise_for_status()
+
+    data = response.json()
+
+    results = data.get("results") or []
+
+    if not results:
+        return None
+
+    result = results[0]
+
+    return {
+        "name": result.get("name"),
+        "country": result.get("country"),
+        "country_code": result.get("country_code"),
+        "admin1": result.get("admin1"),
+        "latitude": result.get("latitude"),
+        "longitude": result.get("longitude"),
+        "timezone": result.get("timezone"),
+    }
+
+
+@app.post("/location/resolve")
+def resolve_location(data: LocationResolveRequest):
+
+    latitude = data.latitude
+    longitude = data.longitude
+
+    geocoded = None
+
+    if latitude is not None and longitude is not None:
+
+        if not -90 <= latitude <= 90:
+            raise HTTPException(400, "Invalid latitude")
+
+        if not -180 <= longitude <= 180:
+            raise HTTPException(400, "Invalid longitude")
+
+    elif data.address or data.region:
+
+        query = data.address or data.region
+
+        try:
+            geocoded = geocode_address(query)
+        except Exception as exc:
+            return {
+                "status": "error",
+                "message": f"Location lookup failed: {exc}",
+            }
+
+        if not geocoded:
+            return {
+                "status": "not_found",
+                "message": "Location not found",
+            }
+
+        latitude = geocoded["latitude"]
+        longitude = geocoded["longitude"]
+
+    else:
+
+        return {
+            "status": "missing",
+            "message": "Provide address, region, or coordinates",
+        }
+
+    return {
+        "status": "ok",
+        "latitude": latitude,
+        "longitude": longitude,
+        "address": data.address,
+        "region": data.region,
+        "resolved": geocoded,
+    }
+
+
+# ============================================================
+# FARM CONTEXT
+# ============================================================
+
+def collect_farm_context(
+    user_id: int,
+    farm_id: Optional[int],
+):
+
+    context = {
+        "farm": None,
+        "lands": [],
+        "crops": [],
+        "soil_lab": [],
+        "water": [],
+    }
+
+    if not farm_id:
+        return context
+
+    farm = verify_farm_owner(
+        user_id,
+        farm_id,
+    )
+
+    context["farm"] = dict(farm)
+
+    lands = fetchall(
+        "SELECT * FROM lands WHERE farm_id=?",
+        (farm_id,),
+    )
+
+    context["lands"] = [
+        dict(x) for x in lands
+    ]
+
+    crops = fetchall(
+        "SELECT * FROM crops WHERE farm_id=?",
+        (farm_id,),
+    )
+
+    context["crops"] = [
+        dict(x) for x in crops
+    ]
+
+    soil = fetchall(
+        "SELECT * FROM soil_lab_tests WHERE farm_id=?",
+        (farm_id,),
+    )
+
+    for item in soil:
+
+        obj = dict(item)
+        obj["data"] = json_loads(
+            obj.get("data"),
+            {},
+        )
+
+        context["soil_lab"].append(obj)
+
+    water = fetchall(
+        "SELECT * FROM water_sources WHERE farm_id=?",
+        (farm_id,),
+    )
+
+    for item in water:
+
+        obj = dict(item)
+        obj["data"] = json_loads(
+            obj.get("data"),
+            {},
+        )
+
+        context["water"].append(obj)
+
+    return context
+
+
+# ============================================================
+# USER DATA VALIDATION
+# ============================================================
+
+def validate_location(
+    latitude,
+    longitude,
+):
+
+    errors = []
+    warnings = []
+
+    if latitude is None or longitude is None:
+        errors.append(
+            "مختصات جغرافیایی برای تحلیل مکانی کامل موجود نیست."
+        )
+        return {
+            "valid": False,
+            "errors": errors,
+            "warnings": warnings,
+        }
+
+    if not -90 <= latitude <= 90:
+        errors.append("عرض جغرافیایی نامعتبر است.")
+
+    if not -180 <= longitude <= 180:
+        errors.append("طول جغرافیایی نامعتبر است.")
+
+    if latitude == 0 and longitude == 0:
+        warnings.append(
+            "مختصات صفر وارد شده و ممکن است مختصات واقعی مزرعه نباشد."
+        )
+
+    return {
+        "valid": len(errors) == 0,
+        "errors": errors,
+        "warnings": warnings,
+    }
+
+
+def validate_user_context(context: dict):
+
+    warnings = []
+    contradictions = []
+
+    farm = context.get("farm") or {}
+
+    area_values = []
+
+    for land in context.get("lands", []):
+
+        area = safe_float(
+            land.get("area")
+        )
+
+        if area is not None:
+            area_values.append(area)
+
+            if area < 0:
+                contradictions.append(
+                    "مساحت زمین نمی‌تواند منفی باشد."
+                )
+
+    for crop in context.get("crops", []):
+
+        name = normalize_text(
+            crop.get("name")
+        )
+
+        if not name:
+            contradictions.append(
+                "یک رکورد کشت بدون نام محصول وجود دارد."
+            )
+
+    for soil in context.get("soil_lab", []):
+
+        data = soil.get("data") or {}
+
+        ph = safe_float(
+            data.get("ph")
+            if isinstance(data, dict)
+            else None
+        )
+
+        if ph is not None:
+
+            if ph < 0 or ph > 14:
+                contradictions.append(
+                    "pH آزمایش خاک خارج از محدوده معتبر است."
+                )
+
+    return {
+        "valid": len(contradictions) == 0,
+        "warnings": warnings,
+        "contradictions": contradictions,
+        "farm_name": farm.get("name", ""),
+        "total_land_records": len(
+            context.get("lands", [])
+        ),
+        "crop_records": len(
+            context.get("crops", [])
+        ),
+    }
+
+
+# ============================================================
+# LOCAL AGRICULTURAL ENGINE
 # ============================================================
 
 def local_agri_answer(
     question: str,
     crop: Optional[str] = None,
+    region: Optional[str] = None,
 ):
-    q = question.lower()
 
-    if (
-        "زرد" in q
-        or "زردی" in q
-        or "برگ" in q
+    q = normalize_text(question).lower()
+
+    points = []
+
+    if any(
+        x in q
+        for x in [
+            "زرد",
+            "زردی",
+            "yellow",
+            "برگ",
+            "leaf",
+        ]
     ):
-        return (
-            "زردی برگ می‌تواند علت‌های مختلفی داشته باشد؛ "
-            "از کمبود عناصر غذایی و مشکل آبیاری تا بیماری ریشه "
-            "یا شرایط نامناسب خاک. برای تشخیص دقیق‌تر باید "
-            "نوع گیاه، سن، محل زردی، وضعیت آبیاری، خاک و در "
-            "صورت امکان تصویر برگ بررسی شود."
+        points.extend(
+            [
+                "کمبود یا عدم تعادل عناصر غذایی",
+                "مشکل آبیاری یا زهکشی",
+                "شوری خاک یا آب",
+                "آسیب ریشه",
+                "بیماری یا آفت",
+            ]
         )
 
-    if (
-        "آبیاری" in q
-        or "آب" in q
+    if any(
+        x in q
+        for x in [
+            "آبیاری",
+            "آب",
+            "irrigation",
+            "water",
+        ]
     ):
-        return (
-            "برنامه آبیاری باید بر اساس نوع محصول، مرحله رشد، "
-            "نوع خاک، دما، بارندگی، روش آبیاری و رطوبت خاک "
-            "تنظیم شود. از آبیاری صرفاً بر اساس یک فاصله زمانی "
-            "ثابت خودداری کنید."
+        points.extend(
+            [
+                "نیاز آبی باید بر اساس محصول، مرحله رشد، بافت خاک، دما و تبخیرتعرق بررسی شود.",
+                "آبیاری بیش از نیاز می‌تواند باعث کمبود اکسیژن ریشه و افزایش بیماری‌های ریشه‌ای شود.",
+            ]
         )
 
-    if "کود" in q:
-        return (
-            "انتخاب کود باید بر اساس نیاز محصول و در صورت "
-            "امکان نتیجه آزمایش خاک و آب انجام شود. مقدار "
-            "کود بدون اطلاعات آزمایشگاهی نباید به‌صورت قطعی "
-            "تجویز شود."
-        )
-
-    if (
-        "سم" in q
-        or "آفت" in q
-        or "بیماری" in q
+    if any(
+        x in q
+        for x in [
+            "کود",
+            "fertilizer",
+            "ازت",
+            "نیتروژن",
+            "فسفر",
+            "پتاس",
+        ]
     ):
-        return (
-            "برای انتخاب روش کنترل، ابتدا باید آفت یا بیماری "
-            "شناسایی شود. تصویر، محصول، مرحله رشد، منطقه و "
-            "علائم لازم است. استفاده از سم بدون شناسایی دقیق "
-            "می‌تواند باعث خسارت و مقاومت آفت شود."
+        points.extend(
+            [
+                "انتخاب کود باید بر اساس آزمایش خاک، محصول، مرحله رشد و هدف تولید انجام شود.",
+                "مصرف کود بدون بررسی شرایط خاک و محصول می‌تواند باعث عدم تعادل غذایی یا شوری شود.",
+            ]
         )
 
-    return (
-        "برای تحلیل دقیق‌تر، ARYA باید اطلاعات محصول، منطقه، "
-        "شرایط آب‌وهوا، خاک، آب، مرحله رشد و علائم موجود را "
-        "دریافت و اعتبارسنجی کند. در صورت کمبود اطلاعات، "
-        "ابتدا فقط داده‌های ضروری را درخواست می‌کند."
-    )
+    if any(
+        x in q
+        for x in [
+            "آفت",
+            "حشره",
+            "بیماری",
+            "سم",
+            "pest",
+            "disease",
+            "pesticide",
+        ]
+    ):
+        points.extend(
+            [
+                "تشخیص آفت یا بیماری فقط از روی یک علامت قطعی نیست.",
+                "برای انتخاب سم باید محصول، عامل، مرحله رشد، شدت آلودگی و برچسب رسمی محصول مشخص باشد.",
+            ]
+        )
+
+    if not points:
+
+        points.append(
+            "برای پاسخ دقیق، محصول، مرحله رشد، محل مزرعه، وضعیت خاک، آب، "
+            "شرایط آب‌وهوا و علائم مشاهده‌شده باید بررسی شوند."
+        )
+
+    return {
+        "answer": "\n".join(
+            f"• {x}" for x in points
+        ),
+        "confidence": 0.45 if not crop else 0.60,
+    }
+
+
+# ============================================================
+# OPENAI AGRICULTURAL ENGINE
+# ============================================================
+
+def build_agri_system_prompt(language: str):
+
+    return f"""
+You are ARYA AgriDoctor, a professional agricultural intelligence system.
+
+Answer language: {language}
+
+Your job is to provide practical, technically reasoned agricultural analysis.
+
+You must consider, when available:
+
+- exact farm location
+- coordinates
+- climate
+- current weather
+- multi-year climate information
+- crop and cultivar
+- growth stage
+- soil type
+- laboratory soil analysis
+- irrigation
+- water quality
+- pests
+- diseases
+- symptoms
+- fertilizer
+- agricultural management
+- images when provided
+- user observations
+- global agricultural knowledge
+
+IMPORTANT:
+
+1. Never invent laboratory results.
+2. Never pretend an uncertain diagnosis is certain.
+3. Separate confirmed facts, probable causes and possibilities.
+4. If information conflicts, identify the conflict.
+5. If user-provided information appears incorrect, explain why.
+6. Do not blindly accept user data.
+7. If important data is missing, identify exactly what is missing.
+8. If a crop is unsuitable for a region, explain the limiting factors and provide suitable alternatives.
+9. For pesticides, do not invent doses.
+10. Pesticide recommendations must depend on registered product, active ingredient,
+   crop, pest/disease, formulation, local regulations and label.
+11. Fertilizer recommendations must consider soil test, crop and growth stage.
+12. Do not claim guaranteed yield.
+13. When yield is discussed, give a conditional range and explain assumptions.
+14. Provide an actionable plan when sufficient information exists.
+15. Provide a schedule when timing is important.
+16. Provide warnings when there are important risks.
+17. Use metric units unless the user asks otherwise.
+18. If an image is not available, do not pretend that you analyzed an image.
+19. Do not respond with phrases such as "request registered" as the actual answer.
+20. Give the agricultural answer directly.
+21. If several explanations are possible, rank them by evidence,
+    but clearly state that the ranking is provisional.
+22. Consider local climate and season.
+23. Consider both the user's supplied data and broader agricultural knowledge.
+24. If user data and broader evidence disagree, show both and explain the discrepancy.
+
+Return a structured agricultural answer containing:
+
+- direct_answer
+- facts
+- likely_causes
+- data_validation
+- missing_data
+- recommendations
+- alternatives
+- action_plan
+- schedule
+- alerts
+- confidence
+
+Do not fabricate unavailable data.
+"""
 
 
 def openai_answer(
     question: str,
     language: str,
+    context_packet: dict,
 ):
+
+    if not OPENAI_API_KEY:
+        return None
+
     try:
+
         from openai import OpenAI
 
         client = OpenAI(
             api_key=OPENAI_API_KEY
         )
 
-        system_prompt = """
-You are ARYA AgriDoctor, an agricultural AI assistant.
-
-You must:
-- distinguish known facts from uncertainty
-- never claim zero-error diagnosis
-- request missing critical agricultural data
-- consider crop, growth stage, location, weather,
-  soil, water, irrigation and images when available
-- avoid unsafe pesticide prescriptions without sufficient data
-- explain uncertainty and confidence
-- recommend expert/laboratory verification when appropriate
-"""
+        prompt = (
+            "USER QUESTION:\n"
+            + question
+            + "\n\nAGRICULTURAL CONTEXT:\n"
+            + json_dumps(context_packet)
+        )
 
         response = client.responses.create(
             model=OPENAI_MODEL,
-            input=[
-                {
-                    "role": "system",
-                    "content": system_prompt,
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Language: {language}\n"
-                        f"Question: {question}"
-                    ),
-                },
-            ],
+            instructions=build_agri_system_prompt(
+                language
+            ),
+            input=prompt,
         )
 
-        text = response.output_text
-
-        usage = getattr(
+        text = getattr(
             response,
-            "usage",
+            "output_text",
             None,
         )
 
-        input_tokens = (
-            getattr(
-                usage,
-                "input_tokens",
-                0,
+        if not text:
+            return None
+
+        return text
+
+    except Exception as exc:
+
+        return {
+            "error": str(exc)
+        }
+
+
+# ============================================================
+# AI USAGE
+# ============================================================
+
+def check_ai_limit(user_id: int):
+
+    date = today_utc()
+
+    row = fetchone(
+        """
+        SELECT * FROM ai_usage
+        WHERE user_id=? AND usage_date=?
+        """,
+        (user_id, date),
+    )
+
+    if not row:
+
+        execute(
+            """
+            INSERT INTO ai_usage
+            (user_id,usage_date,count)
+            VALUES (?,?,0)
+            """,
+            (user_id, date),
+            True,
+        )
+
+        return True
+
+    return int(row["count"]) < DAILY_AI_LIMIT
+
+
+def increment_ai_usage(user_id: int):
+
+    date = today_utc()
+
+    execute(
+        """
+        UPDATE ai_usage
+        SET count=count+1
+        WHERE user_id=? AND usage_date=?
+        """,
+        (user_id, date),
+        True,
+    )
+
+
+# ============================================================
+# REGION ANALYSIS
+# ============================================================
+
+def create_region_analysis(
+    latitude,
+    longitude,
+    region,
+    language,
+):
+
+    weather_data = None
+    climate_data = None
+
+    if latitude is not None and longitude is not None:
+
+        try:
+            weather_data = get_weather_data(
+                latitude,
+                longitude,
             )
-            if usage
-            else 0
-        )
+        except Exception:
+            weather_data = None
 
-        output_tokens = (
-            getattr(
-                usage,
-                "output_tokens",
-                0,
+        try:
+            climate_data = get_climate_data(
+                latitude,
+                longitude,
+                5,
             )
-            if usage
-            else 0
-        )
+        except Exception:
+            climate_data = None
 
-        return (
-            text,
-            input_tokens,
-            output_tokens,
-        )
+    return {
+        "region": region,
+        "latitude": latitude,
+        "longitude": longitude,
+        "weather": weather_data,
+        "climate": climate_data,
+        "note": (
+            "تحلیل منطقه بر اساس مختصات، "
+            "آب‌وهوا و داده‌های اقلیمی موجود انجام می‌شود."
+        ),
+    }
 
-    except Exception:
-        raise
 
+@app.post("/ai/region-analysis")
+def region_analysis(
+    data: RegionAnalysisRequest,
+    authorization: Optional[str] = Header(None),
+):
+
+    require_user(
+        authorization,
+        data.user_id,
+    )
+
+    latitude = data.latitude
+    longitude = data.longitude
+    resolved = None
+
+    if (
+        latitude is None
+        or longitude is None
+    ):
+
+        if data.address or data.region:
+
+            resolved = geocode_address(
+                data.address or data.region
+            )
+
+            if resolved:
+
+                latitude = resolved["latitude"]
+                longitude = resolved["longitude"]
+
+    validation = validate_location(
+        latitude,
+        longitude,
+    )
+
+    analysis = create_region_analysis(
+        latitude,
+        longitude,
+        data.region,
+        data.language,
+    )
+
+    return {
+        "status": "ok",
+        "location": {
+            "latitude": latitude,
+            "longitude": longitude,
+            "region": data.region,
+            "resolved": resolved,
+        },
+        "validation": validation,
+        "analysis": analysis,
+    }
+
+
+# ============================================================
+# MAIN AI ASK
+# ============================================================
 
 @app.post("/ai/ask")
-def ai_ask(
+def ask_ai(
     data: AIAsk,
     authorization: Optional[str] = Header(None),
 ):
+
     require_user(
-        data.user_id,
         authorization,
+        data.user_id,
     )
 
-    user = get_user(
-        data.user_id
-    )
+    if not check_ai_limit(data.user_id):
 
-    if not user:
         raise HTTPException(
-            status_code=404,
-            detail="User not found.",
+            429,
+            "Daily AI limit reached",
         )
 
-    if data.farm_id is not None:
-        auth = authenticate(
-            authorization
-        )
-
-        if auth["role"] != "owner":
-            if not farm_owned_by_user(
-                data.farm_id,
-                data.user_id,
-            ):
-                raise HTTPException(
-                    status_code=403,
-                    detail="Access denied for this farm.",
-                )
-
-    used_today = ai_requests_today(
-        data.user_id
+    farm_context = collect_farm_context(
+        data.user_id,
+        data.farm_id,
     )
 
-    if used_today >= DAILY_AI_LIMIT:
-        raise HTTPException(
-            status_code=429,
-            detail=(
-                "Daily AI request limit reached."
-            ),
+    farm = farm_context.get("farm") or {}
+
+    latitude = data.latitude
+    longitude = data.longitude
+
+    # --------------------------------------------------------
+    # Farm coordinates
+    # --------------------------------------------------------
+
+    if (
+        latitude is None
+        or longitude is None
+    ):
+
+        latitude = farm.get("latitude")
+        longitude = farm.get("longitude")
+
+    # --------------------------------------------------------
+    # Manual address / region
+    # --------------------------------------------------------
+
+    resolved_location = None
+
+    if (
+        data.address
+        and (
+            latitude is None
+            or longitude is None
         )
+    ):
 
-    request_id = secrets.token_hex(16)
-
-    missing = []
-
-    if not data.crop:
-        missing.append("crop")
-
-    if not data.region:
-        missing.append("region")
-
-    answer = None
-
-    input_tokens = 0
-    output_tokens = 0
-
-    model = "local-rule-engine"
-
-    if OPENAI_API_KEY:
         try:
-            (
-                answer,
-                input_tokens,
-                output_tokens,
-            ) = openai_answer(
-                data.question,
-                data.language,
+
+            resolved_location = geocode_address(
+                data.address
             )
 
-            model = OPENAI_MODEL
+            if resolved_location:
+
+                latitude = resolved_location[
+                    "latitude"
+                ]
+
+                longitude = resolved_location[
+                    "longitude"
+                ]
 
         except Exception:
-            answer = local_agri_answer(
-                data.question,
-                data.crop,
+            resolved_location = None
+
+    elif (
+        data.region
+        and (
+            latitude is None
+            or longitude is None
+        )
+    ):
+
+        try:
+
+            resolved_location = geocode_address(
+                data.region
             )
 
-    else:
-        answer = local_agri_answer(
-            data.question,
-            data.crop,
-        )
+            if resolved_location:
 
-    save_ai_usage(
-        data.user_id,
-        request_id,
-        model,
-        input_tokens,
-        output_tokens,
+                latitude = resolved_location[
+                    "latitude"
+                ]
+
+                longitude = resolved_location[
+                    "longitude"
+                ]
+
+        except Exception:
+            resolved_location = None
+
+    # --------------------------------------------------------
+    # Location validation
+    # --------------------------------------------------------
+
+    location_validation = validate_location(
+        latitude,
+        longitude,
     )
 
-    confidence = 0.55
+    # --------------------------------------------------------
+    # Weather
+    # --------------------------------------------------------
 
-    if data.crop and data.region:
-        confidence = 0.70
+    weather_data = None
 
-    connection = db()
+    if (
+        data.weather_analysis
+        and latitude is not None
+        and longitude is not None
+    ):
 
-    connection.execute(
+        try:
+
+            weather_data = get_weather_data(
+                latitude,
+                longitude,
+            )
+
+        except Exception:
+            weather_data = None
+
+    # --------------------------------------------------------
+    # Climate
+    # --------------------------------------------------------
+
+    climate_data = None
+
+    if (
+        data.climate_analysis
+        and latitude is not None
+        and longitude is not None
+    ):
+
+        try:
+
+            climate_data = get_climate_data(
+                latitude,
+                longitude,
+                5,
+            )
+
+        except Exception:
+            climate_data = None
+
+    # --------------------------------------------------------
+    # User data validation
+    # --------------------------------------------------------
+
+    user_validation = (
+        validate_user_context(
+            farm_context
+        )
+        if data.validate_user_information
+        else {}
+    )
+
+    # --------------------------------------------------------
+    # Crop
+    # --------------------------------------------------------
+
+    crop_name = data.crop
+
+    if not crop_name:
+
+        crops = farm_context.get(
+            "crops",
+            [],
+        )
+
+        if crops:
+            crop_name = crops[0].get(
+                "name"
+            )
+
+    # --------------------------------------------------------
+    # Context packet
+    # --------------------------------------------------------
+
+    context_packet = {
+        "application": APP_NAME,
+        "version": VERSION,
+
+        "question": data.question,
+
+        "location": {
+            "latitude": latitude,
+            "longitude": longitude,
+            "address": data.address,
+            "region": data.region,
+            "resolved": resolved_location,
+            "use_current_location":
+                data.use_current_location,
+        },
+
+        "location_validation":
+            location_validation,
+
+        "crop": crop_name,
+
+        "farm_context":
+            farm_context
+            if data.use_user_provided_data
+            else {},
+
+        "user_data_validation":
+            user_validation
+            if data.validate_user_information
+            else {},
+
+        "weather":
+            weather_data
+            if data.weather_analysis
+            else None,
+
+        "climate":
+            climate_data
+            if data.climate_analysis
+            else None,
+
+        "analysis_options": {
+            "deep_agricultural_analysis":
+                data.deep_agricultural_analysis,
+
+            "validate_user_information":
+                data.validate_user_information,
+
+            "generate_alternatives":
+                data.generate_alternatives,
+
+            "generate_action_plan":
+                data.generate_action_plan,
+
+            "generate_schedule":
+                data.generate_schedule,
+
+            "generate_alerts":
+                data.generate_alerts,
+
+            "weather_analysis":
+                data.weather_analysis,
+
+            "climate_analysis":
+                data.climate_analysis,
+
+            "soil_analysis":
+                data.soil_analysis,
+
+            "water_analysis":
+                data.water_analysis,
+
+            "crop_suitability":
+                data.crop_suitability,
+
+            "pest_disease_analysis":
+                data.pest_disease_analysis,
+
+            "fertilizer_analysis":
+                data.fertilizer_analysis,
+
+            "image_analysis_ready":
+                data.image_analysis_ready,
+        },
+
+        "global_knowledge_requested":
+            data.use_global_knowledge,
+    }
+
+    # --------------------------------------------------------
+    # AI
+    # --------------------------------------------------------
+
+    ai_result = openai_answer(
+        data.question,
+        data.language,
+        context_packet,
+    )
+
+    increment_ai_usage(
+        data.user_id
+    )
+
+    # --------------------------------------------------------
+    # Fallback
+    # --------------------------------------------------------
+
+    if isinstance(ai_result, dict) and ai_result.get(
+        "error"
+    ):
+
+        ai_result = None
+
+    if not ai_result:
+
+        local = local_agri_answer(
+            data.question,
+            crop_name,
+            data.region,
+        )
+
+        answer = local["answer"]
+        confidence = local["confidence"]
+
+    else:
+
+        answer = ai_result
+        confidence = 0.78
+
+        if not location_validation.get(
+            "valid",
+            False,
+        ):
+            confidence -= 0.08
+
+        if user_validation.get(
+            "contradictions"
+        ):
+            confidence -= 0.08
+
+        confidence = max(
+            0.35,
+            min(0.95, confidence),
+        )
+
+    # --------------------------------------------------------
+    # Missing data
+    # --------------------------------------------------------
+
+    missing_data = []
+
+    if not crop_name:
+        missing_data.append(
+            "نام محصول یا درخت"
+        )
+
+    if latitude is None or longitude is None:
+        missing_data.append(
+            "موقعیت مزرعه"
+        )
+
+    if not farm_context.get("soil_lab"):
+        missing_data.append(
+            "آزمایش خاک"
+        )
+
+    if not farm_context.get("water"):
+        missing_data.append(
+            "اطلاعات کیفیت آب"
+        )
+
+    # --------------------------------------------------------
+    # Save recommendation
+    # --------------------------------------------------------
+
+    execute(
         """
         INSERT INTO recommendations
-        (
-            user_id,
-            farm_id,
-            category,
-            question,
-            recommendation,
-            confidence,
-            risk,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (user_id,farm_id,question,answer,confidence,data,created_at)
+        VALUES (?,?,?,?,?,?,?)
         """,
         (
             data.user_id,
             data.farm_id,
-            "ai",
             data.question,
             answer,
             confidence,
-            "requires_validation",
-            now_iso(),
+            json_dumps(context_packet),
+            utc_now(),
         ),
+        True,
     )
 
-    connection.commit()
-    connection.close()
+    # --------------------------------------------------------
+    # Audit
+    # --------------------------------------------------------
+
+    execute(
+        """
+        INSERT INTO audit_logs
+        (user_id,action,data,created_at)
+        VALUES (?,?,?,?)
+        """,
+        (
+            data.user_id,
+            "ai_ask",
+            json_dumps(
+                {
+                    "crop": crop_name,
+                    "farm_id": data.farm_id,
+                    "latitude": latitude,
+                    "longitude": longitude,
+                }
+            ),
+            utc_now(),
+        ),
+        True,
+    )
 
     return {
-        "request_id": request_id,
+        "status": "ok",
+
         "answer": answer,
-        "model": model,
+
         "confidence": confidence,
-        "risk": "requires_validation",
-        "missing_data": missing,
-        "daily_requests_used": used_today + 1,
-        "daily_limit": DAILY_AI_LIMIT,
+
+        "location": {
+            "latitude": latitude,
+            "longitude": longitude,
+            "address": data.address,
+            "region": data.region,
+            "resolved": resolved_location,
+        },
+
+        "weather": weather_data,
+
+        "climate": climate_data,
+
+        "validation": {
+            "location": location_validation,
+            "user_data": user_validation,
+        },
+
+        "missing_data": missing_data,
+
+        "crop": crop_name,
+
+        "farm_context": farm_context,
+
+        "recommendations": [],
+
+        "alternatives": [],
+
+        "action_plan": [],
+
+        "schedule": [],
+
+        "alerts": [],
+
+        "ai": {
+            "provider": (
+                "openai"
+                if OPENAI_API_KEY and ai_result
+                else "local"
+            ),
+            "model": (
+                OPENAI_MODEL
+                if OPENAI_API_KEY and ai_result
+                else None
+            ),
+        },
+    }
+
+
+# ============================================================
+# AI HISTORY
+# ============================================================
+
+@app.get("/ai/history/{user_id}")
+def ai_history(
+    user_id: int,
+    authorization: Optional[str] = Header(None),
+):
+
+    require_user(
+        authorization,
+        user_id,
+    )
+
+    rows = fetchall(
+        """
+        SELECT id,farm_id,question,answer,
+               confidence,created_at
+        FROM recommendations
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 100
+        """,
+        (user_id,),
+    )
+
+    return {
+        "status": "ok",
+        "items": [dict(r) for r in rows],
     }
 
 
@@ -2573,60 +2376,75 @@ def ai_ask(
 # PRICING
 # ============================================================
 
-@app.get("/pricing")
-def pricing(
+def pricing_for(
     country: str,
+    users_count: int,
 ):
-    connection = db()
 
-    row = connection.execute(
-        """
-        SELECT COUNT(*) AS count
-        FROM payments
-        WHERE country = ?
-        AND status = 'verified'
-        """,
-        (country,),
-    ).fetchone()
-
-    connection.close()
-
-    count = int(row["count"])
-
-    if country.lower() in (
+    if country.lower() in [
         "iran",
+        "ir",
         "ایران",
-    ):
-        currency = "TOMAN"
+    ]:
 
-        if count < 100:
-            amount = 500000
-        elif count < 600:
-            amount = 800000
-        else:
-            amount = 1200000
+        if users_count < 100:
+            return {
+                "amount": 500000,
+                "currency": "IRR",
+            }
 
-        method = "shaba_bank_transfer"
+        if users_count < 600:
+            return {
+                "amount": 800000,
+                "currency": "IRR",
+            }
 
-    else:
-        currency = "USDT"
+        return {
+            "amount": 1200000,
+            "currency": "IRR",
+        }
 
-        if count < 100:
-            amount = 10
-        elif count < 600:
-            amount = 15
-        else:
-            amount = 20
+    if users_count < 100:
+        return {
+            "amount": 10,
+            "currency": "USDT",
+        }
 
-        method = "crypto"
+    if users_count < 600:
+        return {
+            "amount": 15,
+            "currency": "USDT",
+        }
 
     return {
+        "amount": 20,
+        "currency": "USDT",
+    }
+
+
+@app.get("/pricing")
+def pricing(
+    country: str = "international",
+):
+
+    count_row = fetchone(
+        "SELECT COUNT(*) AS c FROM users"
+    )
+
+    users_count = int(
+        count_row["c"]
+    )
+
+    price = pricing_for(
+        country,
+        users_count,
+    )
+
+    return {
+        "status": "ok",
         "country": country,
-        "verified_customer_count": count,
-        "amount": amount,
-        "currency": currency,
-        "payment_method": method,
-        "duration_days": 365,
+        "registered_users": users_count,
+        **price,
     }
 
 
@@ -2636,510 +2454,227 @@ def pricing(
 
 @app.post("/payments")
 def create_payment(
-    data: PaymentCreate,
+    data: PaymentRequest,
     authorization: Optional[str] = Header(None),
 ):
+
     require_user(
-        data.user_id,
         authorization,
+        data.user_id,
     )
 
-    if not get_user(data.user_id):
+    method = data.method.lower()
+
+    if method not in [
+        "bank",
+        "bank_transfer",
+        "crypto",
+        "usdt",
+    ]:
+
         raise HTTPException(
-            status_code=404,
-            detail="User not found.",
+            400,
+            "Unsupported payment method",
         )
 
-    connection = db()
-
-    cursor = connection.execute(
+    cur = execute(
         """
         INSERT INTO payments
-        (
-            user_id,
-            country,
-            method,
-            amount,
-            currency,
-            reference,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+        (user_id,amount,currency,method,
+         destination,transaction_id,status,
+         data,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?)
         """,
         (
             data.user_id,
-            data.country,
-            data.method,
             data.amount,
             data.currency,
-            data.reference,
-            now_iso(),
+            method,
+            data.destination,
+            data.transaction_id,
+            "pending",
+            "{}",
+            utc_now(),
         ),
-    )
-
-    connection.commit()
-
-    payment_id = cursor.lastrowid
-
-    connection.close()
-
-    audit(
-        str(data.user_id),
-        "create_payment",
-        str(payment_id),
+        True,
     )
 
     return {
-        "payment_id": payment_id,
-        "status": "pending",
+        "status": "ok",
+        "payment_id": cur.lastrowid,
+        "payment_status": "pending",
     }
 
 
-@app.post("/payments/{payment_id}/verify")
-def verify_payment(
-    payment_id: int,
-    authorization: Optional[str] = Header(None),
-):
-    require_owner(
-        authorization
-    )
-
-    connection = db()
-
-    payment = connection.execute(
-        """
-        SELECT *
-        FROM payments
-        WHERE id = ?
-        """,
-        (payment_id,),
-    ).fetchone()
-
-    if not payment:
-        connection.close()
-
-        raise HTTPException(
-            status_code=404,
-            detail="Payment not found.",
-        )
-
-    if payment["status"] == "verified":
-        existing_subscription = connection.execute(
-            """
-            SELECT *
-            FROM subscriptions
-            WHERE user_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (payment["user_id"],),
-        ).fetchone()
-
-        connection.close()
-
-        return {
-            "payment_id": payment_id,
-            "status": "already_verified",
-            "subscription": (
-                dict(existing_subscription)
-                if existing_subscription
-                else None
-            ),
-        }
-
-    connection.execute(
-        """
-        UPDATE payments
-        SET status = 'verified',
-            verified_at = ?
-        WHERE id = ?
-        """,
-        (
-            now_iso(),
-            payment_id,
-        ),
-    )
-
-    started = datetime.now(
-        timezone.utc
-    )
-
-    expires = (
-        started
-        + timedelta(days=365)
-    )
-
-    connection.execute(
-        """
-        INSERT INTO subscriptions
-        (
-            user_id,
-            plan,
-            started_at,
-            expires_at,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, 'active', ?)
-        """,
-        (
-            payment["user_id"],
-            "annual",
-            started.isoformat(),
-            expires.isoformat(),
-            now_iso(),
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-    audit(
-        "owner",
-        "verify_payment",
-        str(payment_id),
-    )
-
-    return {
-        "payment_id": payment_id,
-        "status": "verified",
-        "subscription": "active",
-        "expires_at": expires.isoformat(),
-    }
-
-
-@app.get("/subscriptions/{user_id}")
-def subscription(
+@app.get("/payments/{user_id}")
+def get_payments(
     user_id: int,
     authorization: Optional[str] = Header(None),
 ):
+
     require_user(
-        user_id,
         authorization,
+        user_id,
     )
 
-    connection = db()
+    rows = fetchall(
+        """
+        SELECT *
+        FROM payments
+        WHERE user_id=?
+        ORDER BY id DESC
+        """,
+        (user_id,),
+    )
 
-    row = connection.execute(
+    return {
+        "status": "ok",
+        "payments": [
+            dict(x) for x in rows
+        ],
+    }
+
+
+# ============================================================
+# SUBSCRIPTION
+# ============================================================
+
+@app.get("/subscription/{user_id}")
+def get_subscription(
+    user_id: int,
+    authorization: Optional[str] = Header(None),
+):
+
+    require_user(
+        authorization,
+        user_id,
+    )
+
+    row = fetchone(
         """
         SELECT *
         FROM subscriptions
-        WHERE user_id = ?
+        WHERE user_id=?
         ORDER BY id DESC
         LIMIT 1
         """,
         (user_id,),
-    ).fetchone()
-
-    connection.close()
+    )
 
     if not row:
+
         return {
-            "status": "inactive"
+            "status": "ok",
+            "active": False,
+            "subscription": None,
         }
 
-    result = dict(row)
+    active = row["status"] == "active"
 
-    try:
-        expires = datetime.fromisoformat(
-            result["expires_at"]
-        )
+    if row["expires_at"]:
 
-        if expires <= datetime.now(
-            timezone.utc
-        ):
-            result["status"] = "expired"
+        try:
 
-    except Exception:
-        pass
-
-    return result
-
-
-# ============================================================
-# ACTIVATION CODES
-# ============================================================
-
-@app.post("/owner/activation-code")
-def create_activation_code(
-    duration_days: int = 365,
-    authorization: Optional[str] = Header(None),
-):
-    require_owner(
-        authorization
-    )
-
-    if duration_days <= 0:
-        raise HTTPException(
-            status_code=400,
-            detail="duration_days must be positive.",
-        )
-
-    if duration_days > 3650:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "duration_days cannot exceed 3650."
-            ),
-        )
-
-    raw_code = secrets.token_urlsafe(18)
-
-    code_hash = sha256(
-        raw_code
-    )
-
-    connection = db()
-
-    connection.execute(
-        """
-        INSERT INTO activation_codes
-        (
-            code_hash,
-            duration_days,
-            created_at
-        )
-        VALUES (?, ?, ?)
-        """,
-        (
-            code_hash,
-            duration_days,
-            now_iso(),
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-    audit(
-        "owner",
-        "create_activation_code",
-    )
-
-    return {
-        "code": raw_code,
-        "duration_days": duration_days,
-    }
-
-
-@app.post("/activation/use")
-def use_activation_code(
-    data: ActivationUse,
-    authorization: Optional[str] = Header(None),
-):
-    require_user(
-        data.user_id,
-        authorization,
-    )
-
-    code_hash = sha256(
-        data.code
-    )
-
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT *
-        FROM activation_codes
-        WHERE code_hash = ?
-        AND used = 0
-        """,
-        (code_hash,),
-    ).fetchone()
-
-    if not row:
-        connection.close()
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid or already used "
-                "activation code."
-            ),
-        )
-
-    started = datetime.now(
-        timezone.utc
-    )
-
-    expires = (
-        started
-        + timedelta(
-            days=int(
-                row["duration_days"]
+            expires = datetime.fromisoformat(
+                row["expires_at"]
             )
-        )
-    )
 
-    connection.execute(
-        """
-        UPDATE activation_codes
-        SET used = 1,
-            used_by = ?,
-            used_at = ?
-        WHERE id = ?
-        """,
-        (
-            data.user_id,
-            now_iso(),
-            row["id"],
-        ),
-    )
+            if expires < datetime.now(
+                timezone.utc
+            ):
+                active = False
 
-    connection.execute(
-        """
-        INSERT INTO subscriptions
-        (
-            user_id,
-            plan,
-            started_at,
-            expires_at,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, 'active', ?)
-        """,
-        (
-            data.user_id,
-            "activation",
-            started.isoformat(),
-            expires.isoformat(),
-            now_iso(),
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-    audit(
-        str(data.user_id),
-        "use_activation_code",
-        str(row["id"]),
-    )
+        except Exception:
+            pass
 
     return {
-        "status": "activated",
-        "expires_at": expires.isoformat(),
+        "status": "ok",
+        "active": active,
+        "subscription": dict(row),
     }
 
 
 # ============================================================
-# DEVICES
+# DEVICE ACTIVATION
 # ============================================================
 
-@app.post("/devices")
+@app.post("/devices/register")
 def register_device(
-    data: DeviceCreate,
+    user_id: int,
+    device_id: str,
+    platform: str = "",
     authorization: Optional[str] = Header(None),
 ):
+
     require_user(
-        data.user_id,
         authorization,
+        user_id,
     )
 
-    if not get_user(data.user_id):
-        raise HTTPException(
-            status_code=404,
-            detail="User not found.",
-        )
-
-    device_hash = sha256(
-        data.device_id
-    )
-
-    connection = db()
-
-    existing = connection.execute(
+    existing = fetchone(
         """
-        SELECT *
+        SELECT id
         FROM devices
-        WHERE user_id = ?
-        AND device_hash = ?
+        WHERE user_id=? AND device_id=?
         """,
-        (
-            data.user_id,
-            device_hash,
-        ),
-    ).fetchone()
+        (user_id, device_id),
+    )
 
     if existing:
-        connection.execute(
+
+        execute(
             """
             UPDATE devices
-            SET last_seen = ?,
-                active = 1
-            WHERE id = ?
+            SET last_seen=?,active=1,platform=?
+            WHERE id=?
             """,
             (
-                now_iso(),
+                utc_now(),
+                platform,
                 existing["id"],
             ),
+            True,
         )
-
-        connection.commit()
-        connection.close()
 
         return {
-            "status": "already_registered",
-            "device_id": existing["id"],
+            "status": "ok",
+            "device_id": device_id,
         }
 
-    count = connection.execute(
+    count = fetchone(
         """
-        SELECT COUNT(*) AS count
+        SELECT COUNT(*) AS c
         FROM devices
-        WHERE user_id = ?
-        AND active = 1
+        WHERE user_id=? AND active=1
         """,
-        (data.user_id,),
-    ).fetchone()["count"]
-
-    if int(count) >= DEVICE_LIMIT:
-        connection.close()
-
-        raise HTTPException(
-            status_code=403,
-            detail="Device limit reached.",
-        )
-
-    cursor = connection.execute(
-        """
-        INSERT INTO devices
-        (
-            user_id,
-            device_hash,
-            device_name,
-            created_at,
-            last_seen
-        )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            data.user_id,
-            device_hash,
-            data.device_name,
-            now_iso(),
-            now_iso(),
-        ),
+        (user_id,),
     )
 
-    connection.commit()
+    if int(count["c"]) >= DEVICE_LIMIT:
 
-    device_db_id = cursor.lastrowid
+        raise HTTPException(
+            403,
+            "Device limit reached",
+        )
 
-    connection.close()
-
-    audit(
-        str(data.user_id),
-        "register_device",
-        str(device_db_id),
+    execute(
+        """
+        INSERT INTO devices
+        (user_id,device_id,platform,last_seen,active)
+        VALUES (?,?,?,?,1)
+        """,
+        (
+            user_id,
+            device_id,
+            platform,
+            utc_now(),
+        ),
+        True,
     )
 
     return {
-        "status": "registered",
-        "device_id": device_db_id,
+        "status": "ok",
+        "device_id": device_id,
     }
 
 
@@ -3148,270 +2683,146 @@ def register_device(
 # ============================================================
 
 @app.post("/feedback")
-def create_feedback(
-    data: FeedbackCreate,
+def send_feedback(
+    data: FeedbackRequest,
     authorization: Optional[str] = Header(None),
 ):
-    if data.user_id is not None:
-        require_user(
-            data.user_id,
-            authorization,
-        )
-    else:
-        # Public feedback is allowed when no user account
-        # is associated with the message.
-        pass
 
-    connection = db()
+    require_user(
+        authorization,
+        data.user_id,
+    )
 
-    cursor = connection.execute(
+    cur = execute(
         """
         INSERT INTO feedback
-        (
-            user_id,
-            category,
-            original_language,
-            original_text,
-            persian_translation,
-            status,
-            attachment,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, 'new', ?, ?)
+        (user_id,language,message,
+         translated_message,status,created_at)
+        VALUES (?,?,?,?,?,?)
         """,
         (
             data.user_id,
-            data.category,
-            data.original_language,
-            data.original_text,
-            None,
-            data.attachment,
-            now_iso(),
+            data.language,
+            data.message,
+            "",
+            "new",
+            utc_now(),
         ),
+        True,
     )
 
-    connection.commit()
+    return {
+        "status": "ok",
+        "feedback_id": cur.lastrowid,
+    }
 
-    feedback_id = cursor.lastrowid
 
-    connection.close()
+# ============================================================
+# OWNER
+# ============================================================
+
+def require_owner(
+    authorization: Optional[str],
+):
+
+    user = require_user(
+        authorization
+    )
+
+    if user["role"] != "owner":
+
+        if MASTER_EMAIL:
+            if user["email"] != MASTER_EMAIL:
+                raise HTTPException(
+                    403,
+                    "Owner access required",
+                )
+        else:
+            raise HTTPException(
+                403,
+                "Owner access required",
+            )
+
+    return user
+
+
+@app.get("/owner/stats")
+def owner_stats(
+    authorization: Optional[str] = Header(None),
+):
+
+    require_owner(authorization)
+
+    users = fetchone(
+        "SELECT COUNT(*) AS c FROM users"
+    )
+
+    farms = fetchone(
+        "SELECT COUNT(*) AS c FROM farms"
+    )
+
+    payments = fetchone(
+        "SELECT COUNT(*) AS c FROM payments"
+    )
+
+    recommendations = fetchone(
+        "SELECT COUNT(*) AS c FROM recommendations"
+    )
 
     return {
-        "id": feedback_id,
-        "status": "received",
-        "translation_status": "pending",
+        "status": "ok",
+        "users": users["c"],
+        "farms": farms["c"],
+        "payments": payments["c"],
+        "ai_requests": recommendations["c"],
     }
 
 
 @app.get("/owner/feedback")
 def owner_feedback(
-    status: Optional[str] = None,
     authorization: Optional[str] = Header(None),
 ):
-    require_owner(
-        authorization
-    )
 
-    connection = db()
+    require_owner(authorization)
 
-    if status:
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM feedback
-            WHERE status = ?
-            ORDER BY id DESC
-            """,
-            (status,),
-        ).fetchall()
-
-    else:
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM feedback
-            ORDER BY id DESC
-            """
-        ).fetchall()
-
-    connection.close()
-
-    return [
-        dict(row)
-        for row in rows
-    ]
-
-
-# ============================================================
-# OWNER AI PROPOSALS
-# ============================================================
-
-@app.post("/owner/ai/proposals")
-def create_ai_proposal(
-    data: AIProposalCreate,
-    authorization: Optional[str] = Header(None),
-):
-    require_owner(
-        authorization
-    )
-
-    connection = db()
-
-    cursor = connection.execute(
+    rows = fetchall(
         """
-        INSERT INTO ai_change_proposals
-        (
-            title,
-            description,
-            change_json,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, 'pending', ?)
-        """,
-        (
-            data.title,
-            data.description,
-            json.dumps(
-                data.change_json,
-                ensure_ascii=False,
-            )
-            if data.change_json
-            else None,
-            now_iso(),
-        ),
-    )
-
-    connection.commit()
-
-    proposal_id = cursor.lastrowid
-
-    connection.close()
-
-    audit(
-        "owner",
-        "create_change_proposal",
-        str(proposal_id),
+        SELECT *
+        FROM feedback
+        ORDER BY id DESC
+        LIMIT 200
+        """
     )
 
     return {
-        "id": proposal_id,
-        "status": "pending",
+        "status": "ok",
+        "feedback": [
+            dict(x) for x in rows
+        ],
     }
 
 
-@app.get("/owner/ai/proposals")
-def ai_proposals(
+@app.get("/owner/audit")
+def owner_audit(
     authorization: Optional[str] = Header(None),
 ):
-    require_owner(
-        authorization
-    )
 
-    connection = db()
+    require_owner(authorization)
 
-    rows = connection.execute(
+    rows = fetchall(
         """
         SELECT *
-        FROM ai_change_proposals
+        FROM audit_logs
         ORDER BY id DESC
+        LIMIT 500
         """
-    ).fetchall()
-
-    connection.close()
-
-    return [
-        dict(row)
-        for row in rows
-    ]
-
-
-@app.post(
-    "/owner/ai/proposals/{proposal_id}/decision"
-)
-def decide_ai_proposal(
-    proposal_id: int,
-    data: ProposalDecision,
-    authorization: Optional[str] = Header(None),
-):
-    auth = require_owner(
-        authorization
-    )
-
-    if data.decision not in (
-        "approve",
-        "reject",
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Decision must be approve or reject."
-            ),
-        )
-
-    connection = db()
-
-    row = connection.execute(
-        """
-        SELECT *
-        FROM ai_change_proposals
-        WHERE id = ?
-        """,
-        (proposal_id,),
-    ).fetchone()
-
-    if not row:
-        connection.close()
-
-        raise HTTPException(
-            status_code=404,
-            detail="Proposal not found.",
-        )
-
-    status = (
-        "approved"
-        if data.decision == "approve"
-        else "rejected"
-    )
-
-    reviewer = (
-        data.reviewer.strip()
-        if data.reviewer.strip()
-        else "owner"
-    )
-
-    connection.execute(
-        """
-        UPDATE ai_change_proposals
-        SET status = ?,
-            reviewed_at = ?,
-            reviewed_by = ?
-        WHERE id = ?
-        """,
-        (
-            status,
-            now_iso(),
-            reviewer,
-            proposal_id,
-        ),
-    )
-
-    connection.commit()
-    connection.close()
-
-    audit(
-        "owner",
-        f"ai_proposal_{status}",
-        str(proposal_id),
-        {
-            "reviewer": reviewer,
-            "token_id": auth["token_id"],
-        },
     )
 
     return {
-        "id": proposal_id,
-        "status": status,
+        "status": "ok",
+        "logs": [
+            dict(x) for x in rows
+        ],
     }
 
 
@@ -3419,158 +2830,23 @@ def decide_ai_proposal(
 # KNOWLEDGE
 # ============================================================
 
-@app.post("/owner/knowledge")
-def create_knowledge(
-    data: KnowledgeCreate,
-    authorization: Optional[str] = Header(None),
-):
-    require_owner(
-        authorization
-    )
+@app.get("/knowledge")
+def knowledge():
 
-    connection = db()
-
-    cursor = connection.execute(
-        """
-        INSERT INTO knowledge_versions
-        (
-            version,
-            title,
-            content,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, 'draft', ?)
-        """,
-        (
-            data.version,
-            data.title,
-            data.content,
-            now_iso(),
-        ),
-    )
-
-    connection.commit()
-
-    knowledge_id = cursor.lastrowid
-
-    connection.close()
-
-    audit(
-        "owner",
-        "create_knowledge_version",
-        str(knowledge_id),
-    )
-
-    return {
-        "id": knowledge_id,
-        "status": "draft",
-    }
-
-
-# ============================================================
-# AUDIT
-# ============================================================
-
-@app.get("/owner/audit")
-def owner_audit(
-    limit: int = 100,
-    authorization: Optional[str] = Header(None),
-):
-    require_owner(
-        authorization
-    )
-
-    limit = max(
-        1,
-        min(limit, 1000),
-    )
-
-    connection = db()
-
-    rows = connection.execute(
+    rows = fetchall(
         """
         SELECT *
-        FROM audit_logs
+        FROM knowledge_versions
+        WHERE active=1
         ORDER BY id DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
-
-    connection.close()
-
-    return [
-        dict(row)
-        for row in rows
-    ]
-
-
-# ============================================================
-# OFFLINE SYNC
-# ============================================================
-
-@app.post("/sync")
-def sync_operation(
-    data: SyncCreate,
-    authorization: Optional[str] = Header(None),
-):
-    require_user(
-        data.user_id,
-        authorization,
-    )
-
-    connection = db()
-
-    existing = connection.execute(
         """
-        SELECT *
-        FROM sync_queue
-        WHERE operation_id = ?
-        """,
-        (data.operation_id,),
-    ).fetchone()
-
-    if existing:
-        connection.close()
-
-        return {
-            "operation_id": data.operation_id,
-            "status": existing["status"],
-            "duplicate": True,
-        }
-
-    connection.execute(
-        """
-        INSERT INTO sync_queue
-        (
-            user_id,
-            operation_id,
-            operation,
-            payload,
-            status,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, 'pending', ?)
-        """,
-        (
-            data.user_id,
-            data.operation_id,
-            data.operation,
-            json.dumps(
-                data.payload,
-                ensure_ascii=False,
-            ),
-            now_iso(),
-        ),
     )
-
-    connection.commit()
-    connection.close()
 
     return {
-        "operation_id": data.operation_id,
-        "status": "queued",
+        "status": "ok",
+        "knowledge": [
+            dict(x) for x in rows
+        ],
     }
 
 
@@ -3580,15 +2856,13 @@ def sync_operation(
 
 @app.get("/server-time")
 def server_time():
-    current = datetime.now(
-        timezone.utc
-    )
 
     return {
-        "utc": current.isoformat(),
-        "unix": int(
-            current.timestamp()
-        ),
+        "status": "ok",
+        "utc": utc_now(),
+        "timestamp": datetime.now(
+            timezone.utc
+        ).timestamp(),
     }
 
 
@@ -3596,68 +2870,104 @@ def server_time():
 # SYSTEM INFO
 # ============================================================
 
-@app.get("/system/info")
-def system_info(
-    authorization: Optional[str] = Header(None),
-):
-    require_owner(
-        authorization
-    )
-
-    connection = db()
-
-    users_count = connection.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM users
-        """
-    ).fetchone()["c"]
-
-    farms_count = connection.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM farms
-        """
-    ).fetchone()["c"]
-
-    ai_count = connection.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM ai_usage
-        """
-    ).fetchone()["c"]
-
-    ai_cost = connection.execute(
-        """
-        SELECT COALESCE(
-            SUM(total_cost),
-            0
-        ) AS c
-        FROM ai_usage
-        """
-    ).fetchone()["c"]
-
-    active_tokens = connection.execute(
-        """
-        SELECT COUNT(*) AS c
-        FROM auth_tokens
-        WHERE revoked = 0
-        AND expires_at > ?
-        """,
-        (now_iso(),),
-    ).fetchone()["c"]
-
-    connection.close()
+@app.get("/system-info")
+def system_info():
 
     return {
-        "app": APP_NAME,
-        "version": APP_VERSION,
-        "users": users_count,
-        "farms": farms_count,
-        "ai_requests": ai_count,
-        "ai_recorded_cost": ai_cost,
-        "active_auth_tokens": active_tokens,
-        "daily_ai_limit": DAILY_AI_LIMIT,
-        "device_limit": DEVICE_LIMIT,
-        "time": now_iso(),
+        "status": "ok",
+        "service": APP_NAME,
+        "version": VERSION,
+        "ai_configured": bool(
+            OPENAI_API_KEY
+        ),
+        "model": OPENAI_MODEL
+        if OPENAI_API_KEY
+        else None,
+        "weather_provider": "Open-Meteo",
+        "database": "SQLite",
     }
+
+
+# ============================================================
+# SYNC
+# ============================================================
+
+@app.post("/sync")
+def sync_data(
+    user_id: int,
+    data: dict,
+    authorization: Optional[str] = Header(None),
+):
+
+    require_user(
+        authorization,
+        user_id,
+    )
+
+    execute(
+        """
+        INSERT INTO sync_queue
+        (user_id,data,status,created_at)
+        VALUES (?,?,?,?)
+        """,
+        (
+            user_id,
+            json_dumps(data),
+            "pending",
+            utc_now(),
+        ),
+        True,
+    )
+
+    return {
+        "status": "ok",
+        "synced": True,
+    }
+
+
+# ============================================================
+# NOTIFICATIONS
+# ============================================================
+
+@app.get("/notifications/{user_id}")
+def notifications(
+    user_id: int,
+    authorization: Optional[str] = Header(None),
+):
+
+    require_user(
+        authorization,
+        user_id,
+    )
+
+    rows = fetchall(
+        """
+        SELECT *
+        FROM notifications
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 100
+        """,
+        (user_id,),
+    )
+
+    return {
+        "status": "ok",
+        "notifications": [
+            dict(x) for x in rows
+        ],
+    }
+
+
+# ============================================================
+# STARTUP
+# ============================================================
+
+@app.on_event("startup")
+def startup():
+
+    init_db()
+
+    print(
+        f"{APP_NAME} {VERSION} started"
+    )
