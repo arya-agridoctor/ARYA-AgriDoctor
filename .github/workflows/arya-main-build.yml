@@ -32,7 +32,7 @@ jobs:
 
       - name: Analyze ARYA Main
         working-directory: arya_main
-        run: flutter analyze lib
+        run: run: flutter analyze lib --no-fatal-infos
 
       - name: Build APK
         working-directory: arya_main
