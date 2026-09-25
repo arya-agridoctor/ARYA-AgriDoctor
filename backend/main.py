@@ -13,8 +13,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 import requests
-from fastapi import FastAPI, HTTPException, Header, Security
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -54,8 +53,6 @@ app = FastAPI(
     version=VERSION,
     description="ARYA AgriDoctor Agricultural Intelligence Backend",
 )
-
-security = HTTPBearer(auto_error=False)
 
 app.add_middleware(
     CORSMiddleware,
@@ -552,7 +549,53 @@ class PaymentRequest(BaseModel):
 # AUTH
 # ============================================================
 
+def normalize_authorization(
+    authorization: Optional[str],
+) -> Optional[str]:
+
+    if not authorization:
+        return None
+
+    value = str(authorization).strip()
+
+    if not value:
+        return None
+
+    if value.lower().startswith("bearer "):
+        value = value[7:].strip()
+
+    if (
+        len(value) >= 2
+        and value[0] == '"'
+        and value[-1] == '"'
+    ):
+        value = value[1:-1].strip()
+
+    if (
+        len(value) >= 2
+        and value[0] == "'"
+        and value[-1] == "'"
+    ):
+        value = value[1:-1].strip()
+
+    return value or None
+
+
 def create_token(user_id: int) -> str:
+
+    # حذف توکن‌های منقضی قبلی کاربر
+    execute(
+        """
+        DELETE FROM auth_tokens
+        WHERE user_id=?
+        AND expires_at < ?
+        """,
+        (
+            user_id,
+            utc_now(),
+        ),
+        True,
+    )
 
     token = secrets.token_urlsafe(48)
 
@@ -567,23 +610,36 @@ def create_token(user_id: int) -> str:
         (user_id, token, expires_at, created_at)
         VALUES (?, ?, ?, ?)
         """,
-        (user_id, token, expires, utc_now()),
+        (
+            user_id,
+            token,
+            expires,
+            utc_now(),
+        ),
         True,
     )
 
     return token
 
 
-def get_user_from_token(token: Optional[str]):
+def get_user_from_token(
+    token: Optional[str],
+):
+
+    token = normalize_authorization(token)
+
     if not token:
         return None
 
     row = fetchone(
         """
-        SELECT u.*
+        SELECT
+            u.*
         FROM auth_tokens t
-        JOIN users u ON u.id=t.user_id
+        JOIN users u
+            ON u.id=t.user_id
         WHERE t.token=?
+        LIMIT 1
         """,
         (token,),
     )
@@ -591,11 +647,35 @@ def get_user_from_token(token: Optional[str]):
     if not row:
         return None
 
-    try:
-        expires = datetime.fromisoformat(row["expires_at"])
+    if not bool(row["active"]):
+        return None
 
-        if expires < datetime.now(timezone.utc):
+    try:
+
+        expires = datetime.fromisoformat(
+            row["expires_at"]
+        )
+
+        if expires.tzinfo is None:
+            expires = expires.replace(
+                tzinfo=timezone.utc
+            )
+
+        now = datetime.now(timezone.utc)
+
+        if expires <= now:
+
+            execute(
+                """
+                DELETE FROM auth_tokens
+                WHERE token=?
+                """,
+                (token,),
+                True,
+            )
+
             return None
+
     except Exception:
         return None
 
@@ -607,22 +687,39 @@ def require_user(
     user_id: Optional[int] = None,
 ):
 
-    if not authorization:
-        raise HTTPException(401, "Authentication required")
+    token = normalize_authorization(
+        authorization
+    )
 
-    token = authorization
+    if not token:
 
-    if authorization.lower().startswith("bearer "):
-        token = authorization[7:].strip()
+        raise HTTPException(
+            status_code=401,
+            detail="Authentication required",
+        )
 
-    user = get_user_from_token(token)
+    user = get_user_from_token(
+        token
+    )
 
     if not user:
-        raise HTTPException(401, "Invalid or expired token")
 
-    if user_id is not None and int(user["id"]) != int(user_id):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or expired token",
+        )
+
+    if (
+        user_id is not None
+        and int(user["id"]) != int(user_id)
+    ):
+
         if user["role"] != "owner":
-            raise HTTPException(403, "Access denied")
+
+            raise HTTPException(
+                status_code=403,
+                detail="Access denied",
+            )
 
     return user
 
@@ -633,6 +730,7 @@ def require_user(
 
 @app.get("/")
 def root():
+
     return {
         "service": APP_NAME,
         "version": VERSION,
@@ -642,6 +740,7 @@ def root():
 
 @app.get("/health")
 def health():
+
     return {
         "status": "ok",
         "service": APP_NAME,
@@ -655,15 +754,27 @@ def health():
 # ============================================================
 
 @app.post("/auth/register")
-def register(data: RegisterRequest):
+def register(
+    data: RegisterRequest,
+):
 
-    email = normalize_text(data.email).lower()
+    email = normalize_text(
+        data.email
+    ).lower()
 
     if not email or "@" not in email:
-        raise HTTPException(400, "Invalid email")
+
+        raise HTTPException(
+            400,
+            "Invalid email",
+        )
 
     if len(data.password) < 6:
-        raise HTTPException(400, "Password must contain at least 6 characters")
+
+        raise HTTPException(
+            400,
+            "Password must contain at least 6 characters",
+        )
 
     exists = fetchone(
         "SELECT id FROM users WHERE email=?",
@@ -671,9 +782,15 @@ def register(data: RegisterRequest):
     )
 
     if exists:
-        raise HTTPException(409, "Email already registered")
 
-    password_hash = hash_password(data.password)
+        raise HTTPException(
+            409,
+            "Email already registered",
+        )
+
+    password_hash = hash_password(
+        data.password
+    )
 
     cur = execute(
         """
@@ -695,7 +812,9 @@ def register(data: RegisterRequest):
 
     user_id = cur.lastrowid
 
-    token = create_token(user_id)
+    token = create_token(
+        user_id
+    )
 
     return {
         "status": "ok",
@@ -705,25 +824,42 @@ def register(data: RegisterRequest):
 
 
 @app.post("/auth/login")
-def login(data: LoginRequest):
+def login(
+    data: LoginRequest,
+):
 
-    email = normalize_text(data.email).lower()
+    email = normalize_text(
+        data.email
+    ).lower()
 
     user = fetchone(
         "SELECT * FROM users WHERE email=?",
         (email,),
     )
 
-    if not user or not verify_password(
-        data.password,
-        user["password_hash"],
+    if (
+        not user
+        or not verify_password(
+            data.password,
+            user["password_hash"],
+        )
     ):
-        raise HTTPException(401, "Invalid email or password")
+
+        raise HTTPException(
+            401,
+            "Invalid email or password",
+        )
 
     if not user["active"]:
-        raise HTTPException(403, "Account disabled")
 
-    token = create_token(user["id"])
+        raise HTTPException(
+            403,
+            "Account disabled",
+        )
+
+    token = create_token(
+        user["id"]
+    )
 
     return {
         "status": "ok",
@@ -738,7 +874,9 @@ def auth_me(
     authorization: Optional[str] = Header(None),
 ):
 
-    user = require_user(authorization)
+    user = require_user(
+        authorization
+    )
 
     return {
         "status": "ok",
@@ -757,12 +895,11 @@ def logout(
     authorization: Optional[str] = Header(None),
 ):
 
-    if authorization:
+    token = normalize_authorization(
+        authorization
+    )
 
-        token = authorization
-
-        if authorization.lower().startswith("bearer "):
-            token = authorization[7:].strip()
+    if token:
 
         execute(
             "DELETE FROM auth_tokens WHERE token=?",
@@ -770,7 +907,9 @@ def logout(
             True,
         )
 
-    return {"status": "ok"}
+    return {
+        "status": "ok"
+    }
 
 
 # ============================================================
@@ -783,7 +922,10 @@ def create_farm(
     authorization: Optional[str] = Header(None),
 ):
 
-    require_user(authorization, data.user_id)
+    require_user(
+        authorization,
+        data.user_id,
+    )
 
     cur = execute(
         """
@@ -815,7 +957,10 @@ def get_farms(
     authorization: Optional[str] = Header(None),
 ):
 
-    require_user(authorization, user_id)
+    require_user(
+        authorization,
+        user_id,
+    )
 
     rows = fetchall(
         "SELECT * FROM farms WHERE user_id=? ORDER BY id DESC",
@@ -824,19 +969,31 @@ def get_farms(
 
     return {
         "status": "ok",
-        "farms": [dict(r) for r in rows],
+        "farms": [
+            dict(r) for r in rows
+        ],
     }
 
 
-def verify_farm_owner(user_id: int, farm_id: int):
+def verify_farm_owner(
+    user_id: int,
+    farm_id: int,
+):
 
     row = fetchone(
         "SELECT * FROM farms WHERE id=? AND user_id=?",
-        (farm_id, user_id),
+        (
+            farm_id,
+            user_id,
+        ),
     )
 
     if not row:
-        raise HTTPException(403, "Farm not found or access denied")
+
+        raise HTTPException(
+            403,
+            "Farm not found or access denied",
+        )
 
     return row
 
@@ -851,9 +1008,15 @@ def create_land(
     authorization: Optional[str] = Header(None),
 ):
 
-    require_user(authorization, data.user_id)
+    require_user(
+        authorization,
+        data.user_id,
+    )
 
-    verify_farm_owner(data.user_id, data.farm_id)
+    verify_farm_owner(
+        data.user_id,
+        data.farm_id,
+    )
 
     cur = execute(
         """
@@ -886,9 +1049,15 @@ def get_lands(
     authorization: Optional[str] = Header(None),
 ):
 
-    require_user(authorization, user_id)
+    require_user(
+        authorization,
+        user_id,
+    )
 
-    verify_farm_owner(user_id, farm_id)
+    verify_farm_owner(
+        user_id,
+        farm_id,
+    )
 
     rows = fetchall(
         "SELECT * FROM lands WHERE farm_id=?",
@@ -897,7 +1066,9 @@ def get_lands(
 
     return {
         "status": "ok",
-        "lands": [dict(r) for r in rows],
+        "lands": [
+            dict(r) for r in rows
+        ],
     }
 
 
@@ -911,9 +1082,15 @@ def create_crop(
     authorization: Optional[str] = Header(None),
 ):
 
-    require_user(authorization, data.user_id)
+    require_user(
+        authorization,
+        data.user_id,
+    )
 
-    verify_farm_owner(data.user_id, data.farm_id)
+    verify_farm_owner(
+        data.user_id,
+        data.farm_id,
+    )
 
     cur = execute(
         """
@@ -948,9 +1125,15 @@ def get_crops(
     authorization: Optional[str] = Header(None),
 ):
 
-    require_user(authorization, user_id)
+    require_user(
+        authorization,
+        user_id,
+    )
 
-    verify_farm_owner(user_id, farm_id)
+    verify_farm_owner(
+        user_id,
+        farm_id,
+    )
 
     rows = fetchall(
         "SELECT * FROM crops WHERE farm_id=?",
@@ -959,7 +1142,9 @@ def get_crops(
 
     return {
         "status": "ok",
-        "crops": [dict(r) for r in rows],
+        "crops": [
+            dict(r) for r in rows
+        ],
     }
 
 
@@ -973,9 +1158,15 @@ def save_soil_lab(
     authorization: Optional[str] = Header(None),
 ):
 
-    require_user(authorization, data.user_id)
+    require_user(
+        authorization,
+        data.user_id,
+    )
 
-    verify_farm_owner(data.user_id, data.farm_id)
+    verify_farm_owner(
+        data.user_id,
+        data.farm_id,
+    )
 
     cur = execute(
         """
@@ -1005,9 +1196,15 @@ def get_soil_lab(
     authorization: Optional[str] = Header(None),
 ):
 
-    require_user(authorization, user_id)
+    require_user(
+        authorization,
+        user_id,
+    )
 
-    verify_farm_owner(user_id, farm_id)
+    verify_farm_owner(
+        user_id,
+        farm_id,
+    )
 
     rows = fetchall(
         """
@@ -1023,7 +1220,11 @@ def get_soil_lab(
     for row in rows:
 
         item = dict(row)
-        item["data"] = json_loads(item["data"], {})
+
+        item["data"] = json_loads(
+            item["data"],
+            {},
+        )
 
         result.append(item)
 
@@ -1043,9 +1244,15 @@ def create_water(
     authorization: Optional[str] = Header(None),
 ):
 
-    require_user(authorization, data.user_id)
+    require_user(
+        authorization,
+        data.user_id,
+    )
 
-    verify_farm_owner(data.user_id, data.farm_id)
+    verify_farm_owner(
+        data.user_id,
+        data.farm_id,
+    )
 
     cur = execute(
         """
@@ -1078,9 +1285,15 @@ def get_water(
     authorization: Optional[str] = Header(None),
 ):
 
-    require_user(authorization, user_id)
+    require_user(
+        authorization,
+        user_id,
+    )
 
-    verify_farm_owner(user_id, farm_id)
+    verify_farm_owner(
+        user_id,
+        farm_id,
+    )
 
     rows = fetchall(
         "SELECT * FROM water_sources WHERE farm_id=?",
@@ -1092,7 +1305,11 @@ def get_water(
     for row in rows:
 
         item = dict(row)
-        item["data"] = json_loads(item["data"], {})
+
+        item["data"] = json_loads(
+            item["data"],
+            {},
+        )
 
         result.append(item)
 
@@ -1106,7 +1323,10 @@ def get_water(
 # WEATHER
 # ============================================================
 
-def get_weather_data(latitude: float, longitude: float):
+def get_weather_data(
+    latitude: float,
+    longitude: float,
+):
 
     url = "https://api.open-meteo.com/v1/forecast"
 
@@ -1180,10 +1400,15 @@ def get_climate_data(
     years: int = 5,
 ):
 
-    end = datetime.now(timezone.utc).date()
+    end = datetime.now(
+        timezone.utc
+    ).date()
 
     start = end.replace(
-        year=max(1940, end.year - years)
+        year=max(
+            1940,
+            end.year - years,
+        )
     )
 
     url = "https://archive-api.open-meteo.com/v1/archive"
@@ -1217,7 +1442,9 @@ def get_climate_data(
 # GEOCODING
 # ============================================================
 
-def geocode_address(address: str):
+def geocode_address(
+    address: str,
+):
 
     if not address:
         return None
@@ -1237,7 +1464,9 @@ def geocode_address(address: str):
 
     data = response.json()
 
-    results = data.get("results") or []
+    results = data.get(
+        "results"
+    ) or []
 
     if not results:
         return None
@@ -1256,41 +1485,68 @@ def geocode_address(address: str):
 
 
 @app.post("/location/resolve")
-def resolve_location(data: LocationResolveRequest):
+def resolve_location(
+    data: LocationResolveRequest,
+):
 
     latitude = data.latitude
     longitude = data.longitude
 
     geocoded = None
 
-    if latitude is not None and longitude is not None:
+    if (
+        latitude is not None
+        and longitude is not None
+    ):
 
         if not -90 <= latitude <= 90:
-            raise HTTPException(400, "Invalid latitude")
+
+            raise HTTPException(
+                400,
+                "Invalid latitude",
+            )
 
         if not -180 <= longitude <= 180:
-            raise HTTPException(400, "Invalid longitude")
+
+            raise HTTPException(
+                400,
+                "Invalid longitude",
+            )
 
     elif data.address or data.region:
 
-        query = data.address or data.region
+        query = (
+            data.address
+            or data.region
+        )
 
         try:
-            geocoded = geocode_address(query)
+
+            geocoded = geocode_address(
+                query
+            )
+
         except Exception as exc:
+
             return {
                 "status": "error",
                 "message": f"Location lookup failed: {exc}",
             }
 
         if not geocoded:
+
             return {
                 "status": "not_found",
                 "message": "Location not found",
             }
 
-        latitude = geocoded["latitude"]
-        longitude = geocoded["longitude"]
+        latitude = geocoded[
+            "latitude"
+        ]
+
+        longitude = geocoded[
+            "longitude"
+        ]
 
     else:
 
@@ -1342,7 +1598,8 @@ def collect_farm_context(
     )
 
     context["lands"] = [
-        dict(x) for x in lands
+        dict(x)
+        for x in lands
     ]
 
     crops = fetchall(
@@ -1351,7 +1608,8 @@ def collect_farm_context(
     )
 
     context["crops"] = [
-        dict(x) for x in crops
+        dict(x)
+        for x in crops
     ]
 
     soil = fetchall(
@@ -1362,12 +1620,15 @@ def collect_farm_context(
     for item in soil:
 
         obj = dict(item)
+
         obj["data"] = json_loads(
             obj.get("data"),
             {},
         )
 
-        context["soil_lab"].append(obj)
+        context["soil_lab"].append(
+            obj
+        )
 
     water = fetchall(
         "SELECT * FROM water_sources WHERE farm_id=?",
@@ -1377,12 +1638,15 @@ def collect_farm_context(
     for item in water:
 
         obj = dict(item)
+
         obj["data"] = json_loads(
             obj.get("data"),
             {},
         )
 
-        context["water"].append(obj)
+        context["water"].append(
+            obj
+        )
 
     return context
 
@@ -1399,10 +1663,15 @@ def validate_location(
     errors = []
     warnings = []
 
-    if latitude is None or longitude is None:
+    if (
+        latitude is None
+        or longitude is None
+    ):
+
         errors.append(
             "مختصات جغرافیایی برای تحلیل مکانی کامل موجود نیست."
         )
+
         return {
             "valid": False,
             "errors": errors,
@@ -1410,12 +1679,22 @@ def validate_location(
         }
 
     if not -90 <= latitude <= 90:
-        errors.append("عرض جغرافیایی نامعتبر است.")
+
+        errors.append(
+            "عرض جغرافیایی نامعتبر است."
+        )
 
     if not -180 <= longitude <= 180:
-        errors.append("طول جغرافیایی نامعتبر است.")
 
-    if latitude == 0 and longitude == 0:
+        errors.append(
+            "طول جغرافیایی نامعتبر است."
+        )
+
+    if (
+        latitude == 0
+        and longitude == 0
+    ):
+
         warnings.append(
             "مختصات صفر وارد شده و ممکن است مختصات واقعی مزرعه نباشد."
         )
@@ -1427,43 +1706,63 @@ def validate_location(
     }
 
 
-def validate_user_context(context: dict):
+def validate_user_context(
+    context: dict,
+):
 
     warnings = []
     contradictions = []
 
-    farm = context.get("farm") or {}
+    farm = context.get(
+        "farm"
+    ) or {}
 
     area_values = []
 
-    for land in context.get("lands", []):
+    for land in context.get(
+        "lands",
+        [],
+    ):
 
         area = safe_float(
             land.get("area")
         )
 
         if area is not None:
-            area_values.append(area)
+
+            area_values.append(
+                area
+            )
 
             if area < 0:
+
                 contradictions.append(
                     "مساحت زمین نمی‌تواند منفی باشد."
                 )
 
-    for crop in context.get("crops", []):
+    for crop in context.get(
+        "crops",
+        [],
+    ):
 
         name = normalize_text(
             crop.get("name")
         )
 
         if not name:
+
             contradictions.append(
                 "یک رکورد کشت بدون نام محصول وجود دارد."
             )
 
-    for soil in context.get("soil_lab", []):
+    for soil in context.get(
+        "soil_lab",
+        [],
+    ):
 
-        data = soil.get("data") or {}
+        data = soil.get(
+            "data"
+        ) or {}
 
         ph = safe_float(
             data.get("ph")
@@ -1474,6 +1773,7 @@ def validate_user_context(context: dict):
         if ph is not None:
 
             if ph < 0 or ph > 14:
+
                 contradictions.append(
                     "pH آزمایش خاک خارج از محدوده معتبر است."
                 )
@@ -1482,12 +1782,21 @@ def validate_user_context(context: dict):
         "valid": len(contradictions) == 0,
         "warnings": warnings,
         "contradictions": contradictions,
-        "farm_name": farm.get("name", ""),
+        "farm_name": farm.get(
+            "name",
+            "",
+        ),
         "total_land_records": len(
-            context.get("lands", [])
+            context.get(
+                "lands",
+                [],
+            )
         ),
         "crop_records": len(
-            context.get("crops", [])
+            context.get(
+                "crops",
+                [],
+            )
         ),
     }
 
@@ -1502,7 +1811,9 @@ def local_agri_answer(
     region: Optional[str] = None,
 ):
 
-    q = normalize_text(question).lower()
+    q = normalize_text(
+        question
+    ).lower()
 
     points = []
 
@@ -1516,6 +1827,7 @@ def local_agri_answer(
             "leaf",
         ]
     ):
+
         points.extend(
             [
                 "کمبود یا عدم تعادل عناصر غذایی",
@@ -1535,6 +1847,7 @@ def local_agri_answer(
             "water",
         ]
     ):
+
         points.extend(
             [
                 "نیاز آبی باید بر اساس محصول، مرحله رشد، بافت خاک، دما و تبخیرتعرق بررسی شود.",
@@ -1553,6 +1866,7 @@ def local_agri_answer(
             "پتاس",
         ]
     ):
+
         points.extend(
             [
                 "انتخاب کود باید بر اساس آزمایش خاک، محصول، مرحله رشد و هدف تولید انجام شود.",
@@ -1572,6 +1886,7 @@ def local_agri_answer(
             "pesticide",
         ]
     ):
+
         points.extend(
             [
                 "تشخیص آفت یا بیماری فقط از روی یک علامت قطعی نیست.",
@@ -1588,9 +1903,14 @@ def local_agri_answer(
 
     return {
         "answer": "\n".join(
-            f"• {x}" for x in points
+            f"• {x}"
+            for x in points
         ),
-        "confidence": 0.45 if not crop else 0.60,
+        "confidence": (
+            0.45
+            if not crop
+            else 0.60
+        ),
     }
 
 
@@ -1598,7 +1918,9 @@ def local_agri_answer(
 # OPENAI AGRICULTURAL ENGINE
 # ============================================================
 
-def build_agri_system_prompt(language: str):
+def build_agri_system_prompt(
+    language: str,
+):
 
     return f"""
 You are ARYA AgriDoctor, a professional agricultural intelligence system.
@@ -1730,1252 +2052,5 @@ def openai_answer(
 # AI USAGE
 # ============================================================
 
-def check_ai_limit(user_id: int):
-
-    date = today_utc()
-
-    row = fetchone(
-        """
-        SELECT * FROM ai_usage
-        WHERE user_id=? AND usage_date=?
-        """,
-        (user_id, date),
-    )
-
-    if not row:
-
-        execute(
-            """
-            INSERT INTO ai_usage
-            (user_id,usage_date,count)
-            VALUES (?,?,0)
-            """,
-            (user_id, date),
-            True,
-        )
-
-        return True
-
-    return int(row["count"]) < DAILY_AI_LIMIT
-
-
-def increment_ai_usage(user_id: int):
-
-    date = today_utc()
-
-    execute(
-        """
-        UPDATE ai_usage
-        SET count=count+1
-        WHERE user_id=? AND usage_date=?
-        """,
-        (user_id, date),
-        True,
-    )
-
-
-# ============================================================
-# REGION ANALYSIS
-# ============================================================
-
-def create_region_analysis(
-    latitude,
-    longitude,
-    region,
-    language,
-):
-
-    weather_data = None
-    climate_data = None
-
-    if latitude is not None and longitude is not None:
-
-        try:
-            weather_data = get_weather_data(
-                latitude,
-                longitude,
-            )
-        except Exception:
-            weather_data = None
-
-        try:
-            climate_data = get_climate_data(
-                latitude,
-                longitude,
-                5,
-            )
-        except Exception:
-            climate_data = None
-
-    return {
-        "region": region,
-        "latitude": latitude,
-        "longitude": longitude,
-        "weather": weather_data,
-        "climate": climate_data,
-        "note": (
-            "تحلیل منطقه بر اساس مختصات، "
-            "آب‌وهوا و داده‌های اقلیمی موجود انجام می‌شود."
-        ),
-    }
-
-
-@app.post("/ai/region-analysis")
-def region_analysis(
-    data: RegionAnalysisRequest,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        data.user_id,
-    )
-
-    latitude = data.latitude
-    longitude = data.longitude
-    resolved = None
-
-    if (
-        latitude is None
-        or longitude is None
-    ):
-
-        if data.address or data.region:
-
-            resolved = geocode_address(
-                data.address or data.region
-            )
-
-            if resolved:
-
-                latitude = resolved["latitude"]
-                longitude = resolved["longitude"]
-
-    validation = validate_location(
-        latitude,
-        longitude,
-    )
-
-    analysis = create_region_analysis(
-        latitude,
-        longitude,
-        data.region,
-        data.language,
-    )
-
-    return {
-        "status": "ok",
-        "location": {
-            "latitude": latitude,
-            "longitude": longitude,
-            "region": data.region,
-            "resolved": resolved,
-        },
-        "validation": validation,
-        "analysis": analysis,
-    }
-
-
-# ============================================================
-# MAIN AI ASK
-# ============================================================
-
-@app.post("/ai/ask")
-def ask_ai(
-    data: AIAsk,
-    credentials: Optional[HTTPAuthorizationCredentials] = Security(security),
-):
-    authorization = (
-        f"{credentials.scheme} {credentials.credentials}"
-        if credentials
-        else None
-    )
-
-    require_user(
-        authorization,
-        data.user_id,
-    )
-
-    if not check_ai_limit(data.user_id):
-
-        raise HTTPException(
-            429,
-            "Daily AI limit reached",
-        )
-
-    farm_context = collect_farm_context(
-        data.user_id,
-        data.farm_id,
-    )
-
-    farm = farm_context.get("farm") or {}
-
-    latitude = data.latitude
-    longitude = data.longitude
-
-    # --------------------------------------------------------
-    # Farm coordinates
-    # --------------------------------------------------------
-
-    if (
-        latitude is None
-        or longitude is None
-    ):
-
-        latitude = farm.get("latitude")
-        longitude = farm.get("longitude")
-
-    # --------------------------------------------------------
-    # Manual address / region
-    # --------------------------------------------------------
-
-    resolved_location = None
-
-    if (
-        data.address
-        and (
-            latitude is None
-            or longitude is None
-        )
-    ):
-
-        try:
-
-            resolved_location = geocode_address(
-                data.address
-            )
-
-            if resolved_location:
-
-                latitude = resolved_location[
-                    "latitude"
-                ]
-
-                longitude = resolved_location[
-                    "longitude"
-                ]
-
-        except Exception:
-            resolved_location = None
-
-    elif (
-        data.region
-        and (
-            latitude is None
-            or longitude is None
-        )
-    ):
-
-        try:
-
-            resolved_location = geocode_address(
-                data.region
-            )
-
-            if resolved_location:
-
-                latitude = resolved_location[
-                    "latitude"
-                ]
-
-                longitude = resolved_location[
-                    "longitude"
-                ]
-
-        except Exception:
-            resolved_location = None
-
-    # --------------------------------------------------------
-    # Location validation
-    # --------------------------------------------------------
-
-    location_validation = validate_location(
-        latitude,
-        longitude,
-    )
-
-    # --------------------------------------------------------
-    # Weather
-    # --------------------------------------------------------
-
-    weather_data = None
-
-    if (
-        data.weather_analysis
-        and latitude is not None
-        and longitude is not None
-    ):
-
-        try:
-
-            weather_data = get_weather_data(
-                latitude,
-                longitude,
-            )
-
-        except Exception:
-            weather_data = None
-
-    # --------------------------------------------------------
-    # Climate
-    # --------------------------------------------------------
-
-    climate_data = None
-
-    if (
-        data.climate_analysis
-        and latitude is not None
-        and longitude is not None
-    ):
-
-        try:
-
-            climate_data = get_climate_data(
-                latitude,
-                longitude,
-                5,
-            )
-
-        except Exception:
-            climate_data = None
-
-    # --------------------------------------------------------
-    # User data validation
-    # --------------------------------------------------------
-
-    user_validation = (
-        validate_user_context(
-            farm_context
-        )
-        if data.validate_user_information
-        else {}
-    )
-
-    # --------------------------------------------------------
-    # Crop
-    # --------------------------------------------------------
-
-    crop_name = data.crop
-
-    if not crop_name:
-
-        crops = farm_context.get(
-            "crops",
-            [],
-        )
-
-        if crops:
-            crop_name = crops[0].get(
-                "name"
-            )
-
-    # --------------------------------------------------------
-    # Context packet
-    # --------------------------------------------------------
-
-    context_packet = {
-        "application": APP_NAME,
-        "version": VERSION,
-
-        "question": data.question,
-
-        "location": {
-            "latitude": latitude,
-            "longitude": longitude,
-            "address": data.address,
-            "region": data.region,
-            "resolved": resolved_location,
-            "use_current_location":
-                data.use_current_location,
-        },
-
-        "location_validation":
-            location_validation,
-
-        "crop": crop_name,
-
-        "farm_context":
-            farm_context
-            if data.use_user_provided_data
-            else {},
-
-        "user_data_validation":
-            user_validation
-            if data.validate_user_information
-            else {},
-
-        "weather":
-            weather_data
-            if data.weather_analysis
-            else None,
-
-        "climate":
-            climate_data
-            if data.climate_analysis
-            else None,
-
-        "analysis_options": {
-            "deep_agricultural_analysis":
-                data.deep_agricultural_analysis,
-
-            "validate_user_information":
-                data.validate_user_information,
-
-            "generate_alternatives":
-                data.generate_alternatives,
-
-            "generate_action_plan":
-                data.generate_action_plan,
-
-            "generate_schedule":
-                data.generate_schedule,
-
-            "generate_alerts":
-                data.generate_alerts,
-
-            "weather_analysis":
-                data.weather_analysis,
-
-            "climate_analysis":
-                data.climate_analysis,
-
-            "soil_analysis":
-                data.soil_analysis,
-
-            "water_analysis":
-                data.water_analysis,
-
-            "crop_suitability":
-                data.crop_suitability,
-
-            "pest_disease_analysis":
-                data.pest_disease_analysis,
-
-            "fertilizer_analysis":
-                data.fertilizer_analysis,
-
-            "image_analysis_ready":
-                data.image_analysis_ready,
-        },
-
-        "global_knowledge_requested":
-            data.use_global_knowledge,
-    }
-
-    # --------------------------------------------------------
-    # AI
-    # --------------------------------------------------------
-
-    ai_result = openai_answer(
-        data.question,
-        data.language,
-        context_packet,
-    )
-
-    increment_ai_usage(
-        data.user_id
-    )
-
-    # --------------------------------------------------------
-    # Fallback
-    # --------------------------------------------------------
-
-    if isinstance(ai_result, dict) and ai_result.get(
-        "error"
-    ):
-
-        ai_result = None
-
-    if not ai_result:
-
-        local = local_agri_answer(
-            data.question,
-            crop_name,
-            data.region,
-        )
-
-        answer = local["answer"]
-        confidence = local["confidence"]
-
-    else:
-
-        answer = ai_result
-        confidence = 0.78
-
-        if not location_validation.get(
-            "valid",
-            False,
-        ):
-            confidence -= 0.08
-
-        if user_validation.get(
-            "contradictions"
-        ):
-            confidence -= 0.08
-
-        confidence = max(
-            0.35,
-            min(0.95, confidence),
-        )
-
-    # --------------------------------------------------------
-    # Missing data
-    # --------------------------------------------------------
-
-    missing_data = []
-
-    if not crop_name:
-        missing_data.append(
-            "نام محصول یا درخت"
-        )
-
-    if latitude is None or longitude is None:
-        missing_data.append(
-            "موقعیت مزرعه"
-        )
-
-    if not farm_context.get("soil_lab"):
-        missing_data.append(
-            "آزمایش خاک"
-        )
-
-    if not farm_context.get("water"):
-        missing_data.append(
-            "اطلاعات کیفیت آب"
-        )
-
-    # --------------------------------------------------------
-    # Save recommendation
-    # --------------------------------------------------------
-
-    execute(
-        """
-        INSERT INTO recommendations
-        (user_id,farm_id,question,answer,confidence,data,created_at)
-        VALUES (?,?,?,?,?,?,?)
-        """,
-        (
-            data.user_id,
-            data.farm_id,
-            data.question,
-            answer,
-            confidence,
-            json_dumps(context_packet),
-            utc_now(),
-        ),
-        True,
-    )
-
-    # --------------------------------------------------------
-    # Audit
-    # --------------------------------------------------------
-
-    execute(
-        """
-        INSERT INTO audit_logs
-        (user_id,action,data,created_at)
-        VALUES (?,?,?,?)
-        """,
-        (
-            data.user_id,
-            "ai_ask",
-            json_dumps(
-                {
-                    "crop": crop_name,
-                    "farm_id": data.farm_id,
-                    "latitude": latitude,
-                    "longitude": longitude,
-                }
-            ),
-            utc_now(),
-        ),
-        True,
-    )
-
-    return {
-        "status": "ok",
-
-        "answer": answer,
-
-        "confidence": confidence,
-
-        "location": {
-            "latitude": latitude,
-            "longitude": longitude,
-            "address": data.address,
-            "region": data.region,
-            "resolved": resolved_location,
-        },
-
-        "weather": weather_data,
-
-        "climate": climate_data,
-
-        "validation": {
-            "location": location_validation,
-            "user_data": user_validation,
-        },
-
-        "missing_data": missing_data,
-
-        "crop": crop_name,
-
-        "farm_context": farm_context,
-
-        "recommendations": [],
-
-        "alternatives": [],
-
-        "action_plan": [],
-
-        "schedule": [],
-
-        "alerts": [],
-
-        "ai": {
-            "provider": (
-                "openai"
-                if OPENAI_API_KEY and ai_result
-                else "local"
-            ),
-            "model": (
-                OPENAI_MODEL
-                if OPENAI_API_KEY and ai_result
-                else None
-            ),
-        },
-    }
-
-
-# ============================================================
-# AI HISTORY
-# ============================================================
-
-@app.get("/ai/history/{user_id}")
-def ai_history(
-    user_id: int,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        user_id,
-    )
-
-    rows = fetchall(
-        """
-        SELECT id,farm_id,question,answer,
-               confidence,created_at
-        FROM recommendations
-        WHERE user_id=?
-        ORDER BY id DESC
-        LIMIT 100
-        """,
-        (user_id,),
-    )
-
-    return {
-        "status": "ok",
-        "items": [dict(r) for r in rows],
-    }
-
-
-# ============================================================
-# PRICING
-# ============================================================
-
-def pricing_for(
-    country: str,
-    users_count: int,
-):
-
-    if country.lower() in [
-        "iran",
-        "ir",
-        "ایران",
-    ]:
-
-        if users_count < 100:
-            return {
-                "amount": 500000,
-                "currency": "IRR",
-            }
-
-        if users_count < 600:
-            return {
-                "amount": 800000,
-                "currency": "IRR",
-            }
-
-        return {
-            "amount": 1200000,
-            "currency": "IRR",
-        }
-
-    if users_count < 100:
-        return {
-            "amount": 10,
-            "currency": "USDT",
-        }
-
-    if users_count < 600:
-        return {
-            "amount": 15,
-            "currency": "USDT",
-        }
-
-    return {
-        "amount": 20,
-        "currency": "USDT",
-    }
-
-
-@app.get("/pricing")
-def pricing(
-    country: str = "international",
-):
-
-    count_row = fetchone(
-        "SELECT COUNT(*) AS c FROM users"
-    )
-
-    users_count = int(
-        count_row["c"]
-    )
-
-    price = pricing_for(
-        country,
-        users_count,
-    )
-
-    return {
-        "status": "ok",
-        "country": country,
-        "registered_users": users_count,
-        **price,
-    }
-
-
-# ============================================================
-# PAYMENTS
-# ============================================================
-
-@app.post("/payments")
-def create_payment(
-    data: PaymentRequest,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        data.user_id,
-    )
-
-    method = data.method.lower()
-
-    if method not in [
-        "bank",
-        "bank_transfer",
-        "crypto",
-        "usdt",
-    ]:
-
-        raise HTTPException(
-            400,
-            "Unsupported payment method",
-        )
-
-    cur = execute(
-        """
-        INSERT INTO payments
-        (user_id,amount,currency,method,
-         destination,transaction_id,status,
-         data,created_at)
-        VALUES (?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            data.user_id,
-            data.amount,
-            data.currency,
-            method,
-            data.destination,
-            data.transaction_id,
-            "pending",
-            "{}",
-            utc_now(),
-        ),
-        True,
-    )
-
-    return {
-        "status": "ok",
-        "payment_id": cur.lastrowid,
-        "payment_status": "pending",
-    }
-
-
-@app.get("/payments/{user_id}")
-def get_payments(
-    user_id: int,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        user_id,
-    )
-
-    rows = fetchall(
-        """
-        SELECT *
-        FROM payments
-        WHERE user_id=?
-        ORDER BY id DESC
-        """,
-        (user_id,),
-    )
-
-    return {
-        "status": "ok",
-        "payments": [
-            dict(x) for x in rows
-        ],
-    }
-
-
-# ============================================================
-# SUBSCRIPTION
-# ============================================================
-
-@app.get("/subscription/{user_id}")
-def get_subscription(
-    user_id: int,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        user_id,
-    )
-
-    row = fetchone(
-        """
-        SELECT *
-        FROM subscriptions
-        WHERE user_id=?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (user_id,),
-    )
-
-    if not row:
-
-        return {
-            "status": "ok",
-            "active": False,
-            "subscription": None,
-        }
-
-    active = row["status"] == "active"
-
-    if row["expires_at"]:
-
-        try:
-
-            expires = datetime.fromisoformat(
-                row["expires_at"]
-            )
-
-            if expires < datetime.now(
-                timezone.utc
-            ):
-                active = False
-
-        except Exception:
-            pass
-
-    return {
-        "status": "ok",
-        "active": active,
-        "subscription": dict(row),
-    }
-
-
-# ============================================================
-# DEVICE ACTIVATION
-# ============================================================
-
-@app.post("/devices/register")
-def register_device(
-    user_id: int,
-    device_id: str,
-    platform: str = "",
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        user_id,
-    )
-
-    existing = fetchone(
-        """
-        SELECT id
-        FROM devices
-        WHERE user_id=? AND device_id=?
-        """,
-        (user_id, device_id),
-    )
-
-    if existing:
-
-        execute(
-            """
-            UPDATE devices
-            SET last_seen=?,active=1,platform=?
-            WHERE id=?
-            """,
-            (
-                utc_now(),
-                platform,
-                existing["id"],
-            ),
-            True,
-        )
-
-        return {
-            "status": "ok",
-            "device_id": device_id,
-        }
-
-    count = fetchone(
-        """
-        SELECT COUNT(*) AS c
-        FROM devices
-        WHERE user_id=? AND active=1
-        """,
-        (user_id,),
-    )
-
-    if int(count["c"]) >= DEVICE_LIMIT:
-
-        raise HTTPException(
-            403,
-            "Device limit reached",
-        )
-
-    execute(
-        """
-        INSERT INTO devices
-        (user_id,device_id,platform,last_seen,active)
-        VALUES (?,?,?,?,1)
-        """,
-        (
-            user_id,
-            device_id,
-            platform,
-            utc_now(),
-        ),
-        True,
-    )
-
-    return {
-        "status": "ok",
-        "device_id": device_id,
-    }
-
-
-# ============================================================
-# FEEDBACK
-# ============================================================
-
-@app.post("/feedback")
-def send_feedback(
-    data: FeedbackRequest,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        data.user_id,
-    )
-
-    cur = execute(
-        """
-        INSERT INTO feedback
-        (user_id,language,message,
-         translated_message,status,created_at)
-        VALUES (?,?,?,?,?,?)
-        """,
-        (
-            data.user_id,
-            data.language,
-            data.message,
-            "",
-            "new",
-            utc_now(),
-        ),
-        True,
-    )
-
-    return {
-        "status": "ok",
-        "feedback_id": cur.lastrowid,
-    }
-
-
-# ============================================================
-# OWNER
-# ============================================================
-
-def require_owner(
-    authorization: Optional[str],
-):
-
-    user = require_user(
-        authorization
-    )
-
-    if user["role"] != "owner":
-
-        if MASTER_EMAIL:
-            if user["email"] != MASTER_EMAIL:
-                raise HTTPException(
-                    403,
-                    "Owner access required",
-                )
-        else:
-            raise HTTPException(
-                403,
-                "Owner access required",
-            )
-
-    return user
-
-
-@app.get("/owner/stats")
-def owner_stats(
-    authorization: Optional[str] = Header(None),
-):
-
-    require_owner(authorization)
-
-    users = fetchone(
-        "SELECT COUNT(*) AS c FROM users"
-    )
-
-    farms = fetchone(
-        "SELECT COUNT(*) AS c FROM farms"
-    )
-
-    payments = fetchone(
-        "SELECT COUNT(*) AS c FROM payments"
-    )
-
-    recommendations = fetchone(
-        "SELECT COUNT(*) AS c FROM recommendations"
-    )
-
-    return {
-        "status": "ok",
-        "users": users["c"],
-        "farms": farms["c"],
-        "payments": payments["c"],
-        "ai_requests": recommendations["c"],
-    }
-
-
-@app.get("/owner/feedback")
-def owner_feedback(
-    authorization: Optional[str] = Header(None),
-):
-
-    require_owner(authorization)
-
-    rows = fetchall(
-        """
-        SELECT *
-        FROM feedback
-        ORDER BY id DESC
-        LIMIT 200
-        """
-    )
-
-    return {
-        "status": "ok",
-        "feedback": [
-            dict(x) for x in rows
-        ],
-    }
-
-
-@app.get("/owner/audit")
-def owner_audit(
-    authorization: Optional[str] = Header(None),
-):
-
-    require_owner(authorization)
-
-    rows = fetchall(
-        """
-        SELECT *
-        FROM audit_logs
-        ORDER BY id DESC
-        LIMIT 500
-        """
-    )
-
-    return {
-        "status": "ok",
-        "logs": [
-            dict(x) for x in rows
-        ],
-    }
-
-
-# ============================================================
-# KNOWLEDGE
-# ============================================================
-
-@app.get("/knowledge")
-def knowledge():
-
-    rows = fetchall(
-        """
-        SELECT *
-        FROM knowledge_versions
-        WHERE active=1
-        ORDER BY id DESC
-        """
-    )
-
-    return {
-        "status": "ok",
-        "knowledge": [
-            dict(x) for x in rows
-        ],
-    }
-
-
-# ============================================================
-# SERVER TIME
-# ============================================================
-
-@app.get("/server-time")
-def server_time():
-
-    return {
-        "status": "ok",
-        "utc": utc_now(),
-        "timestamp": datetime.now(
-            timezone.utc
-        ).timestamp(),
-    }
-
-
-# ============================================================
-# SYSTEM INFO
-# ============================================================
-
-@app.get("/system-info")
-def system_info():
-
-    return {
-        "status": "ok",
-        "service": APP_NAME,
-        "version": VERSION,
-        "ai_configured": bool(
-            OPENAI_API_KEY
-        ),
-        "model": OPENAI_MODEL
-        if OPENAI_API_KEY
-        else None,
-        "weather_provider": "Open-Meteo",
-        "database": "SQLite",
-    }
-
-
-# ============================================================
-# SYNC
-# ============================================================
-
-@app.post("/sync")
-def sync_data(
-    user_id: int,
-    data: dict,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        user_id,
-    )
-
-    execute(
-        """
-        INSERT INTO sync_queue
-        (user_id,data,status,created_at)
-        VALUES (?,?,?,?)
-        """,
-        (
-            user_id,
-            json_dumps(data),
-            "pending",
-            utc_now(),
-        ),
-        True,
-    )
-
-    return {
-        "status": "ok",
-        "synced": True,
-    }
-
-
-# ============================================================
-# NOTIFICATIONS
-# ============================================================
-
-@app.get("/notifications/{user_id}")
-def notifications(
-    user_id: int,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        user_id,
-    )
-
-    rows = fetchall(
-        """
-        SELECT *
-        FROM notifications
-        WHERE user_id=?
-        ORDER BY id DESC
-        LIMIT 100
-        """,
-        (user_id,),
-    )
-
-    return {
-        "status": "ok",
-        "notifications": [
-            dict(x) for x in rows
-        ],
-    }
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-@app.on_event("startup")
-def startup():
-
-    init_db()
-
-    print(
-        f"{APP_NAME} {VERSION} started"
-    )
+def check_ai_limit(
+    user
