@@ -13,7 +13,8 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 
 import requests
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -53,6 +54,8 @@ app = FastAPI(
     version=VERSION,
     description="ARYA AgriDoctor Agricultural Intelligence Backend",
 )
+
+security = HTTPBearer(auto_error=False)
 
 app.add_middleware(
     CORSMiddleware,
@@ -1880,8 +1883,13 @@ def region_analysis(
 @app.post("/ai/ask")
 def ask_ai(
     data: AIAsk,
-    authorization: Optional[str] = Header(None),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(security),
 ):
+    authorization = (
+        f"{credentials.scheme} {credentials.credentials}"
+        if credentials
+        else None
+    )
 
     require_user(
         authorization,
