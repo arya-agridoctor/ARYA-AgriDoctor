@@ -1,891 +1,1281 @@
-# backend/main.py
-# ARYA AgriDoctor - Integrated Backend
-# FastAPI + SQLite + Open-Meteo + OpenAI
-# نسخه یکپارچه
-
 import os
 import re
 import json
-import sqlite3
+import time
+import uuid
+import hmac
+import base64
 import hashlib
 import secrets
+import struct
+import sqlite3
+from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Any
+from typing import Any, Optional, Literal
 
 import requests
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, Field, EmailStr
 
 # ============================================================
-# CONFIG
+# ARYA AGRIDOCTOR — SINGLE FILE BACKEND
+# Production-oriented foundation. External providers are explicit;
+# the backend never invents diagnoses, doses, prices, or weather.
 # ============================================================
 
 APP_NAME = "ARYA AgriDoctor"
-VERSION = "2.0.0"
-
-DB_PATH = os.getenv("ARYA_DB_PATH", "arya.db")
-
-MASTER_EMAIL = os.getenv("ARYA_MASTER_EMAIL", "")
-MASTER_SECRET = os.getenv("ARYA_MASTER_SECRET", "")
+VERSION = "4.0.0"
+BASE_DIR = Path(os.getenv("ARYA_BASE_DIR", ".")).resolve()
+DB_PATH = Path(os.getenv("ARYA_DATABASE", str(BASE_DIR / "arya.db")))
+MEDIA_DIR = Path(os.getenv("ARYA_MEDIA_DIR", str(BASE_DIR / "media")))
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+TRANSLATION_API_URL = os.getenv("ARYA_TRANSLATION_API_URL", "")
+TRANSLATION_API_KEY = os.getenv("ARYA_TRANSLATION_API_KEY", "")
+WEATHER_TIMEOUT = int(os.getenv("ARYA_WEATHER_TIMEOUT", "20"))
+TOKEN_DAYS = int(os.getenv("ARYA_TOKEN_DAYS", "30"))
+RESET_HOURS = int(os.getenv("ARYA_RESET_HOURS", "2"))
 DAILY_AI_LIMIT = int(os.getenv("ARYA_DAILY_AI_LIMIT", "30"))
 DEVICE_LIMIT = int(os.getenv("ARYA_DEVICE_LIMIT", "3"))
+PBKDF2_ITERATIONS = int(os.getenv("ARYA_PBKDF2_ITERATIONS", "310000"))
+MAX_UPLOAD_MB = int(os.getenv("ARYA_MAX_UPLOAD_MB", "15"))
+OWNER_BOOTSTRAP_SECRET = os.getenv("ARYA_OWNER_BOOTSTRAP_SECRET", "")
+OWNER_EMAIL = os.getenv("ARYA_OWNER_EMAIL", "")
 
-ACCESS_TOKEN_DAYS = int(os.getenv("ARYA_ACCESS_TOKEN_DAYS", "30"))
-RESET_TOKEN_HOURS = int(os.getenv("ARYA_RESET_TOKEN_HOURS", "2"))
+app = FastAPI(title=APP_NAME, version=VERSION)
 
-PBKDF2_ITERATIONS = 310000
-
-OPEN_METEO_TIMEOUT = 20
-
-
-# ============================================================
-# APP
-# ============================================================
-
-app = FastAPI(
-    title=APP_NAME,
-    version=VERSION,
-    description="ARYA AgriDoctor Agricultural Intelligence Backend",
-)
+CORS_ORIGINS = [
+    x.strip()
+    for x in os.getenv("ARYA_CORS", "*").split(",")
+    if x.strip()
+]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=(CORS_ORIGINS != ["*"]),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# ----------------------------- utilities -----------------------------
 
-# ============================================================
-# GENERAL HELPERS
-# ============================================================
-
-def utc_now() -> str:
+def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def today_utc() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+def today() -> str:
+    return datetime.now(timezone.utc).date().isoformat()
 
 
-def json_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, default=str)
-
-
-def json_loads(value: Any, default=None):
-    if value is None:
-        return default
-
-    if isinstance(value, (dict, list)):
-        return value
-
-    try:
-        return json.loads(value)
-    except Exception:
-        return default
-
-
-def hash_password(password: str, salt: Optional[str] = None) -> str:
-    if not password:
-        raise ValueError("password required")
-
-    if salt is None:
-        salt = secrets.token_hex(16)
-
-    digest = hashlib.pbkdf2_hmac(
+def hash_password(password: str, salt: Optional[bytes] = None) -> str:
+    if len(password) < 8:
+        raise HTTPException(400, "password must be at least 8 characters")
+    salt = salt or secrets.token_bytes(16)
+    dk = hashlib.pbkdf2_hmac(
         "sha256",
-        password.encode("utf-8"),
-        bytes.fromhex(salt),
+        password.encode(),
+        salt,
         PBKDF2_ITERATIONS,
     )
+    return (
+        base64.urlsafe_b64encode(salt).decode()
+        + "$"
+        + base64.urlsafe_b64encode(dk).decode()
+    )
 
-    return f"{salt}${digest.hex()}"
+
+def totp_code(secret: str, timestamp: Optional[int] = None) -> str:
+    if not secret:
+        return ""
+
+    timestamp = timestamp or int(time.time())
+    counter = timestamp // 30
+
+    key = base64.b32decode(
+        secret.upper()
+        + "=" * ((8 - len(secret) % 8) % 8)
+    )
+
+    msg = struct.pack(">Q", counter)
+    digest = hmac.new(key, msg, hashlib.sha1).digest()
+    off = digest[-1] & 0x0F
+
+    num = (
+        struct.unpack(">I", digest[off:off + 4])[0]
+        & 0x7FFFFFFF
+    ) % 1000000
+
+    return f"{num:06d}"
+
+
+def verify_totp(secret: str, code: str) -> bool:
+    if not re.fullmatch(r"\d{6}", code or ""):
+        return False
+
+    t = int(time.time())
+
+    return any(
+        hmac.compare_digest(
+            totp_code(secret, t + d),
+            code,
+        )
+        for d in (-30, 0, 30)
+    )
 
 
 def verify_password(password: str, stored: str) -> bool:
     try:
-        salt, digest = stored.split("$", 1)
+        salt_s, digest_s = stored.split("$", 1)
 
-        calculated = hashlib.pbkdf2_hmac(
+        salt = base64.urlsafe_b64decode(
+            salt_s.encode()
+        )
+
+        digest = base64.urlsafe_b64decode(
+            digest_s.encode()
+        )
+
+        test = hashlib.pbkdf2_hmac(
             "sha256",
-            password.encode("utf-8"),
-            bytes.fromhex(salt),
+            password.encode(),
+            salt,
             PBKDF2_ITERATIONS,
-        ).hex()
+        )
 
-        return secrets.compare_digest(calculated, digest)
+        return hmac.compare_digest(test, digest)
+
     except Exception:
         return False
 
 
-def normalize_text(value: Optional[str]) -> str:
-    if not value:
-        return ""
-
-    return re.sub(r"\s+", " ", value.strip())
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
-def safe_float(value):
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+def norm_email(v: str) -> str:
+    return v.strip().lower()
+
+
+def jdump(v: Any) -> str:
+    return json.dumps(
+        v,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def jload(v: Any, default=None):
+    if v is None:
+        return default
+
     try:
-        return float(value)
+        return json.loads(v)
     except Exception:
-        return None
+        return default
 
 
-# ============================================================
-# DATABASE
-# ============================================================
+def validate_coords(
+    lat: Optional[float],
+    lon: Optional[float],
+):
+    if lat is not None and not -90 <= lat <= 90:
+        raise HTTPException(422, "invalid latitude")
+
+    if lon is not None and not -180 <= lon <= 180:
+        raise HTTPException(422, "invalid longitude")
+
+
+def validate_pH(ph: Optional[float]):
+    if ph is not None and not 0 <= ph <= 14:
+        raise HTTPException(
+            422,
+            "pH must be between 0 and 14",
+        )
+
 
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=30,
+    )
+
     conn.row_factory = sqlite3.Row
+
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+
     return conn
 
 
-def execute(
+def q(
     sql: str,
-    params: tuple = (),
-    commit: bool = False,
+    args=(),
+    one=False,
+    many=False,
 ):
     conn = db()
 
     try:
-        cur = conn.execute(sql, params)
+        cur = conn.execute(sql, args)
 
-        if commit:
-            conn.commit()
+        rows = (
+            cur.fetchall()
+            if (one or many)
+            else None
+        )
 
-        return cur
+        conn.commit()
+
+        if one:
+            return (
+                dict(rows[0])
+                if rows
+                else None
+            )
+
+        if many:
+            return [
+                dict(x)
+                for x in rows
+            ]
+
+        return cur.lastrowid
+
     finally:
         conn.close()
 
 
-def fetchone(sql: str, params: tuple = ()):
+def execmany(sql: str, rows):
     conn = db()
 
     try:
-        return conn.execute(sql, params).fetchone()
+        conn.executemany(sql, rows)
+        conn.commit()
+
     finally:
         conn.close()
 
 
-def fetchall(sql: str, params: tuple = ()):
-    conn = db()
-
+def audit(
+    user_id: Optional[int],
+    action: str,
+    entity: str = "",
+    entity_id: Optional[int] = None,
+    details=None,
+):
     try:
-        return conn.execute(sql, params).fetchall()
-    finally:
-        conn.close()
+        q(
+            """
+            INSERT INTO audit_logs(
+                user_id,
+                action,
+                entity,
+                entity_id,
+                details,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?)
+            """,
+            (
+                user_id,
+                action,
+                entity,
+                entity_id,
+                jdump(details or {}),
+                now_iso(),
+            ),
+        )
 
+    except Exception:
+        pass
+
+
+# ----------------------------- database -----------------------------
 
 def init_db():
-
     conn = db()
 
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            email TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            name TEXT DEFAULT '',
-            language TEXT DEFAULT 'fa',
-            role TEXT DEFAULT 'user',
-            active INTEGER DEFAULT 1,
-            created_at TEXT NOT NULL
-        );
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS schema_meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS farms (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            name TEXT DEFAULT '',
-            region TEXT DEFAULT '',
-            address TEXT DEFAULT '',
-            latitude REAL,
-            longitude REAL,
-            climate TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS users(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                name TEXT DEFAULT '',
+                phone TEXT DEFAULT '',
+                country TEXT DEFAULT '',
+                language TEXT DEFAULT 'fa',
+                role TEXT DEFAULT 'user',
+                active INTEGER DEFAULT 1,
+                mfa_enabled INTEGER DEFAULT 0,
+                mfa_secret TEXT DEFAULT '',
+                recovery_hash TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
 
-        CREATE TABLE IF NOT EXISTS lands (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            farm_id INTEGER NOT NULL,
-            name TEXT DEFAULT '',
-            area REAL,
-            soil_type TEXT DEFAULT '',
-            irrigation TEXT DEFAULT '',
-            notes TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS auth_tokens(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT UNIQUE NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            );
 
-        CREATE TABLE IF NOT EXISTS crops (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            farm_id INTEGER,
-            land_id INTEGER,
-            name TEXT NOT NULL,
-            variety TEXT DEFAULT '',
-            growth_stage TEXT DEFAULT '',
-            planting_date TEXT DEFAULT '',
-            notes TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS password_resets(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                token_hash TEXT UNIQUE NOT NULL,
+                expires_at TEXT NOT NULL,
+                used INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            );
 
-        CREATE TABLE IF NOT EXISTS soil_lab_tests (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            farm_id INTEGER NOT NULL,
-            land_id INTEGER,
-            data TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS farms(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                country TEXT DEFAULT '',
+                region TEXT DEFAULT '',
+                address TEXT DEFAULT '',
+                latitude REAL,
+                longitude REAL,
+                area_ha REAL,
+                soil_type TEXT DEFAULT '',
+                climate_type TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(user_id)
+                    REFERENCES users(id)
+                    ON DELETE CASCADE
+            );
 
-        CREATE TABLE IF NOT EXISTS water_sources (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            farm_id INTEGER NOT NULL,
-            name TEXT DEFAULT '',
-            source_type TEXT DEFAULT '',
-            salinity REAL,
-            ph REAL,
-            data TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS lands(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                farm_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                area_ha REAL,
+                latitude REAL,
+                longitude REAL,
+                soil_type TEXT DEFAULT '',
+                irrigation_type TEXT DEFAULT '',
+                water_source TEXT DEFAULT '',
+                notes TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(farm_id)
+                    REFERENCES farms(id)
+                    ON DELETE CASCADE
+            );
 
-        CREATE TABLE IF NOT EXISTS weather_observations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            farm_id INTEGER,
-            latitude REAL,
-            longitude REAL,
-            data TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS crops(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                land_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                variety TEXT DEFAULT '',
+                planted_at TEXT,
+                harvest_at TEXT,
+                area_ha REAL,
+                growth_stage TEXT DEFAULT '',
+                irrigation_l_day REAL,
+                expected_yield_min REAL,
+                expected_yield_max REAL,
+                notes TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(land_id)
+                    REFERENCES lands(id)
+                    ON DELETE CASCADE
+            );
 
-        CREATE TABLE IF NOT EXISTS recommendations (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            farm_id INTEGER,
-            question TEXT,
-            answer TEXT,
-            confidence REAL,
-            data TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS trees(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                land_id INTEGER NOT NULL,
+                species TEXT NOT NULL,
+                variety TEXT DEFAULT '',
+                age_years REAL,
+                tree_count INTEGER,
+                health TEXT DEFAULT '',
+                irrigation_l_day REAL,
+                notes TEXT DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(land_id)
+                    REFERENCES lands(id)
+                    ON DELETE CASCADE
+            );
 
-        CREATE TABLE IF NOT EXISTS ai_usage (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            usage_date TEXT NOT NULL,
-            count INTEGER DEFAULT 0,
-            UNIQUE(user_id, usage_date)
-        );
+            CREATE TABLE IF NOT EXISTS soil_tests(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                land_id INTEGER NOT NULL,
+                test_date TEXT,
+                ph REAL,
+                ec REAL,
+                organic_matter REAL,
+                nitrogen REAL,
+                phosphorus REAL,
+                potassium REAL,
+                calcium REAL,
+                magnesium REAL,
+                sulfur REAL,
+                zinc REAL,
+                iron REAL,
+                boron REAL,
+                soil_texture TEXT DEFAULT '',
+                salinity TEXT DEFAULT '',
+                raw_json TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(land_id)
+                    REFERENCES lands(id)
+                    ON DELETE CASCADE
+            );
 
-        CREATE TABLE IF NOT EXISTS payments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            amount REAL,
-            currency TEXT,
-            method TEXT,
-            destination TEXT DEFAULT '',
-            transaction_id TEXT DEFAULT '',
-            status TEXT DEFAULT 'pending',
-            data TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS water_tests(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                land_id INTEGER NOT NULL,
+                test_date TEXT,
+                ph REAL,
+                ec REAL,
+                tss REAL,
+                hardness REAL,
+                sodium REAL,
+                chloride REAL,
+                bicarbonate REAL,
+                boron REAL,
+                sar REAL,
+                raw_json TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(land_id)
+                    REFERENCES lands(id)
+                    ON DELETE CASCADE
+            );
+            """
+        )
 
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            plan TEXT DEFAULT '',
-            status TEXT DEFAULT 'inactive',
-            expires_at TEXT,
-            created_at TEXT NOT NULL
-        );
+        conn.commit()
 
-        CREATE TABLE IF NOT EXISTS activation_codes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            code TEXT UNIQUE NOT NULL,
-            user_id INTEGER,
-            active INTEGER DEFAULT 1,
-            expires_at TEXT,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS devices (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            device_id TEXT NOT NULL,
-            platform TEXT DEFAULT '',
-            last_seen TEXT NOT NULL,
-            active INTEGER DEFAULT 1,
-            UNIQUE(user_id, device_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS feedback (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            language TEXT DEFAULT 'fa',
-            message TEXT NOT NULL,
-            translated_message TEXT DEFAULT '',
-            status TEXT DEFAULT 'new',
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS feedback_messages (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            feedback_id INTEGER NOT NULL,
-            sender TEXT NOT NULL,
-            message TEXT NOT NULL,
-            language TEXT DEFAULT 'fa',
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            action TEXT NOT NULL,
-            data TEXT DEFAULT '',
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS ai_change_proposals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT,
-            description TEXT,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS knowledge_versions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            version TEXT NOT NULL,
-            title TEXT DEFAULT '',
-            content TEXT DEFAULT '',
-            active INTEGER DEFAULT 1,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS sync_queue (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            data TEXT NOT NULL,
-            status TEXT DEFAULT 'pending',
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS notifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            title TEXT,
-            message TEXT,
-            read INTEGER DEFAULT 0,
-            created_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS system_settings (
-            key TEXT PRIMARY KEY,
-            value TEXT DEFAULT '',
-            updated_at TEXT NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS auth_tokens (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            token TEXT UNIQUE NOT NULL,
-            expires_at TEXT NOT NULL,
-            created_at TEXT NOT NULL
-        );
-        """
-    )
-
-    conn.commit()
-    conn.close()
+    finally:
+        conn.close()
 
 
-init_db()
+# ----------------------------- schemas -----------------------------
 
-
-# ============================================================
-# MODELS
-# ============================================================
-
-class RegisterRequest(BaseModel):
-    email: str
+class RegisterIn(BaseModel):
+    email: EmailStr
     password: str
     name: str = ""
+    phone: str = ""
+    country: str = ""
     language: str = "fa"
 
 
-class LoginRequest(BaseModel):
-    email: str
+class LoginIn(BaseModel):
+    email: EmailStr
     password: str
+    mfa_code: str = ""
 
 
-class FarmCreate(BaseModel):
-    user_id: int
-    name: str = ""
+class PasswordResetRequestIn(BaseModel):
+    email: EmailStr
+
+
+class PasswordResetConfirmIn(BaseModel):
+    token: str
+    new_password: str
+
+
+class OwnerBootstrapIn(BaseModel):
+    secret: str
+
+
+class MFAEnableIn(BaseModel):
+    code: str
+
+
+class FarmIn(BaseModel):
+    name: str
+    description: str = ""
+    country: str = ""
     region: str = ""
     address: str = ""
     latitude: Optional[float] = None
     longitude: Optional[float] = None
-
-
-class LandCreate(BaseModel):
-    user_id: int
-    farm_id: int
-    name: str = ""
-    area: Optional[float] = None
+    area_ha: Optional[float] = None
     soil_type: str = ""
-    irrigation: str = ""
+    climate_type: str = ""
+
+
+class LandIn(BaseModel):
+    farm_id: int
+    name: str
+    area_ha: Optional[float] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    soil_type: str = ""
+    irrigation_type: str = ""
+    water_source: str = ""
     notes: str = ""
 
 
-class CropCreate(BaseModel):
-    user_id: int
-    farm_id: int
-    land_id: Optional[int] = None
+class CropIn(BaseModel):
+    land_id: int
     name: str
     variety: str = ""
+    planted_at: Optional[str] = None
+    harvest_at: Optional[str] = None
+    area_ha: Optional[float] = None
     growth_stage: str = ""
-    planting_date: str = ""
+    irrigation_l_day: Optional[float] = None
+    expected_yield_min: Optional[float] = None
+    expected_yield_max: Optional[float] = None
     notes: str = ""
 
 
-class SoilLabRequest(BaseModel):
-    user_id: int
-    farm_id: int
-    land_id: Optional[int] = None
-    data: dict = {}
+class TreeIn(BaseModel):
+    land_id: int
+    species: str
+    variety: str = ""
+    age_years: Optional[float] = None
+    tree_count: Optional[int] = None
+    health: str = ""
+    irrigation_l_day: Optional[float] = None
+    notes: str = ""
 
 
-class WaterCreate(BaseModel):
-    user_id: int
-    farm_id: int
-    name: str = ""
-    source_type: str = ""
-    salinity: Optional[float] = None
+class SoilTestIn(BaseModel):
+    land_id: int
+    test_date: Optional[str] = None
     ph: Optional[float] = None
-    data: dict = {}
+    ec: Optional[float] = None
+    organic_matter: Optional[float] = None
+    nitrogen: Optional[float] = None
+    phosphorus: Optional[float] = None
+    potassium: Optional[float] = None
+    calcium: Optional[float] = None
+    magnesium: Optional[float] = None
+    sulfur: Optional[float] = None
+    zinc: Optional[float] = None
+    iron: Optional[float] = None
+    boron: Optional[float] = None
+    soil_texture: str = ""
+    salinity: str = ""
+    raw: dict = Field(default_factory=dict)
 
 
-class WeatherRequest(BaseModel):
+class WaterTestIn(BaseModel):
+    land_id: int
+    test_date: Optional[str] = None
+    ph: Optional[float] = None
+    ec: Optional[float] = None
+    tss: Optional[float] = None
+    hardness: Optional[float] = None
+    sodium: Optional[float] = None
+    chloride: Optional[float] = None
+    bicarbonate: Optional[float] = None
+    boron: Optional[float] = None
+    sar: Optional[float] = None
+    raw: dict = Field(default_factory=dict)
+
+
+class WeatherIn(BaseModel):
     latitude: float
     longitude: float
+    observed_at: Optional[str] = None
+    temperature: Optional[float] = None
+    humidity: Optional[float] = None
+    rain_mm: Optional[float] = None
+    wind_kmh: Optional[float] = None
+    source: str = "manual"
+    raw: dict = Field(default_factory=dict)
 
 
-class AIAsk(BaseModel):
-    user_id: int
-    question: str
-    farm_id: Optional[int] = None
-    crop: Optional[str] = None
-    region: Optional[str] = None
-    language: str = "fa"
-
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    address: Optional[str] = None
-
-    use_current_location: bool = False
-    use_user_provided_data: bool = True
-    use_global_knowledge: bool = True
-
-    deep_agricultural_analysis: bool = True
-    validate_user_information: bool = True
-    generate_alternatives: bool = True
-    generate_action_plan: bool = True
-    generate_schedule: bool = True
-    generate_alerts: bool = True
-
-    weather_analysis: bool = True
-    climate_analysis: bool = True
-    soil_analysis: bool = True
-    water_analysis: bool = True
-    crop_suitability: bool = True
-    pest_disease_analysis: bool = True
-    fertilizer_analysis: bool = True
-    image_analysis_ready: bool = True
+class LocationIn(BaseModel):
+    latitude: float
+    longitude: float
+    address: str = ""
+    region: str = ""
+    country: str = ""
+    source: str = "manual"
 
 
-class RegionAnalysisRequest(BaseModel):
-    user_id: int
-    language: str = "fa"
-
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-    address: Optional[str] = None
-    region: Optional[str] = None
-
-    use_current_location: bool = False
-    use_global_knowledge: bool = True
-
-
-class LocationResolveRequest(BaseModel):
-    address: Optional[str] = None
-    region: Optional[str] = None
-    latitude: Optional[float] = None
-    longitude: Optional[float] = None
-
-
-class FeedbackRequest(BaseModel):
-    user_id: int
-    message: str
+class FeedbackIn(BaseModel):
+    subject: str
+    text: str
     language: str = "fa"
 
 
-class PaymentRequest(BaseModel):
-    user_id: int
+class AIRequestIn(BaseModel):
+    prompt: str
+    language: str = "fa"
+    context: dict = Field(default_factory=dict)
+
+
+class RecommendationIn(BaseModel):
+    land_id: int
+    crop_name: str = ""
+    goal: str = ""
+    context: dict = Field(default_factory=dict)
+
+
+class PaymentIn(BaseModel):
     amount: float
     currency: str
     method: str
-    transaction_id: str = ""
-    destination: str = ""
+    reference: str = ""
+    note: str = ""
 
 
-# ============================================================
-# AUTH
-# ============================================================
-
-def normalize_authorization(
-    authorization: Optional[str],
-) -> Optional[str]:
-
-    if not authorization:
-        return None
-
-    value = str(authorization).strip()
-
-    if not value:
-        return None
-
-    if value.lower().startswith("bearer "):
-        value = value[7:].strip()
-
-    if (
-        len(value) >= 2
-        and value[0] == '"'
-        and value[-1] == '"'
-    ):
-        value = value[1:-1].strip()
-
-    if (
-        len(value) >= 2
-        and value[0] == "'"
-        and value[-1] == "'"
-    ):
-        value = value[1:-1].strip()
-
-    return value or None
+class PaymentDecisionIn(BaseModel):
+    note: str = ""
 
 
-def create_token(user_id: int) -> str:
+class ActivationIn(BaseModel):
+    code: str
+    device_id: str
 
-    # حذف توکن‌های منقضی قبلی کاربر
-    execute(
+
+class DeviceIn(BaseModel):
+    device_id: str
+    device_name: str = ""
+    platform: str = ""
+
+
+class SettingIn(BaseModel):
+    value: str
+    secret: bool = False
+
+
+class SyncIn(BaseModel):
+    client_event_id: str
+    operation: str
+    payload: dict = Field(default_factory=dict)
+
+
+# ----------------------------- provider infrastructure -----------------------------
+
+PROVIDERS = [
+    (
+        "weather",
+        "Open-Meteo",
+        "https://api.open-meteo.com",
+        "",
+        "",
+        1,
+        "Current weather and forecast"
+    ),
+    (
+        "openai",
+        "OpenAI",
+        OPENAI_BASE_URL,
+        "",
+        "OPENAI_API_KEY",
+        1,
+        "AI analysis and multimodal processing"
+    ),
+    (
+        "geocoding",
+        "Geocoding Provider",
+        "",
+        "",
+        "ARYA_GEOCODING_API_KEY",
+        0,
+        "Address and reverse geocoding"
+    ),
+    (
+        "maps",
+        "Maps Provider",
+        "",
+        "",
+        "ARYA_MAPS_API_KEY",
+        0,
+        "Maps and spatial services"
+    ),
+    (
+        "soil",
+        "Soil Data Provider",
+        "",
+        "",
+        "ARYA_SOIL_API_KEY",
+        0,
+        "Soil data"
+    ),
+    (
+        "satellite",
+        "Satellite Provider",
+        "",
+        "",
+        "ARYA_SATELLITE_API_KEY",
+        0,
+        "Satellite imagery and remote sensing"
+    ),
+    (
+        "et0",
+        "ET0 Provider",
+        "",
+        "",
+        "ARYA_ET0_API_KEY",
+        0,
+        "Reference evapotranspiration"
+    ),
+    (
+        "crop_knowledge",
+        "Crop Knowledge Provider",
+        "",
+        "",
+        "ARYA_CROP_KNOWLEDGE_API_KEY",
+        0,
+        "Crop knowledge and suitability"
+    ),
+    (
+        "pest_disease",
+        "Pest Disease Provider",
+        "",
+        "",
+        "ARYA_PEST_API_KEY",
+        0,
+        "Pest and disease information"
+    ),
+    (
+        "pesticide",
+        "Pesticide Provider",
+        "",
+        "",
+        "ARYA_PESTICIDE_API_KEY",
+        0,
+        "Pesticide database"
+    ),
+    (
+        "fertilizer",
+        "Fertilizer Provider",
+        "",
+        "",
+        "ARYA_FERTILIZER_API_KEY",
+        0,
+        "Fertilizer data"
+    ),
+    (
+        "market",
+        "Market Provider",
+        "",
+        "",
+        "ARYA_MARKET_API_KEY",
+        0,
+        "Agricultural market data"
+    ),
+    (
+        "translation",
+        "Translation Provider",
+        "",
+        "",
+        "ARYA_TRANSLATION_API_KEY",
+        0,
+        "Multilingual translation"
+    ),
+    (
+        "email",
+        "Email Provider",
+        "",
+        "",
+        "ARYA_EMAIL_API_KEY",
+        0,
+        "Transactional email"
+    ),
+    (
+        "sms",
+        "SMS Provider",
+        "",
+        "",
+        "ARYA_SMS_API_KEY",
+        0,
+        "SMS notifications"
+    ),
+    (
+        "push",
+        "Push Provider",
+        "",
+        "",
+        "ARYA_PUSH_API_KEY",
+        0,
+        "Push notifications"
+    ),
+    (
+        "blockchain",
+        "Blockchain Provider",
+        "",
+        "",
+        "ARYA_BLOCKCHAIN_API_KEY",
+        0,
+        "USDT payment verification"
+    ),
+    (
+        "bank",
+        "Bank Provider",
+        "",
+        "",
+        "ARYA_BANK_API_KEY",
+        0,
+        "Bank transfer verification"
+    ),
+]
+
+PROVIDER_KEYS = {x[0] for x in PROVIDERS}
+
+
+def init_providers():
+    conn = db()
+
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS external_providers(
+                key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                base_url TEXT DEFAULT '',
+                health_url TEXT DEFAULT '',
+                auth_env TEXT DEFAULT '',
+                enabled INTEGER DEFAULT 0,
+                required INTEGER DEFAULT 0,
+                notes TEXT DEFAULT '',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+
+        for key, name, base, health, auth, required, notes in PROVIDERS:
+            conn.execute(
+                """
+                INSERT INTO external_providers(
+                    key,name,base_url,health_url,
+                    auth_env,enabled,required,notes,updated_at
+                )
+                VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(key) DO NOTHING
+                """,
+                (
+                    key,
+                    name,
+                    base,
+                    health,
+                    auth,
+                    int(bool(base)),
+                    required,
+                    notes,
+                    now_iso(),
+                ),
+            )
+
+        conn.execute(
+            """
+            INSERT INTO schema_meta(key,value)
+            VALUES('version',?)
+            ON CONFLICT(key)
+            DO UPDATE SET value=excluded.value
+            """,
+            (VERSION,),
+        )
+
+        conn.commit()
+
+    finally:
+        conn.close()
+
+
+def provider_row(key: str):
+    return q(
         """
-        DELETE FROM auth_tokens
-        WHERE user_id=?
-        AND expires_at < ?
+        SELECT *
+        FROM external_providers
+        WHERE key=?
         """,
-        (
-            user_id,
-            utc_now(),
-        ),
-        True,
+        (key,),
+        one=True,
     )
 
+
+def provider_enabled(key: str) -> bool:
+    row = provider_row(key)
+
+    return bool(
+        row
+        and row["enabled"]
+        and row["base_url"]
+    )
+
+
+def provider_headers(key: str):
+    row = provider_row(key)
+
+    if not row:
+        return {}
+
+    env = row["auth_env"] or ""
+    secret = os.getenv(env, "") if env else ""
+
+    if not secret:
+        return {}
+
+    return {
+        "Authorization": f"Bearer {secret}",
+        "X-API-Key": secret,
+    }
+
+
+def provider_request(
+    key: str,
+    path: str = "",
+    params=None,
+    method: str = "GET",
+    json_body=None,
+):
+    row = provider_row(key)
+
+    if not row:
+        raise HTTPException(
+            404,
+            f"provider not found: {key}",
+        )
+
+    if not row["enabled"]:
+        raise HTTPException(
+            503,
+            f"provider disabled: {key}",
+        )
+
+    base = (row["base_url"] or "").rstrip("/")
+
+    if not base:
+        raise HTTPException(
+            503,
+            f"provider not configured: {key}",
+        )
+
+    url = base + "/" + path.lstrip("/")
+
+    try:
+        response = requests.request(
+            method,
+            url,
+            params=params,
+            json=json_body,
+            headers=provider_headers(key),
+            timeout=WEATHER_TIMEOUT,
+        )
+
+        response.raise_for_status()
+
+        try:
+            return response.json()
+        except Exception:
+            return {
+                "text": response.text
+            }
+
+    except requests.RequestException as exc:
+        raise HTTPException(
+            502,
+            f"provider request failed: {key}: {exc}",
+        )
+
+
+def provider_status(key: str):
+    row = provider_row(key)
+
+    if not row:
+        return {
+            "key": key,
+            "configured": False,
+            "healthy": False,
+            "reason": "provider not found",
+        }
+
+    if not row["enabled"]:
+        return {
+            "key": key,
+            "configured": bool(row["base_url"]),
+            "healthy": None,
+            "enabled": False,
+        }
+
+    url = row["health_url"] or row["base_url"]
+
+    if not url:
+        return {
+            "key": key,
+            "configured": False,
+            "healthy": False,
+            "reason": "no URL configured",
+        }
+
+    try:
+        r = requests.get(
+            url,
+            headers=provider_headers(key),
+            timeout=10,
+        )
+
+        return {
+            "key": key,
+            "configured": True,
+            "healthy": r.ok,
+            "status_code": r.status_code,
+        }
+
+    except requests.RequestException as exc:
+        return {
+            "key": key,
+            "configured": True,
+            "healthy": False,
+            "error": str(exc),
+        }
+
+
+# ----------------------------- authentication -----------------------------
+
+def create_token(user_id: int):
     token = secrets.token_urlsafe(48)
 
     expires = (
         datetime.now(timezone.utc)
-        + timedelta(days=ACCESS_TOKEN_DAYS)
+        + timedelta(days=TOKEN_DAYS)
     ).isoformat()
 
-    execute(
+    q(
         """
-        INSERT INTO auth_tokens
-        (user_id, token, expires_at, created_at)
-        VALUES (?, ?, ?, ?)
+        INSERT INTO auth_tokens(
+            user_id,
+            token_hash,
+            expires_at,
+            revoked,
+            created_at
+        )
+        VALUES(?,?,?,?,?)
         """,
         (
             user_id,
-            token,
+            token_hash(token),
             expires,
-            utc_now(),
+            0,
+            now_iso(),
         ),
-        True,
     )
 
-    return token
+    return token, expires
 
 
-def get_user_from_token(
-    token: Optional[str],
+def current_user(
+    authorization: Optional[str] = None,
 ):
+    if not authorization:
+        raise HTTPException(
+            401,
+            "authorization required",
+        )
 
-    token = normalize_authorization(token)
+    token = authorization
 
-    if not token:
-        return None
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
 
-    row = fetchone(
+    row = q(
         """
         SELECT
-            u.*
+            u.*,
+            t.expires_at AS token_expires
         FROM auth_tokens t
         JOIN users u
             ON u.id=t.user_id
-        WHERE t.token=?
-        LIMIT 1
+        WHERE t.token_hash=?
+          AND t.revoked=0
+          AND u.active=1
         """,
-        (token,),
+        (token_hash(token),),
+        one=True,
     )
 
     if not row:
-        return None
-
-    if not bool(row["active"]):
-        return None
-
-    try:
-
-        expires = datetime.fromisoformat(
-            row["expires_at"]
+        raise HTTPException(
+            401,
+            "invalid token",
         )
 
-        if expires.tzinfo is None:
-            expires = expires.replace(
-                tzinfo=timezone.utc
+    try:
+        exp = datetime.fromisoformat(
+            row["token_expires"]
+        )
+
+        if exp < datetime.now(timezone.utc):
+            raise HTTPException(
+                401,
+                "token expired",
             )
 
-        now = datetime.now(timezone.utc)
-
-        if expires <= now:
-
-            execute(
-                """
-                DELETE FROM auth_tokens
-                WHERE token=?
-                """,
-                (token,),
-                True,
-            )
-
-            return None
-
-    except Exception:
-        return None
+    except ValueError:
+        raise HTTPException(
+            401,
+            "invalid token expiration",
+        )
 
     return row
 
 
-def require_user(
-    authorization: Optional[str],
-    user_id: Optional[int] = None,
-):
-
-    token = normalize_authorization(
-        authorization
-    )
-
-    if not token:
-
+def require_owner(user):
+    if user["role"] != "owner":
         raise HTTPException(
-            status_code=401,
-            detail="Authentication required",
+            403,
+            "owner access required",
         )
 
-    user = get_user_from_token(
-        token
-    )
 
-    if not user:
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid or expired token",
-        )
-
-    if (
-        user_id is not None
-        and int(user["id"]) != int(user_id)
-    ):
-
-        if user["role"] != "owner":
-
-            raise HTTPException(
-                status_code=403,
-                detail="Access denied",
-            )
-
-    return user
-
-
-# ============================================================
-# HEALTH
-# ============================================================
-
-@app.get("/")
-def root():
-
-    return {
-        "service": APP_NAME,
-        "version": VERSION,
-        "status": "ok",
-    }
-
-
-@app.get("/health")
-def health():
-
-    return {
-        "status": "ok",
-        "service": APP_NAME,
-        "version": VERSION,
-        "timestamp": utc_now(),
-    }
-
-
-# ============================================================
-# REGISTER / LOGIN
-# ============================================================
+# ----------------------------- auth endpoints -----------------------------
 
 @app.post("/auth/register")
-def register(
-    data: RegisterRequest,
-):
+def register(x: RegisterIn):
+    email = norm_email(x.email)
 
-    email = normalize_text(
-        data.email
-    ).lower()
-
-    if not email or "@" not in email:
-
-        raise HTTPException(
-            400,
-            "Invalid email",
-        )
-
-    if len(data.password) < 6:
-
-        raise HTTPException(
-            400,
-            "Password must contain at least 6 characters",
-        )
-
-    exists = fetchone(
+    if q(
         "SELECT id FROM users WHERE email=?",
         (email,),
-    )
-
-    if exists:
-
+        one=True,
+    ):
         raise HTTPException(
             409,
-            "Email already registered",
+            "email already registered",
         )
 
-    password_hash = hash_password(
-        data.password
-    )
+    created = now_iso()
 
-    cur = execute(
+    uid = q(
         """
-        INSERT INTO users
-        (email,password_hash,name,language,role,active,created_at)
-        VALUES (?,?,?,?,?,?,?)
+        INSERT INTO users(
+            email,
+            password_hash,
+            name,
+            phone,
+            country,
+            language,
+            role,
+            active,
+            created_at,
+            updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?)
         """,
         (
             email,
-            password_hash,
-            normalize_text(data.name),
-            data.language,
+            hash_password(x.password),
+            x.name,
+            x.phone,
+            x.country,
+            x.language,
             "user",
             1,
-            utc_now(),
+            created,
+            created,
         ),
-        True,
     )
 
-    user_id = cur.lastrowid
-
-    token = create_token(
-        user_id
+    audit(
+        uid,
+        "register",
+        "users",
+        uid,
     )
 
     return {
-        "status": "ok",
-        "user_id": user_id,
-        "token": token,
+        "ok": True,
+        "user_id": uid,
     }
 
 
 @app.post("/auth/login")
-def login(
-    data: LoginRequest,
-):
+def login(x: LoginIn):
+    email = norm_email(x.email)
 
-    email = normalize_text(
-        data.email
-    ).lower()
-
-    user = fetchone(
-        "SELECT * FROM users WHERE email=?",
+    user = q(
+        """
+        SELECT *
+        FROM users
+        WHERE email=?
+        """,
         (email,),
+        one=True,
     )
 
-    if (
-        not user
-        or not verify_password(
-            data.password,
-            user["password_hash"],
-        )
-    ):
-
+    if not user:
         raise HTTPException(
             401,
-            "Invalid email or password",
+            "invalid credentials",
         )
 
     if not user["active"]:
-
         raise HTTPException(
             403,
-            "Account disabled",
+            "user disabled",
         )
 
-    token = create_token(
+    if not verify_password(
+        x.password,
+        user["password_hash"],
+    ):
+        raise HTTPException(
+            401,
+            "invalid credentials",
+        )
+
+    if user["mfa_enabled"]:
+        if not verify_totp(
+            user["mfa_secret"],
+            x.mfa_code,
+        ):
+            raise HTTPException(
+                401,
+                "mfa required or invalid",
+            )
+
+    token, expires = create_token(
         user["id"]
     )
 
-    return {
-        "status": "ok",
-        "user_id": user["id"],
-        "token": token,
-        "role": user["role"],
-    }
-
-
-@app.get("/auth/me")
-def auth_me(
-    authorization: Optional[str] = Header(None),
-):
-
-    user = require_user(
-        authorization
+    audit(
+        user["id"],
+        "login",
+        "users",
+        user["id"],
     )
 
     return {
-        "status": "ok",
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": expires,
         "user": {
             "id": user["id"],
             "email": user["email"],
             "name": user["name"],
-            "language": user["language"],
             "role": user["role"],
+            "language": user["language"],
         },
     }
 
@@ -894,441 +1284,1076 @@ def auth_me(
 def logout(
     authorization: Optional[str] = Header(None),
 ):
+    user = current_user(authorization)
 
-    token = normalize_authorization(
-        authorization
+    token = authorization
+
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+
+    q(
+        """
+        UPDATE auth_tokens
+        SET revoked=1
+        WHERE token_hash=?
+        """,
+        (token_hash(token),),
     )
 
-    if token:
-
-        execute(
-            "DELETE FROM auth_tokens WHERE token=?",
-            (token,),
-            True,
-        )
+    audit(
+        user["id"],
+        "logout",
+        "auth_tokens",
+    )
 
     return {
-        "status": "ok"
+        "ok": True
     }
 
 
-# ============================================================
-# FARMS
-# ============================================================
-
-@app.post("/farms")
-def create_farm(
-    data: FarmCreate,
+@app.get("/auth/me")
+def me(
     authorization: Optional[str] = Header(None),
 ):
+    user = current_user(authorization)
 
-    require_user(
-        authorization,
-        data.user_id,
+    return {
+        "id": user["id"],
+        "email": user["email"],
+        "name": user["name"],
+        "phone": user["phone"],
+        "country": user["country"],
+        "language": user["language"],
+        "role": user["role"],
+        "mfa_enabled": bool(
+            user["mfa_enabled"]
+        ),
+    }
+
+
+@app.post("/auth/password-reset/request")
+def password_reset_request(
+    x: PasswordResetRequestIn,
+):
+    email = norm_email(x.email)
+
+    user = q(
+        """
+        SELECT *
+        FROM users
+        WHERE email=?
+        """,
+        (email,),
+        one=True,
     )
 
-    cur = execute(
+    # Do not disclose whether account exists.
+    result = {
+        "ok": True,
+        "message": "If the account exists, reset instructions will be sent."
+    }
+
+    if not user:
+        return result
+
+    raw = secrets.token_urlsafe(48)
+    expires = (
+        datetime.now(timezone.utc)
+        + timedelta(hours=RESET_HOURS)
+    ).isoformat()
+
+    q(
         """
-        INSERT INTO farms
-        (user_id,name,region,address,latitude,longitude,created_at)
-        VALUES (?,?,?,?,?,?,?)
+        INSERT INTO password_resets(
+            user_id,
+            token_hash,
+            expires_at,
+            used,
+            created_at
+        )
+        VALUES(?,?,?,?,?)
         """,
         (
-            data.user_id,
-            data.name,
-            data.region,
-            data.address,
-            data.latitude,
-            data.longitude,
-            utc_now(),
+            user["id"],
+            token_hash(raw),
+            expires,
+            0,
+            now_iso(),
         ),
-        True,
     )
 
-    return {
-        "status": "ok",
-        "farm_id": cur.lastrowid,
-    }
+    # Development/owner-controlled optional return.
+    # Production should deliver through an approved provider.
+    if os.getenv(
+        "ARYA_RESET_RETURN_TOKEN",
+        "0",
+    ) == "1":
+        result["reset_token"] = raw
+
+    return result
 
 
-@app.get("/farms/{user_id}")
-def get_farms(
-    user_id: int,
-    authorization: Optional[str] = Header(None),
+@app.post("/auth/password-reset/confirm")
+def password_reset_confirm(
+    x: PasswordResetConfirmIn,
 ):
-
-    require_user(
-        authorization,
-        user_id,
-    )
-
-    rows = fetchall(
-        "SELECT * FROM farms WHERE user_id=? ORDER BY id DESC",
-        (user_id,),
-    )
-
-    return {
-        "status": "ok",
-        "farms": [
-            dict(r) for r in rows
-        ],
-    }
-
-
-def verify_farm_owner(
-    user_id: int,
-    farm_id: int,
-):
-
-    row = fetchone(
-        "SELECT * FROM farms WHERE id=? AND user_id=?",
-        (
-            farm_id,
-            user_id,
-        ),
+    row = q(
+        """
+        SELECT *
+        FROM password_resets
+        WHERE token_hash=?
+          AND used=0
+        """,
+        (token_hash(x.token),),
+        one=True,
     )
 
     if not row:
+        raise HTTPException(
+            400,
+            "invalid reset token",
+        )
 
+    try:
+        exp = datetime.fromisoformat(
+            row["expires_at"]
+        )
+
+        if exp < datetime.now(timezone.utc):
+            raise HTTPException(
+                400,
+                "reset token expired",
+            )
+
+    except ValueError:
+        raise HTTPException(
+            400,
+            "invalid reset expiration",
+        )
+
+    q(
+        """
+        UPDATE users
+        SET password_hash=?,
+            updated_at=?
+        WHERE id=?
+        """,
+        (
+            hash_password(
+                x.new_password
+            ),
+            now_iso(),
+            row["user_id"],
+        ),
+    )
+
+    q(
+        """
+        UPDATE password_resets
+        SET used=1
+        WHERE id=?
+        """,
+        (row["id"],),
+    )
+
+    q(
+        """
+        UPDATE auth_tokens
+        SET revoked=1
+        WHERE user_id=?
+        """,
+        (row["user_id"],),
+    )
+
+    audit(
+        row["user_id"],
+        "password_reset",
+        "users",
+        row["user_id"],
+    )
+
+    return {
+        "ok": True
+    }
+
+
+# ----------------------------- owner bootstrap / MFA -----------------------------
+
+@app.post("/owner/bootstrap")
+def owner_bootstrap(
+    x: OwnerBootstrapIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    if not OWNER_BOOTSTRAP_SECRET:
+        raise HTTPException(
+            503,
+            "owner bootstrap secret is not configured",
+        )
+
+    if not hmac.compare_digest(
+        x.secret,
+        OWNER_BOOTSTRAP_SECRET,
+    ):
         raise HTTPException(
             403,
-            "Farm not found or access denied",
+            "invalid bootstrap secret",
+        )
+
+    existing = q(
+        """
+        SELECT id
+        FROM users
+        WHERE role='owner'
+        LIMIT 1
+        """,
+        one=True,
+    )
+
+    if existing:
+        raise HTTPException(
+            409,
+            "owner already initialized",
+        )
+
+    if OWNER_EMAIL and (
+        norm_email(user["email"])
+        != norm_email(OWNER_EMAIL)
+    ):
+        raise HTTPException(
+            403,
+            "owner email mismatch",
+        )
+
+    q(
+        """
+        UPDATE users
+        SET role='owner',
+            updated_at=?
+        WHERE id=?
+        """,
+        (
+            now_iso(),
+            user["id"],
+        ),
+    )
+
+    audit(
+        user["id"],
+        "owner_bootstrap",
+        "users",
+        user["id"],
+    )
+
+    return {
+        "ok": True,
+        "role": "owner",
+    }
+
+
+@app.post("/owner/mfa/setup")
+def owner_mfa_setup(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    secret = user["mfa_secret"]
+
+    if not secret:
+        secret = base64.b32encode(
+            secrets.token_bytes(20)
+        ).decode().rstrip("=")
+
+        q(
+            """
+            UPDATE users
+            SET mfa_secret=?,
+                updated_at=?
+            WHERE id=?
+            """,
+            (
+                secret,
+                now_iso(),
+                user["id"],
+            ),
+        )
+
+    return {
+        "secret": secret,
+        "issuer": APP_NAME,
+        "account": user["email"],
+    }
+
+
+@app.post("/owner/mfa/enable")
+def owner_mfa_enable(
+    x: MFAEnableIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    if not user["mfa_secret"]:
+        raise HTTPException(
+            400,
+            "run mfa setup first",
+        )
+
+    if not verify_totp(
+        user["mfa_secret"],
+        x.code,
+    ):
+        raise HTTPException(
+            400,
+            "invalid mfa code",
+        )
+
+    q(
+        """
+        UPDATE users
+        SET mfa_enabled=1,
+            updated_at=?
+        WHERE id=?
+        """,
+        (
+            now_iso(),
+            user["id"],
+        ),
+    )
+
+    audit(
+        user["id"],
+        "mfa_enable",
+        "users",
+        user["id"],
+    )
+
+    return {
+        "ok": True,
+        "mfa_enabled": True,
+    }
+
+
+@app.post("/owner/mfa/disable")
+def owner_mfa_disable(
+    x: MFAEnableIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    if not verify_totp(
+        user["mfa_secret"],
+        x.code,
+    ):
+        raise HTTPException(
+            400,
+            "invalid mfa code",
+        )
+
+    q(
+        """
+        UPDATE users
+        SET mfa_enabled=0,
+            updated_at=?
+        WHERE id=?
+        """,
+        (
+            now_iso(),
+            user["id"],
+        ),
+    )
+
+    audit(
+        user["id"],
+        "mfa_disable",
+        "users",
+        user["id"],
+    )
+
+    return {
+        "ok": True,
+        "mfa_enabled": False,
+    }
+
+
+# ----------------------------- farms / lands -----------------------------
+
+@app.post("/farms")
+def create_farm(
+    x: FarmIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    validate_coords(
+        x.latitude,
+        x.longitude,
+    )
+
+    fid = q(
+        """
+        INSERT INTO farms(
+            user_id,
+            name,
+            description,
+            country,
+            region,
+            address,
+            latitude,
+            longitude,
+            area_ha,
+            soil_type,
+            climate_type,
+            created_at,
+            updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            user["id"],
+            x.name,
+            x.description,
+            x.country,
+            x.region,
+            x.address,
+            x.latitude,
+            x.longitude,
+            x.area_ha,
+            x.soil_type,
+            x.climate_type,
+            now_iso(),
+            now_iso(),
+        ),
+    )
+
+    audit(
+        user["id"],
+        "farm_create",
+        "farms",
+        fid,
+    )
+
+    return q(
+        "SELECT * FROM farms WHERE id=?",
+        (fid,),
+        one=True,
+    )
+
+
+@app.get("/farms")
+def list_farms(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    return q(
+        """
+        SELECT *
+        FROM farms
+        WHERE user_id=?
+        ORDER BY id DESC
+        """,
+        (user["id"],),
+        many=True,
+    )
+
+
+@app.get("/farms/{farm_id}")
+def get_farm(
+    farm_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    row = q(
+        """
+        SELECT *
+        FROM farms
+        WHERE id=?
+          AND user_id=?
+        """,
+        (
+            farm_id,
+            user["id"],
+        ),
+        one=True,
+    )
+
+    if not row:
+        raise HTTPException(
+            404,
+            "farm not found",
         )
 
     return row
 
 
-# ============================================================
-# LANDS
-# ============================================================
-
 @app.post("/lands")
 def create_land(
-    data: LandCreate,
+    x: LandIn,
     authorization: Optional[str] = Header(None),
 ):
+    user = current_user(authorization)
 
-    require_user(
-        authorization,
-        data.user_id,
-    )
-
-    verify_farm_owner(
-        data.user_id,
-        data.farm_id,
-    )
-
-    cur = execute(
+    farm = q(
         """
-        INSERT INTO lands
-        (farm_id,name,area,soil_type,irrigation,notes,created_at)
-        VALUES (?,?,?,?,?,?,?)
+        SELECT *
+        FROM farms
+        WHERE id=?
+          AND user_id=?
         """,
         (
-            data.farm_id,
-            data.name,
-            data.area,
-            data.soil_type,
-            data.irrigation,
-            data.notes,
-            utc_now(),
+            x.farm_id,
+            user["id"],
         ),
-        True,
+        one=True,
     )
 
-    return {
-        "status": "ok",
-        "land_id": cur.lastrowid,
-    }
+    if not farm:
+        raise HTTPException(
+            404,
+            "farm not found",
+        )
 
-
-@app.get("/lands/{farm_id}")
-def get_lands(
-    farm_id: int,
-    user_id: int,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        user_id,
+    validate_coords(
+        x.latitude,
+        x.longitude,
     )
 
-    verify_farm_owner(
-        user_id,
-        farm_id,
-    )
-
-    rows = fetchall(
-        "SELECT * FROM lands WHERE farm_id=?",
-        (farm_id,),
-    )
-
-    return {
-        "status": "ok",
-        "lands": [
-            dict(r) for r in rows
-        ],
-    }
-
-
-# ============================================================
-# CROPS
-# ============================================================
-
-@app.post("/crops")
-def create_crop(
-    data: CropCreate,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        data.user_id,
-    )
-
-    verify_farm_owner(
-        data.user_id,
-        data.farm_id,
-    )
-
-    cur = execute(
+    lid = q(
         """
-        INSERT INTO crops
-        (farm_id,land_id,name,variety,growth_stage,
-         planting_date,notes,created_at)
-        VALUES (?,?,?,?,?,?,?,?)
+        INSERT INTO lands(
+            farm_id,
+            name,
+            area_ha,
+            latitude,
+            longitude,
+            soil_type,
+            irrigation_type,
+            water_source,
+            notes,
+            created_at,
+            updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
-            data.farm_id,
-            data.land_id,
-            data.name,
-            data.variety,
-            data.growth_stage,
-            data.planting_date,
-            data.notes,
-            utc_now(),
+            x.farm_id,
+            x.name,
+            x.area_ha,
+            x.latitude,
+            x.longitude,
+            x.soil_type,
+            x.irrigation_type,
+            x.water_source,
+            x.notes,
+            now_iso(),
+            now_iso(),
         ),
-        True,
     )
 
-    return {
-        "status": "ok",
-        "crop_id": cur.lastrowid,
-    }
+    audit(
+        user["id"],
+        "land_create",
+        "lands",
+        lid,
+    )
+
+    return q(
+        "SELECT * FROM lands WHERE id=?",
+        (lid,),
+        one=True,
+    )
 
 
-@app.get("/crops/{farm_id}")
-def get_crops(
+@app.get("/farms/{farm_id}/lands")
+def list_lands(
     farm_id: int,
-    user_id: int,
     authorization: Optional[str] = Header(None),
 ):
+    user = current_user(authorization)
 
-    require_user(
-        authorization,
-        user_id,
-    )
-
-    verify_farm_owner(
-        user_id,
-        farm_id,
-    )
-
-    rows = fetchall(
-        "SELECT * FROM crops WHERE farm_id=?",
-        (farm_id,),
-    )
-
-    return {
-        "status": "ok",
-        "crops": [
-            dict(r) for r in rows
-        ],
-    }
-
-
-# ============================================================
-# SOIL LAB
-# ============================================================
-
-@app.post("/soil/lab")
-def save_soil_lab(
-    data: SoilLabRequest,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        data.user_id,
-    )
-
-    verify_farm_owner(
-        data.user_id,
-        data.farm_id,
-    )
-
-    cur = execute(
+    if not q(
         """
-        INSERT INTO soil_lab_tests
-        (farm_id,land_id,data,created_at)
-        VALUES (?,?,?,?)
+        SELECT id
+        FROM farms
+        WHERE id=?
+          AND user_id=?
         """,
         (
-            data.farm_id,
-            data.land_id,
-            json_dumps(data.data),
-            utc_now(),
+            farm_id,
+            user["id"],
         ),
-        True,
-    )
+        one=True,
+    ):
+        raise HTTPException(
+            404,
+            "farm not found",
+        )
 
-    return {
-        "status": "ok",
-        "soil_lab_id": cur.lastrowid,
-    }
-
-
-@app.get("/soil/lab/{farm_id}")
-def get_soil_lab(
-    farm_id: int,
-    user_id: int,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        user_id,
-    )
-
-    verify_farm_owner(
-        user_id,
-        farm_id,
-    )
-
-    rows = fetchall(
+    return q(
         """
-        SELECT * FROM soil_lab_tests
+        SELECT *
+        FROM lands
         WHERE farm_id=?
         ORDER BY id DESC
         """,
         (farm_id,),
+        many=True,
     )
 
-    result = []
 
-    for row in rows:
-
-        item = dict(row)
-
-        item["data"] = json_loads(
-            item["data"],
-            {},
-        )
-
-        result.append(item)
-
-    return {
-        "status": "ok",
-        "tests": result,
-    }
-
-
-# ============================================================
-# WATER
-# ============================================================
-
-@app.post("/water")
-def create_water(
-    data: WaterCreate,
+@app.post("/crops")
+def create_crop(
+    x: CropIn,
     authorization: Optional[str] = Header(None),
 ):
+    user = current_user(authorization)
 
-    require_user(
-        authorization,
-        data.user_id,
-    )
-
-    verify_farm_owner(
-        data.user_id,
-        data.farm_id,
-    )
-
-    cur = execute(
+    land = q(
         """
-        INSERT INTO water_sources
-        (farm_id,name,source_type,salinity,ph,data,created_at)
-        VALUES (?,?,?,?,?,?,?)
+        SELECT l.*
+        FROM lands l
+        JOIN farms f
+            ON f.id=l.farm_id
+        WHERE l.id=?
+          AND f.user_id=?
         """,
         (
-            data.farm_id,
-            data.name,
-            data.source_type,
-            data.salinity,
-            data.ph,
-            json_dumps(data.data),
-            utc_now(),
+            x.land_id,
+            user["id"],
         ),
-        True,
+        one=True,
     )
 
-    return {
-        "status": "ok",
-        "water_id": cur.lastrowid,
-    }
-
-
-@app.get("/water/{farm_id}")
-def get_water(
-    farm_id: int,
-    user_id: int,
-    authorization: Optional[str] = Header(None),
-):
-
-    require_user(
-        authorization,
-        user_id,
-    )
-
-    verify_farm_owner(
-        user_id,
-        farm_id,
-    )
-
-    rows = fetchall(
-        "SELECT * FROM water_sources WHERE farm_id=?",
-        (farm_id,),
-    )
-
-    result = []
-
-    for row in rows:
-
-        item = dict(row)
-
-        item["data"] = json_loads(
-            item["data"],
-            {},
+    if not land:
+        raise HTTPException(
+            404,
+            "land not found",
         )
 
-        result.append(item)
+    cid = q(
+        """
+        INSERT INTO crops(
+            land_id,
+            name,
+            variety,
+            planted_at,
+            harvest_at,
+            area_ha,
+            growth_stage,
+            irrigation_l_day,
+            expected_yield_min,
+            expected_yield_max,
+            notes,
+            created_at,
+            updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            x.land_id,
+            x.name,
+            x.variety,
+            x.planted_at,
+            x.harvest_at,
+            x.area_ha,
+            x.growth_stage,
+            x.irrigation_l_day,
+            x.expected_yield_min,
+            x.expected_yield_max,
+            x.notes,
+            now_iso(),
+            now_iso(),
+        ),
+    )
 
-    return {
-        "status": "ok",
-        "water": result,
-    }
+    audit(
+        user["id"],
+        "crop_create",
+        "crops",
+        cid,
+    )
+
+    return q(
+        "SELECT * FROM crops WHERE id=?",
+        (cid,),
+        one=True,
+    )
 
 
-# ============================================================
-# WEATHER
-# ============================================================
+@app.get("/lands/{land_id}/crops")
+def list_crops(
+    land_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
 
-def get_weather_data(
+    return q(
+        """
+        SELECT c.*
+        FROM crops c
+        JOIN lands l
+            ON l.id=c.land_id
+        JOIN farms f
+            ON f.id=l.farm_id
+        WHERE c.land_id=?
+          AND f.user_id=?
+        ORDER BY c.id DESC
+        """,
+        (
+            land_id,
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+@app.post("/trees")
+def create_tree(
+    x: TreeIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    land = q(
+        """
+        SELECT l.*
+        FROM lands l
+        JOIN farms f
+            ON f.id=l.farm_id
+        WHERE l.id=?
+          AND f.user_id=?
+        """,
+        (
+            x.land_id,
+            user["id"],
+        ),
+        one=True,
+    )
+
+    if not land:
+        raise HTTPException(
+            404,
+            "land not found",
+        )
+
+    tid = q(
+        """
+        INSERT INTO trees(
+            land_id,
+            species,
+            variety,
+            age_years,
+            tree_count,
+            health,
+            irrigation_l_day,
+            notes,
+            created_at,
+            updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            x.land_id,
+            x.species,
+            x.variety,
+            x.age_years,
+            x.tree_count,
+            x.health,
+            x.irrigation_l_day,
+            x.notes,
+            now_iso(),
+            now_iso(),
+        ),
+    )
+
+    audit(
+        user["id"],
+        "tree_create",
+        "trees",
+        tid,
+    )
+
+    return q(
+        "SELECT * FROM trees WHERE id=?",
+        (tid,),
+        one=True,
+    )
+
+
+@app.get("/lands/{land_id}/trees")
+def list_trees(
+    land_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    return q(
+        """
+        SELECT t.*
+        FROM trees t
+        JOIN lands l
+            ON l.id=t.land_id
+        JOIN farms f
+            ON f.id=l.farm_id
+        WHERE t.land_id=?
+          AND f.user_id=?
+        ORDER BY t.id DESC
+        """,
+        (
+            land_id,
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+# ----------------------------- soil / water -----------------------------
+
+@app.post("/soil/tests")
+def create_soil_test(
+    x: SoilTestIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    land = q(
+        """
+        SELECT l.*
+        FROM lands l
+        JOIN farms f
+            ON f.id=l.farm_id
+        WHERE l.id=?
+          AND f.user_id=?
+        """,
+        (
+            x.land_id,
+            user["id"],
+        ),
+        one=True,
+    )
+
+    if not land:
+        raise HTTPException(
+            404,
+            "land not found",
+        )
+
+    validate_pH(x.ph)
+
+    sid = q(
+        """
+        INSERT INTO soil_tests(
+            land_id,
+            test_date,
+            ph,
+            ec,
+            organic_matter,
+            nitrogen,
+            phosphorus,
+            potassium,
+            calcium,
+            magnesium,
+            sulfur,
+            zinc,
+            iron,
+            boron,
+            soil_texture,
+            salinity,
+            raw_json,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            x.land_id,
+            x.test_date,
+            x.ph,
+            x.ec,
+            x.organic_matter,
+            x.nitrogen,
+            x.phosphorus,
+            x.potassium,
+            x.calcium,
+            x.magnesium,
+            x.sulfur,
+            x.zinc,
+            x.iron,
+            x.boron,
+            x.soil_texture,
+            x.salinity,
+            jdump(x.raw),
+            now_iso(),
+        ),
+    )
+
+    audit(
+        user["id"],
+        "soil_test_create",
+        "soil_tests",
+        sid,
+    )
+
+    return q(
+        "SELECT * FROM soil_tests WHERE id=?",
+        (sid,),
+        one=True,
+    )
+
+
+@app.get("/lands/{land_id}/soil/tests")
+def list_soil_tests(
+    land_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    return q(
+        """
+        SELECT s.*
+        FROM soil_tests s
+        JOIN lands l
+            ON l.id=s.land_id
+        JOIN farms f
+            ON f.id=l.farm_id
+        WHERE s.land_id=?
+          AND f.user_id=?
+        ORDER BY s.id DESC
+        """,
+        (
+            land_id,
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+@app.post("/water/tests")
+def create_water_test(
+    x: WaterTestIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    land = q(
+        """
+        SELECT l.*
+        FROM lands l
+        JOIN farms f
+            ON f.id=l.farm_id
+        WHERE l.id=?
+          AND f.user_id=?
+        """,
+        (
+            x.land_id,
+            user["id"],
+        ),
+        one=True,
+    )
+
+    if not land:
+        raise HTTPException(
+            404,
+            "land not found",
+        )
+
+    validate_pH(x.ph)
+
+    wid = q(
+        """
+        INSERT INTO water_tests(
+            land_id,
+            test_date,
+            ph,
+            ec,
+            tss,
+            hardness,
+            sodium,
+            chloride,
+            bicarbonate,
+            boron,
+            sar,
+            raw_json,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            x.land_id,
+            x.test_date,
+            x.ph,
+            x.ec,
+            x.tss,
+            x.hardness,
+            x.sodium,
+            x.chloride,
+            x.bicarbonate,
+            x.boron,
+            x.sar,
+            jdump(x.raw),
+            now_iso(),
+        ),
+    )
+
+    audit(
+        user["id"],
+        "water_test_create",
+        "water_tests",
+        wid,
+    )
+
+    return q(
+        "SELECT * FROM water_tests WHERE id=?",
+        (wid,),
+        one=True,
+    )
+
+
+@app.get("/lands/{land_id}/water/tests")
+def list_water_tests(
+    land_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    return q(
+        """
+        SELECT w.*
+        FROM water_tests w
+        JOIN lands l
+            ON l.id=w.land_id
+        JOIN farms f
+            ON f.id=l.farm_id
+        WHERE w.land_id=?
+          AND f.user_id=?
+        ORDER BY w.id DESC
+        """,
+        (
+            land_id,
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+# ----------------------------- weather -----------------------------
+
+@app.get("/weather/current")
+def weather_current(
     latitude: float,
     longitude: float,
+    authorization: Optional[str] = Header(None),
 ):
+    user = current_user(authorization)
 
-    url = "https://api.open-meteo.com/v1/forecast"
+    validate_coords(
+        latitude,
+        longitude,
+    )
 
     params = {
         "latitude": latitude,
@@ -1337,720 +2362,861 @@ def get_weather_data(
             "temperature_2m,"
             "relative_humidity_2m,"
             "precipitation,"
-            "wind_speed_10m,"
-            "weather_code"
+            "wind_speed_10m"
         ),
-        "daily": (
-            "temperature_2m_max,"
-            "temperature_2m_min,"
-            "precipitation_sum,"
-            "wind_speed_10m_max,"
-            "relative_humidity_2m_max,"
-            "relative_humidity_2m_min"
-        ),
-        "forecast_days": 7,
         "timezone": "auto",
     }
 
-    response = requests.get(
-        url,
-        params=params,
-        timeout=OPEN_METEO_TIMEOUT,
-    )
-
-    response.raise_for_status()
-
-    return response.json()
-
-
-@app.post("/weather")
-def weather(
-    data: WeatherRequest,
-):
-
     try:
-
-        result = get_weather_data(
-            data.latitude,
-            data.longitude,
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params=params,
+            timeout=WEATHER_TIMEOUT,
         )
 
-        return {
-            "status": "ok",
-            "latitude": data.latitude,
-            "longitude": data.longitude,
-            "data": result,
-        }
+        r.raise_for_status()
 
-    except Exception as exc:
+        data = r.json()
 
         return {
-            "status": "error",
-            "message": str(exc),
+            "verified": True,
+            "provider": "open-meteo",
+            "data": data,
+        }
+
+    except requests.RequestException as exc:
+        return {
+            "verified": False,
+            "provider": "open-meteo",
+            "error": str(exc),
         }
 
 
-# ============================================================
-# CLIMATE / MULTI-YEAR DATA
-# ============================================================
-
-def get_climate_data(
+@app.get("/weather/forecast")
+def weather_forecast(
     latitude: float,
     longitude: float,
-    years: int = 5,
+    days: int = 7,
+    authorization: Optional[str] = Header(None),
 ):
+    user = current_user(authorization)
 
-    end = datetime.now(
-        timezone.utc
-    ).date()
-
-    start = end.replace(
-        year=max(
-            1940,
-            end.year - years,
-        )
+    validate_coords(
+        latitude,
+        longitude,
     )
 
-    url = "https://archive-api.open-meteo.com/v1/archive"
+    days = max(
+        1,
+        min(days, 16),
+    )
 
     params = {
         "latitude": latitude,
         "longitude": longitude,
-        "start_date": start.isoformat(),
-        "end_date": end.isoformat(),
+        "forecast_days": days,
         "daily": (
-            "temperature_2m_mean,"
             "temperature_2m_max,"
             "temperature_2m_min,"
-            "precipitation_sum"
+            "precipitation_sum,"
+            "wind_speed_10m_max"
         ),
         "timezone": "auto",
     }
 
-    response = requests.get(
-        url,
-        params=params,
-        timeout=OPEN_METEO_TIMEOUT,
-    )
+    try:
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params=params,
+            timeout=WEATHER_TIMEOUT,
+        )
 
-    response.raise_for_status()
+        r.raise_for_status()
 
-    return response.json()
+        return {
+            "verified": True,
+            "provider": "open-meteo",
+            "data": r.json(),
+        }
+
+    except requests.RequestException as exc:
+        return {
+            "verified": False,
+            "provider": "open-meteo",
+            "error": str(exc),
+        }
 
 
-# ============================================================
-# GEOCODING
-# ============================================================
-
-def geocode_address(
-    address: str,
+@app.post("/weather/observation")
+def weather_observation(
+    x: WeatherIn,
+    authorization: Optional[str] = Header(None),
 ):
+    user = current_user(authorization)
 
-    if not address:
-        return None
-
-    response = requests.get(
-        "https://geocoding-api.open-meteo.com/v1/search",
-        params={
-            "name": address,
-            "count": 5,
-            "language": "en",
-            "format": "json",
-        },
-        timeout=OPEN_METEO_TIMEOUT,
+    validate_coords(
+        x.latitude,
+        x.longitude,
     )
 
-    response.raise_for_status()
+    oid = q(
+        """
+        INSERT INTO weather_observations(
+            user_id,
+            lat,
+            lon,
+            observed_at,
+            temperature,
+            humidity,
+            rain_mm,
+            wind_kmh,
+            source,
+            raw_json,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            user["id"],
+            x.latitude,
+            x.longitude,
+            x.observed_at or now_iso(),
+            x.temperature,
+            x.humidity,
+            x.rain_mm,
+            x.wind_kmh,
+            x.source,
+            jdump(x.raw),
+            now_iso(),
+        ),
+    )
 
-    data = response.json()
+    return q(
+        """
+        SELECT *
+        FROM weather_observations
+        WHERE id=?
+        """,
+        (oid,),
+        one=True,
+    )
 
-    results = data.get(
-        "results"
-    ) or []
 
-    if not results:
-        return None
+# ----------------------------- location -----------------------------
 
-    result = results[0]
+@app.post("/location")
+def create_location(
+    x: LocationIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    validate_coords(
+        x.latitude,
+        x.longitude,
+    )
+
+    lid = q(
+        """
+        INSERT INTO location_records(
+            user_id,
+            lat,
+            lon,
+            address,
+            region,
+            country,
+            source,
+            confidence,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            user["id"],
+            x.latitude,
+            x.longitude,
+            x.address,
+            x.region,
+            x.country,
+            x.source,
+            1,
+            now_iso(),
+        ),
+    )
+
+    return q(
+        """
+        SELECT *
+        FROM location_records
+        WHERE id=?
+        """,
+        (lid,),
+        one=True,
+    )
+
+
+# ----------------------------- provider management / health -----------------------------
+
+@app.get("/integrations/status")
+def integrations_status(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    rows = q(
+        """
+        SELECT
+            key,
+            name,
+            base_url,
+            health_url,
+            enabled,
+            required,
+            notes,
+            updated_at
+        FROM external_providers
+        ORDER BY key
+        """,
+        many=True,
+    )
+
+    result = []
+
+    for r in rows:
+        x = dict(r)
+
+        x["base_url_configured"] = bool(
+            x["base_url"]
+        )
+
+        x.pop("base_url", None)
+        x.pop("health_url", None)
+
+        x["healthy"] = (
+            provider_status(x["key"])["healthy"]
+            if x["enabled"]
+            else None
+        )
+
+        result.append(x)
 
     return {
-        "name": result.get("name"),
-        "country": result.get("country"),
-        "country_code": result.get("country_code"),
-        "admin1": result.get("admin1"),
-        "latitude": result.get("latitude"),
-        "longitude": result.get("longitude"),
-        "timezone": result.get("timezone"),
+        "version": VERSION,
+        "providers": result,
     }
 
 
-@app.post("/location/resolve")
-def resolve_location(
-    data: LocationResolveRequest,
+@app.get("/owner/providers")
+def owner_providers(
+    authorization: Optional[str] = Header(None),
 ):
+    user = current_user(authorization)
+    require_owner(user)
 
-    latitude = data.latitude
-    longitude = data.longitude
+    rows = q(
+        """
+        SELECT
+            key,
+            name,
+            base_url,
+            health_url,
+            auth_env,
+            enabled,
+            required,
+            notes,
+            updated_at
+        FROM external_providers
+        ORDER BY key
+        """,
+        many=True,
+    )
 
-    geocoded = None
-
-    if (
-        latitude is not None
-        and longitude is not None
-    ):
-
-        if not -90 <= latitude <= 90:
-
-            raise HTTPException(
-                400,
-                "Invalid latitude",
+    for r in rows:
+        r["secret_configured"] = bool(
+            r["auth_env"]
+            and os.getenv(
+                r["auth_env"],
+                "",
             )
-
-        if not -180 <= longitude <= 180:
-
-            raise HTTPException(
-                400,
-                "Invalid longitude",
-            )
-
-    elif data.address or data.region:
-
-        query = (
-            data.address
-            or data.region
         )
 
-        try:
+    return rows
 
-            geocoded = geocode_address(
-                query
-            )
 
-        except Exception as exc:
+class ProviderConfigIn(BaseModel):
+    base_url: str = ""
+    health_url: str = ""
+    enabled: bool = False
+    required: bool = False
+    notes: str = ""
 
-            return {
-                "status": "error",
-                "message": f"Location lookup failed: {exc}",
-            }
 
-        if not geocoded:
+@app.put("/owner/providers/{key}")
+def owner_provider_config(
+    key: str,
+    x: ProviderConfigIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
 
-            return {
-                "status": "not_found",
-                "message": "Location not found",
-            }
+    if key not in PROVIDER_KEYS:
+        raise HTTPException(
+            404,
+            "unknown provider",
+        )
 
-        latitude = geocoded[
-            "latitude"
-        ]
+    if x.enabled and not x.base_url:
+        raise HTTPException(
+            400,
+            "base_url required when enabling provider",
+        )
 
-        longitude = geocoded[
-            "longitude"
-        ]
+    q(
+        """
+        UPDATE external_providers
+        SET base_url=?,
+            health_url=?,
+            enabled=?,
+            required=?,
+            notes=?,
+            updated_at=?
+        WHERE key=?
+        """,
+        (
+            x.base_url.strip(),
+            x.health_url.strip(),
+            int(x.enabled),
+            int(x.required),
+            x.notes,
+            now_iso(),
+            key,
+        ),
+    )
 
-    else:
+    audit(
+        user["id"],
+        "provider_config_update",
+        "external_providers",
+        None,
+        {
+            "key": key,
+            "enabled": x.enabled,
+        },
+    )
 
+    return {
+        "ok": True,
+        "key": key,
+        "enabled": x.enabled,
+    }
+
+
+@app.post("/owner/providers/{key}/health")
+def owner_provider_health(
+    key: str,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    if key not in PROVIDER_KEYS:
+        raise HTTPException(
+            404,
+            "unknown provider",
+        )
+
+    result = provider_status(key)
+
+    audit(
+        user["id"],
+        "provider_health_check",
+        "external_providers",
+        None,
+        {
+            "key": key,
+            "healthy": result.get("healthy"),
+        },
+    )
+
+    return result
+
+
+@app.get("/location/reverse")
+def reverse_geocode(
+    lat: float,
+    lon: float,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+
+    validate_coords(
+        lat,
+        lon,
+    )
+
+    if not provider_enabled("geocoding"):
         return {
-            "status": "missing",
-            "message": "Provide address, region, or coordinates",
+            "status": "unavailable",
+            "verified": False,
+            "latitude": lat,
+            "longitude": lon,
+            "reason": (
+                "No approved reverse-geocoding "
+                "provider configured."
+            ),
         }
 
     return {
         "status": "ok",
-        "latitude": latitude,
-        "longitude": longitude,
-        "address": data.address,
-        "region": data.region,
-        "resolved": geocoded,
+        "verified": True,
+        "provider": "geocoding",
+        "data": provider_request(
+            "geocoding",
+            "reverse",
+            {
+                "lat": lat,
+                "lon": lon,
+            },
+        ),
     }
 
 
-# ============================================================
-# FARM CONTEXT
-# ============================================================
+@app.get("/agri/provider-query/{provider}")
+def provider_query(
+    provider: str,
+    path: str = "",
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
 
-def collect_farm_context(
+    if provider not in PROVIDER_KEYS:
+        raise HTTPException(
+            404,
+            "unknown provider",
+        )
+
+    return provider_request(
+        provider,
+        path,
+    )
+
+
+# ----------------------------- settings / owner stats / audit -----------------------------
+
+@app.get("/owner/settings")
+def owner_settings(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    rows = q(
+        """
+        SELECT
+            key,
+            value,
+            secret,
+            updated_at
+        FROM system_settings
+        ORDER BY key
+        """,
+        many=True,
+    )
+
+    for r in rows:
+        if r["secret"]:
+            r["value"] = "***"
+
+    return rows
+
+
+@app.put("/owner/settings/{key}")
+def owner_setting(
+    key: str,
+    x: SettingIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    q(
+        """
+        INSERT INTO system_settings(
+            key,
+            value,
+            secret,
+            updated_by,
+            updated_at
+        )
+        VALUES(?,?,?,?,?)
+        ON CONFLICT(key)
+        DO UPDATE SET
+            value=excluded.value,
+            secret=excluded.secret,
+            updated_by=excluded.updated_by,
+            updated_at=excluded.updated_at
+        """,
+        (
+            key,
+            x.value,
+            int(x.secret),
+            user["id"],
+            now_iso(),
+        ),
+    )
+
+    audit(
+        user["id"],
+        "setting_update",
+        "system_settings",
+        None,
+        {"key": key},
+    )
+
+    return {
+        "ok": True
+    }
+
+
+@app.get("/owner/stats")
+def owner_stats(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    def count(
+        table,
+        where="",
+        args=(),
+    ):
+        return q(
+            f"""
+            SELECT COUNT(*) n
+            FROM {table}
+            {where}
+            """,
+            args,
+            one=True,
+        )["n"]
+
+    return {
+        "users": count(
+            "users",
+            "WHERE role='user'",
+        ),
+        "owners": count(
+            "users",
+            "WHERE role='owner'",
+        ),
+        "farms": count("farms"),
+        "payments_pending": count(
+            "payments",
+            "WHERE status='pending'",
+        ),
+        "payments_approved": count(
+            "payments",
+            "WHERE status='approved'",
+        ),
+        "subscriptions": count(
+            "subscriptions",
+            "WHERE status='active'",
+        ),
+        "feedback_open": count(
+            "feedback",
+            "WHERE status='open'",
+        ),
+        "ai_today": count(
+            "ai_usage",
+            "WHERE usage_date=?",
+            (today(),),
+        ),
+    }
+
+
+@app.get("/owner/audit")
+def owner_audit(
+    limit: int = 200,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    return q(
+        """
+        SELECT *
+        FROM audit_logs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (
+            max(
+                1,
+                min(limit, 1000),
+            ),
+        ),
+        many=True,
+    )
+
+
+@app.get("/owner/users")
+def owner_users(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    return q(
+        """
+        SELECT
+            id,
+            email,
+            name,
+            country,
+            language,
+            role,
+            active,
+            mfa_enabled,
+            created_at
+        FROM users
+        ORDER BY id DESC
+        """,
+        many=True,
+    )
+
+
+@app.post("/owner/users/{user_id}/disable")
+def owner_disable_user(
     user_id: int,
-    farm_id: Optional[int],
+    authorization: Optional[str] = Header(None),
 ):
+    user = current_user(authorization)
+    require_owner(user)
 
-    context = {
-        "farm": None,
-        "lands": [],
-        "crops": [],
-        "soil_lab": [],
-        "water": [],
-    }
+    if user_id == user["id"]:
+        raise HTTPException(
+            400,
+            "cannot disable current owner",
+        )
 
-    if not farm_id:
-        return context
+    q(
+        """
+        UPDATE users
+        SET active=0,
+            updated_at=?
+        WHERE id=?
+        """,
+        (
+            now_iso(),
+            user_id,
+        ),
+    )
 
-    farm = verify_farm_owner(
+    q(
+        """
+        UPDATE auth_tokens
+        SET revoked=1
+        WHERE user_id=?
+        """,
+        (user_id,),
+    )
+
+    audit(
+        user["id"],
+        "user_disable",
+        "users",
         user_id,
-        farm_id,
     )
-
-    context["farm"] = dict(farm)
-
-    lands = fetchall(
-        "SELECT * FROM lands WHERE farm_id=?",
-        (farm_id,),
-    )
-
-    context["lands"] = [
-        dict(x)
-        for x in lands
-    ]
-
-    crops = fetchall(
-        "SELECT * FROM crops WHERE farm_id=?",
-        (farm_id,),
-    )
-
-    context["crops"] = [
-        dict(x)
-        for x in crops
-    ]
-
-    soil = fetchall(
-        "SELECT * FROM soil_lab_tests WHERE farm_id=?",
-        (farm_id,),
-    )
-
-    for item in soil:
-
-        obj = dict(item)
-
-        obj["data"] = json_loads(
-            obj.get("data"),
-            {},
-        )
-
-        context["soil_lab"].append(
-            obj
-        )
-
-    water = fetchall(
-        "SELECT * FROM water_sources WHERE farm_id=?",
-        (farm_id,),
-    )
-
-    for item in water:
-
-        obj = dict(item)
-
-        obj["data"] = json_loads(
-            obj.get("data"),
-            {},
-        )
-
-        context["water"].append(
-            obj
-        )
-
-    return context
-
-
-# ============================================================
-# USER DATA VALIDATION
-# ============================================================
-
-def validate_location(
-    latitude,
-    longitude,
-):
-
-    errors = []
-    warnings = []
-
-    if (
-        latitude is None
-        or longitude is None
-    ):
-
-        errors.append(
-            "مختصات جغرافیایی برای تحلیل مکانی کامل موجود نیست."
-        )
-
-        return {
-            "valid": False,
-            "errors": errors,
-            "warnings": warnings,
-        }
-
-    if not -90 <= latitude <= 90:
-
-        errors.append(
-            "عرض جغرافیایی نامعتبر است."
-        )
-
-    if not -180 <= longitude <= 180:
-
-        errors.append(
-            "طول جغرافیایی نامعتبر است."
-        )
-
-    if (
-        latitude == 0
-        and longitude == 0
-    ):
-
-        warnings.append(
-            "مختصات صفر وارد شده و ممکن است مختصات واقعی مزرعه نباشد."
-        )
 
     return {
-        "valid": len(errors) == 0,
-        "errors": errors,
-        "warnings": warnings,
+        "ok": True
     }
 
 
-def validate_user_context(
-    context: dict,
-):
+# ----------------------------- backup -----------------------------
 
-    warnings = []
-    contradictions = []
-
-    farm = context.get(
-        "farm"
-    ) or {}
-
-    area_values = []
-
-    for land in context.get(
-        "lands",
-        [],
-    ):
-
-        area = safe_float(
-            land.get("area")
-        )
-
-        if area is not None:
-
-            area_values.append(
-                area
-            )
-
-            if area < 0:
-
-                contradictions.append(
-                    "مساحت زمین نمی‌تواند منفی باشد."
-                )
-
-    for crop in context.get(
-        "crops",
-        [],
-    ):
-
-        name = normalize_text(
-            crop.get("name")
-        )
-
-        if not name:
-
-            contradictions.append(
-                "یک رکورد کشت بدون نام محصول وجود دارد."
-            )
-
-    for soil in context.get(
-        "soil_lab",
-        [],
-    ):
-
-        data = soil.get(
-            "data"
-        ) or {}
-
-        ph = safe_float(
-            data.get("ph")
-            if isinstance(data, dict)
-            else None
-        )
-
-        if ph is not None:
-
-            if ph < 0 or ph > 14:
-
-                contradictions.append(
-                    "pH آزمایش خاک خارج از محدوده معتبر است."
-                )
-
-    return {
-        "valid": len(contradictions) == 0,
-        "warnings": warnings,
-        "contradictions": contradictions,
-        "farm_name": farm.get(
-            "name",
-            "",
-        ),
-        "total_land_records": len(
-            context.get(
-                "lands",
-                [],
-            )
-        ),
-        "crop_records": len(
-            context.get(
-                "crops",
-                [],
-            )
-        ),
-    }
-
-
-# ============================================================
-# LOCAL AGRICULTURAL ENGINE
-# ============================================================
-
-def local_agri_answer(
-    question: str,
-    crop: Optional[str] = None,
-    region: Optional[str] = None,
-):
-
-    q = normalize_text(
-        question
-    ).lower()
-
-    points = []
-
-    if any(
-        x in q
-        for x in [
-            "زرد",
-            "زردی",
-            "yellow",
-            "برگ",
-            "leaf",
-        ]
-    ):
-
-        points.extend(
-            [
-                "کمبود یا عدم تعادل عناصر غذایی",
-                "مشکل آبیاری یا زهکشی",
-                "شوری خاک یا آب",
-                "آسیب ریشه",
-                "بیماری یا آفت",
-            ]
-        )
-
-    if any(
-        x in q
-        for x in [
-            "آبیاری",
-            "آب",
-            "irrigation",
-            "water",
-        ]
-    ):
-
-        points.extend(
-            [
-                "نیاز آبی باید بر اساس محصول، مرحله رشد، بافت خاک، دما و تبخیرتعرق بررسی شود.",
-                "آبیاری بیش از نیاز می‌تواند باعث کمبود اکسیژن ریشه و افزایش بیماری‌های ریشه‌ای شود.",
-            ]
-        )
-
-    if any(
-        x in q
-        for x in [
-            "کود",
-            "fertilizer",
-            "ازت",
-            "نیتروژن",
-            "فسفر",
-            "پتاس",
-        ]
-    ):
-
-        points.extend(
-            [
-                "انتخاب کود باید بر اساس آزمایش خاک، محصول، مرحله رشد و هدف تولید انجام شود.",
-                "مصرف کود بدون بررسی شرایط خاک و محصول می‌تواند باعث عدم تعادل غذایی یا شوری شود.",
-            ]
-        )
-
-    if any(
-        x in q
-        for x in [
-            "آفت",
-            "حشره",
-            "بیماری",
-            "سم",
-            "pest",
-            "disease",
-            "pesticide",
-        ]
-    ):
-
-        points.extend(
-            [
-                "تشخیص آفت یا بیماری فقط از روی یک علامت قطعی نیست.",
-                "برای انتخاب سم باید محصول، عامل، مرحله رشد، شدت آلودگی و برچسب رسمی محصول مشخص باشد.",
-            ]
-        )
-
-    if not points:
-
-        points.append(
-            "برای پاسخ دقیق، محصول، مرحله رشد، محل مزرعه، وضعیت خاک، آب، "
-            "شرایط آب‌وهوا و علائم مشاهده‌شده باید بررسی شوند."
-        )
-
-    return {
-        "answer": "\n".join(
-            f"• {x}"
-            for x in points
-        ),
-        "confidence": (
-            0.45
-            if not crop
-            else 0.60
-        ),
-    }
-
-
-# ============================================================
-# OPENAI AGRICULTURAL ENGINE
-# ============================================================
-
-def build_agri_system_prompt(
-    language: str,
-):
-
-    return f"""
-You are ARYA AgriDoctor, a professional agricultural intelligence system.
-
-Answer language: {language}
-
-Your job is to provide practical, technically reasoned agricultural analysis.
-
-You must consider, when available:
-
-- exact farm location
-- coordinates
-- climate
-- current weather
-- multi-year climate information
-- crop and cultivar
-- growth stage
-- soil type
-- laboratory soil analysis
-- irrigation
-- water quality
-- pests
-- diseases
-- symptoms
-- fertilizer
-- agricultural management
-- images when provided
-- user observations
-- global agricultural knowledge
-
-IMPORTANT:
-
-1. Never invent laboratory results.
-2. Never pretend an uncertain diagnosis is certain.
-3. Separate confirmed facts, probable causes and possibilities.
-4. If information conflicts, identify the conflict.
-5. If user-provided information appears incorrect, explain why.
-6. Do not blindly accept user data.
-7. If important data is missing, identify exactly what is missing.
-8. If a crop is unsuitable for a region, explain the limiting factors and provide suitable alternatives.
-9. For pesticides, do not invent doses.
-10. Pesticide recommendations must depend on registered product, active ingredient,
-   crop, pest/disease, formulation, local regulations and label.
-11. Fertilizer recommendations must consider soil test, crop and growth stage.
-12. Do not claim guaranteed yield.
-13. When yield is discussed, give a conditional range and explain assumptions.
-14. Provide an actionable plan when sufficient information exists.
-15. Provide a schedule when timing is important.
-16. Provide warnings when there are important risks.
-17. Use metric units unless the user asks otherwise.
-18. If an image is not available, do not pretend that you analyzed an image.
-19. Do not respond with phrases such as "request registered" as the actual answer.
-20. Give the agricultural answer directly.
-21. If several explanations are possible, rank them by evidence,
-    but clearly state that the ranking is provisional.
-22. Consider local climate and season.
-23. Consider both the user's supplied data and broader agricultural knowledge.
-24. If user data and broader evidence disagree, show both and explain the discrepancy.
-
-Return a structured agricultural answer containing:
-
-- direct_answer
-- facts
-- likely_causes
-- data_validation
-- missing_data
-- recommendations
-- alternatives
-- action_plan
-- schedule
-- alerts
-- confidence
-
-Do not fabricate unavailable data.
-"""
-
-
-def openai_answer(
-    question: str,
-    language: str,
-    context_packet: dict,
-):
-
-    if not OPENAI_API_KEY:
-        return None
+def create_backup_file():
+    conn = db()
+    rows = {}
 
     try:
+        tables = [
+            r["name"]
+            for r in conn.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type='table'
+                  AND name NOT LIKE 'sqlite_%'
+                """
+            ).fetchall()
+        ]
 
-        from openai import OpenAI
+        for t in tables:
+            rows[t] = [
+                dict(x)
+                for x in conn.execute(
+                    f"SELECT * FROM {t}"
+                ).fetchall()
+            ]
 
-        client = OpenAI(
-            api_key=OPENAI_API_KEY
-        )
+    finally:
+        conn.close()
 
-        prompt = (
-            "USER QUESTION:\n"
-            + question
-            + "\n\nAGRICULTURAL CONTEXT:\n"
-            + json_dumps(context_packet)
-        )
+    path = (
+        BASE_DIR
+        / f"arya_backup_"
+          f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+          f".json"
+    )
 
-        response = client.responses.create(
-            model=OPENAI_MODEL,
-            instructions=build_agri_system_prompt(
-                language
-            ),
-            input=prompt,
-        )
-
-        text = getattr(
-            response,
-            "output_text",
-            None,
-        )
-
-        if not text:
-            return None
-
-        return text
-
-    except Exception as exc:
-
-        return {
-            "error": str(exc)
+    data = jdump(
+        {
+            "version": VERSION,
+            "created_at": now_iso(),
+            "tables": rows,
         }
+    ).encode()
+
+    path.write_bytes(data)
+
+    return path, sha256_bytes(data)
 
 
-# ============================================================
-# AI USAGE
-# ============================================================
+@app.post("/owner/backup")
+def backup(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
 
-def check_ai_limit(
-    user
+    path, digest = create_backup_file()
+
+    bid = q(
+        """
+        INSERT INTO backups(
+            created_by,
+            path,
+            sha256,
+            created_at
+        )
+        VALUES(?,?,?,?)
+        """,
+        (
+            user["id"],
+            str(path),
+            digest,
+            now_iso(),
+        ),
+    )
+
+    audit(
+        user["id"],
+        "backup",
+        "backups",
+        bid,
+    )
+
+    return {
+        "id": bid,
+        "path": str(path),
+        "sha256": digest,
+    }
+
+
+@app.get("/owner/backups")
+def backups(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    return q(
+        """
+        SELECT *
+        FROM backups
+        ORDER BY id DESC
+        """,
+        many=True,
+    )
+
+
+# ----------------------------- owner emergency audit controls -----------------------------
+
+@app.post("/owner/emergency/revoke-all-sessions")
+def revoke_all_sessions(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    q(
+        """
+        UPDATE auth_tokens
+        SET revoked=1
+        WHERE user_id!=?
+        """,
+        (user["id"],),
+    )
+
+    audit(
+        user["id"],
+        "emergency_revoke_all_sessions",
+    )
+
+    return {
+        "ok": True
+    }
+
+
+@app.post("/owner/emergency/expire-all-subscriptions")
+def expire_all_subscriptions(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(authorization)
+    require_owner(user)
+
+    q(
+        """
+        UPDATE subscriptions
+        SET status='expired'
+        WHERE status='active'
+          AND user_id!=?
+        """,
+        (user["id"],),
+    )
+
+    audit(
+        user["id"],
+        "emergency_expire_all_subscriptions",
+    )
+
+    return {
+        "ok": True
+    }
+
+
+# ----------------------------- startup -----------------------------
+
+@app.on_event("startup")
+def startup():
+    init_db()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    init_db()
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=int(
+            os.getenv(
+                "PORT",
+                "8000",
+            )
+        ),
+    )
