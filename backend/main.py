@@ -11,174 +11,354 @@ import struct
 import sqlite3
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional, Literal
+from typing import Any, Optional
 
 import requests
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Query
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    Header,
+    UploadFile,
+    File,
+    Query,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
 
+
 # ============================================================
-# ARYA AGRIDOCTOR — SINGLE FILE BACKEND
-# Production-oriented foundation. External providers are explicit;
-# the backend never invents diagnoses, doses, prices, or weather.
+# ARYA AGRIDOCTOR
+# SINGLE FILE PRODUCTION-ORIENTED BACKEND
 # ============================================================
 
 APP_NAME = "ARYA AgriDoctor"
-VERSION = "4.0.0"
-BASE_DIR = Path(os.getenv("ARYA_BASE_DIR", ".")).resolve()
-DB_PATH = Path(os.getenv("ARYA_DATABASE", str(BASE_DIR / "arya.db")))
-MEDIA_DIR = Path(os.getenv("ARYA_MEDIA_DIR", str(BASE_DIR / "media")))
-MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+VERSION = "5.0.0"
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-TRANSLATION_API_URL = os.getenv("ARYA_TRANSLATION_API_URL", "")
-TRANSLATION_API_KEY = os.getenv("ARYA_TRANSLATION_API_KEY", "")
-WEATHER_TIMEOUT = int(os.getenv("ARYA_WEATHER_TIMEOUT", "20"))
-TOKEN_DAYS = int(os.getenv("ARYA_TOKEN_DAYS", "30"))
-RESET_HOURS = int(os.getenv("ARYA_RESET_HOURS", "2"))
-DAILY_AI_LIMIT = int(os.getenv("ARYA_DAILY_AI_LIMIT", "30"))
-DEVICE_LIMIT = int(os.getenv("ARYA_DEVICE_LIMIT", "3"))
-PBKDF2_ITERATIONS = int(os.getenv("ARYA_PBKDF2_ITERATIONS", "310000"))
-MAX_UPLOAD_MB = int(os.getenv("ARYA_MAX_UPLOAD_MB", "15"))
-OWNER_BOOTSTRAP_SECRET = os.getenv("ARYA_OWNER_BOOTSTRAP_SECRET", "")
-OWNER_EMAIL = os.getenv("ARYA_OWNER_EMAIL", "")
+BASE_DIR = Path(
+    os.getenv("ARYA_BASE_DIR", ".")
+).resolve()
 
-app = FastAPI(title=APP_NAME, version=VERSION)
+DB_PATH = Path(
+    os.getenv(
+        "ARYA_DATABASE",
+        str(BASE_DIR / "arya.db"),
+    )
+)
+
+MEDIA_DIR = Path(
+    os.getenv(
+        "ARYA_MEDIA_DIR",
+        str(BASE_DIR / "media"),
+    )
+)
+
+MEDIA_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+OPENAI_API_KEY = os.getenv(
+    "OPENAI_API_KEY",
+    "",
+)
+
+OPENAI_MODEL = os.getenv(
+    "OPENAI_MODEL",
+    "gpt-5",
+)
+
+OPENAI_BASE_URL = os.getenv(
+    "OPENAI_BASE_URL",
+    "https://api.openai.com/v1",
+).rstrip("/")
+
+TRANSLATION_API_URL = os.getenv(
+    "ARYA_TRANSLATION_API_URL",
+    "",
+)
+
+TRANSLATION_API_KEY = os.getenv(
+    "ARYA_TRANSLATION_API_KEY",
+    "",
+)
+
+WEATHER_TIMEOUT = int(
+    os.getenv(
+        "ARYA_WEATHER_TIMEOUT",
+        "20",
+    )
+)
+
+TOKEN_DAYS = int(
+    os.getenv(
+        "ARYA_TOKEN_DAYS",
+        "30",
+    )
+)
+
+RESET_HOURS = int(
+    os.getenv(
+        "ARYA_RESET_HOURS",
+        "2",
+    )
+)
+
+DAILY_AI_LIMIT = int(
+    os.getenv(
+        "ARYA_DAILY_AI_LIMIT",
+        "30",
+    )
+)
+
+DEVICE_LIMIT = int(
+    os.getenv(
+        "ARYA_DEVICE_LIMIT",
+        "3",
+    )
+)
+
+PBKDF2_ITERATIONS = int(
+    os.getenv(
+        "ARYA_PBKDF2_ITERATIONS",
+        "310000",
+    )
+)
+
+MAX_UPLOAD_MB = int(
+    os.getenv(
+        "ARYA_MAX_UPLOAD_MB",
+        "15",
+    )
+)
+
+OWNER_BOOTSTRAP_SECRET = os.getenv(
+    "ARYA_OWNER_BOOTSTRAP_SECRET",
+    "",
+)
+
+OWNER_EMAIL = os.getenv(
+    "ARYA_OWNER_EMAIL",
+    "",
+)
 
 CORS_ORIGINS = [
     x.strip()
-    for x in os.getenv("ARYA_CORS", "*").split(",")
+    for x in os.getenv(
+        "ARYA_CORS",
+        "*",
+    ).split(",")
     if x.strip()
 ]
+
+
+app = FastAPI(
+    title=APP_NAME,
+    version=VERSION,
+)
+
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
-    allow_credentials=(CORS_ORIGINS != ["*"]),
+    allow_credentials=(
+        CORS_ORIGINS != ["*"]
+    ),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------------------- utilities -----------------------------
+
+# ============================================================
+# UTILITIES
+# ============================================================
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
 def today() -> str:
-    return datetime.now(timezone.utc).date().isoformat()
+    return datetime.now(
+        timezone.utc
+    ).date().isoformat()
 
 
-def hash_password(password: str, salt: Optional[bytes] = None) -> str:
+def hash_password(
+    password: str,
+    salt: Optional[bytes] = None,
+) -> str:
     if len(password) < 8:
-        raise HTTPException(400, "password must be at least 8 characters")
+        raise HTTPException(
+            400,
+            "password must be at least 8 characters",
+        )
+
     salt = salt or secrets.token_bytes(16)
-    dk = hashlib.pbkdf2_hmac(
+
+    digest = hashlib.pbkdf2_hmac(
         "sha256",
         password.encode(),
         salt,
         PBKDF2_ITERATIONS,
     )
+
     return (
-        base64.urlsafe_b64encode(salt).decode()
+        base64.urlsafe_b64encode(
+            salt
+        ).decode()
         + "$"
-        + base64.urlsafe_b64encode(dk).decode()
+        + base64.urlsafe_b64encode(
+            digest
+        ).decode()
     )
 
 
-def totp_code(secret: str, timestamp: Optional[int] = None) -> str:
-    if not secret:
-        return ""
-
-    timestamp = timestamp or int(time.time())
-    counter = timestamp // 30
-
-    key = base64.b32decode(
-        secret.upper()
-        + "=" * ((8 - len(secret) % 8) % 8)
-    )
-
-    msg = struct.pack(">Q", counter)
-    digest = hmac.new(key, msg, hashlib.sha1).digest()
-    off = digest[-1] & 0x0F
-
-    num = (
-        struct.unpack(">I", digest[off:off + 4])[0]
-        & 0x7FFFFFFF
-    ) % 1000000
-
-    return f"{num:06d}"
-
-
-def verify_totp(secret: str, code: str) -> bool:
-    if not re.fullmatch(r"\d{6}", code or ""):
-        return False
-
-    t = int(time.time())
-
-    return any(
-        hmac.compare_digest(
-            totp_code(secret, t + d),
-            code,
-        )
-        for d in (-30, 0, 30)
-    )
-
-
-def verify_password(password: str, stored: str) -> bool:
+def verify_password(
+    password: str,
+    stored: str,
+) -> bool:
     try:
-        salt_s, digest_s = stored.split("$", 1)
+        salt_s, digest_s = stored.split(
+            "$",
+            1,
+        )
 
         salt = base64.urlsafe_b64decode(
             salt_s.encode()
         )
 
-        digest = base64.urlsafe_b64decode(
+        expected = base64.urlsafe_b64decode(
             digest_s.encode()
         )
 
-        test = hashlib.pbkdf2_hmac(
+        actual = hashlib.pbkdf2_hmac(
             "sha256",
             password.encode(),
             salt,
             PBKDF2_ITERATIONS,
         )
 
-        return hmac.compare_digest(test, digest)
+        return hmac.compare_digest(
+            actual,
+            expected,
+        )
 
     except Exception:
         return False
 
 
-def sha256_bytes(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
+def totp_code(
+    secret: str,
+    timestamp: Optional[int] = None,
+) -> str:
+    if not secret:
+        return ""
+
+    timestamp = (
+        timestamp
+        if timestamp is not None
+        else int(time.time())
+    )
+
+    counter = timestamp // 30
+
+    key = base64.b32decode(
+        secret.upper()
+        + "=" * (
+            (8 - len(secret) % 8) % 8
+        )
+    )
+
+    msg = struct.pack(
+        ">Q",
+        counter,
+    )
+
+    digest = hmac.new(
+        key,
+        msg,
+        hashlib.sha1,
+    ).digest()
+
+    offset = digest[-1] & 0x0F
+
+    number = (
+        struct.unpack(
+            ">I",
+            digest[
+                offset:offset + 4
+            ],
+        )[0]
+        & 0x7FFFFFFF
+    ) % 1000000
+
+    return f"{number:06d}"
 
 
-def token_hash(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+def verify_totp(
+    secret: str,
+    code: str,
+) -> bool:
+    if not re.fullmatch(
+        r"\d{6}",
+        code or "",
+    ):
+        return False
+
+    current = int(time.time())
+
+    return any(
+        hmac.compare_digest(
+            totp_code(
+                secret,
+                current + delta,
+            ),
+            code,
+        )
+        for delta in (-30, 0, 30)
+    )
 
 
-def norm_email(v: str) -> str:
-    return v.strip().lower()
+def sha256_bytes(
+    data: bytes,
+) -> str:
+    return hashlib.sha256(
+        data
+    ).hexdigest()
 
 
-def jdump(v: Any) -> str:
+def token_hash(
+    token: str,
+) -> str:
+    return hashlib.sha256(
+        token.encode()
+    ).hexdigest()
+
+
+def norm_email(
+    value: str,
+) -> str:
+    return value.strip().lower()
+
+
+def jdump(value: Any) -> str:
     return json.dumps(
-        v,
+        value,
         ensure_ascii=False,
         separators=(",", ":"),
     )
 
 
-def jload(v: Any, default=None):
-    if v is None:
+def jload(
+    value: Any,
+    default=None,
+):
+    if value is None:
         return default
 
     try:
-        return json.loads(v)
+        return json.loads(value)
     except Exception:
         return default
 
@@ -187,15 +367,29 @@ def validate_coords(
     lat: Optional[float],
     lon: Optional[float],
 ):
-    if lat is not None and not -90 <= lat <= 90:
-        raise HTTPException(422, "invalid latitude")
+    if lat is not None and not (
+        -90 <= lat <= 90
+    ):
+        raise HTTPException(
+            422,
+            "invalid latitude",
+        )
 
-    if lon is not None and not -180 <= lon <= 180:
-        raise HTTPException(422, "invalid longitude")
+    if lon is not None and not (
+        -180 <= lon <= 180
+    ):
+        raise HTTPException(
+            422,
+            "invalid longitude",
+        )
 
 
-def validate_pH(ph: Optional[float]):
-    if ph is not None and not 0 <= ph <= 14:
+def validate_ph(
+    value: Optional[float],
+):
+    if value is not None and not (
+        0 <= value <= 14
+    ):
         raise HTTPException(
             422,
             "pH must be between 0 and 14",
@@ -210,8 +404,13 @@ def db():
 
     conn.row_factory = sqlite3.Row
 
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(
+        "PRAGMA foreign_keys=ON"
+    )
+
+    conn.execute(
+        "PRAGMA journal_mode=WAL"
+    )
 
     return conn
 
@@ -225,41 +424,31 @@ def q(
     conn = db()
 
     try:
-        cur = conn.execute(sql, args)
-
-        rows = (
-            cur.fetchall()
-            if (one or many)
-            else None
+        cursor = conn.execute(
+            sql,
+            args,
         )
 
-        conn.commit()
-
         if one:
+            row = cursor.fetchone()
+            conn.commit()
             return (
-                dict(rows[0])
-                if rows
+                dict(row)
+                if row
                 else None
             )
 
         if many:
+            rows = cursor.fetchall()
+            conn.commit()
             return [
-                dict(x)
-                for x in rows
+                dict(row)
+                for row in rows
             ]
 
-        return cur.lastrowid
-
-    finally:
-        conn.close()
-
-
-def execmany(sql: str, rows):
-    conn = db()
-
-    try:
-        conn.executemany(sql, rows)
         conn.commit()
+
+        return cursor.lastrowid
 
     finally:
         conn.close()
@@ -294,12 +483,40 @@ def audit(
                 now_iso(),
             ),
         )
-
     except Exception:
         pass
 
 
-# ----------------------------- database -----------------------------
+def require_owner(
+    user,
+):
+    if user["role"] != "owner":
+        raise HTTPException(
+            403,
+            "owner access required",
+        )
+
+
+def safe_filename(
+    filename: str,
+) -> str:
+    filename = (
+        Path(filename or "file")
+        .name
+    )
+
+    filename = re.sub(
+        r"[^A-Za-z0-9._-]",
+        "_",
+        filename,
+    )
+
+    return filename[:180] or "file"
+
+
+# ============================================================
+# DATABASE
+# ============================================================
 
 def init_db():
     conn = db()
@@ -472,7 +689,301 @@ def init_db():
                     REFERENCES lands(id)
                     ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS weather_observations(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                lat REAL,
+                lon REAL,
+                observed_at TEXT,
+                temperature REAL,
+                humidity REAL,
+                rain_mm REAL,
+                wind_kmh REAL,
+                source TEXT DEFAULT 'manual',
+                raw_json TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS location_records(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                lat REAL,
+                lon REAL,
+                address TEXT DEFAULT '',
+                region TEXT DEFAULT '',
+                country TEXT DEFAULT '',
+                source TEXT DEFAULT 'manual',
+                confidence REAL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_logs(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                action TEXT NOT NULL,
+                entity TEXT DEFAULT '',
+                entity_id INTEGER,
+                details TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS system_settings(
+                key TEXT PRIMARY KEY,
+                value TEXT DEFAULT '',
+                secret INTEGER DEFAULT 0,
+                updated_by INTEGER,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ai_usage(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                usage_date TEXT NOT NULL,
+                tokens INTEGER DEFAULT 0,
+                requests INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS ai_requests(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                language TEXT DEFAULT 'fa',
+                context_json TEXT DEFAULT '{}',
+                response_json TEXT DEFAULT '{}',
+                provider TEXT DEFAULT '',
+                verified INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS media_files(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                original_name TEXT DEFAULT '',
+                stored_name TEXT NOT NULL,
+                mime_type TEXT DEFAULT '',
+                size_bytes INTEGER DEFAULT 0,
+                sha256 TEXT NOT NULL,
+                status TEXT DEFAULT 'stored',
+                analysis_json TEXT DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS feedback(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                subject TEXT NOT NULL,
+                text TEXT NOT NULL,
+                language TEXT DEFAULT 'fa',
+                status TEXT DEFAULT 'open',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS feedback_messages(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                feedback_id INTEGER NOT NULL,
+                sender_user_id INTEGER,
+                sender_role TEXT DEFAULT 'user',
+                language TEXT DEFAULT 'fa',
+                text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(feedback_id)
+                    REFERENCES feedback(id)
+                    ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS payments(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                amount REAL NOT NULL,
+                currency TEXT NOT NULL,
+                method TEXT NOT NULL,
+                reference TEXT DEFAULT '',
+                note TEXT DEFAULT '',
+                status TEXT DEFAULT 'pending',
+                destination TEXT DEFAULT '',
+                network TEXT DEFAULT '',
+                approved_by INTEGER,
+                approved_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS payment_destinations(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                method TEXT NOT NULL,
+                currency TEXT NOT NULL,
+                network TEXT DEFAULT '',
+                destination TEXT NOT NULL,
+                active INTEGER DEFAULT 1,
+                created_by INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS subscriptions(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                plan TEXT NOT NULL,
+                amount REAL DEFAULT 0,
+                currency TEXT DEFAULT '',
+                starts_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                status TEXT DEFAULT 'active',
+                payment_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS activation_codes(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code_hash TEXT UNIQUE NOT NULL,
+                plan TEXT DEFAULT '',
+                expires_at TEXT,
+                used INTEGER DEFAULT 0,
+                user_id INTEGER,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS devices(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                device_id TEXT NOT NULL,
+                device_name TEXT DEFAULT '',
+                platform TEXT DEFAULT '',
+                active INTEGER DEFAULT 1,
+                last_seen TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id,device_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS notifications(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                language TEXT DEFAULT 'fa',
+                type TEXT DEFAULT 'general',
+                read_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS agricultural_alerts(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                farm_id INTEGER,
+                alert_type TEXT NOT NULL,
+                severity TEXT DEFAULT 'info',
+                title TEXT NOT NULL,
+                body TEXT NOT NULL,
+                data_json TEXT DEFAULT '{}',
+                active INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_events(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                client_event_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                payload_json TEXT DEFAULT '{}',
+                status TEXT DEFAULT 'accepted',
+                created_at TEXT NOT NULL,
+                UNIQUE(user_id,client_event_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS backups(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_by INTEGER NOT NULL,
+                path TEXT NOT NULL,
+                sha256 TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS knowledge_items(
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                language TEXT DEFAULT 'fa',
+                source TEXT DEFAULT '',
+                version TEXT DEFAULT '1',
+                active INTEGER DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS external_providers(
+                key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                base_url TEXT DEFAULT '',
+                health_url TEXT DEFAULT '',
+                auth_env TEXT DEFAULT '',
+                enabled INTEGER DEFAULT 0,
+                required INTEGER DEFAULT 0,
+                notes TEXT DEFAULT '',
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_tokens_user
+                ON auth_tokens(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_tokens_hash
+                ON auth_tokens(token_hash);
+
+            CREATE INDEX IF NOT EXISTS idx_farms_user
+                ON farms(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_lands_farm
+                ON lands(farm_id);
+
+            CREATE INDEX IF NOT EXISTS idx_crops_land
+                ON crops(land_id);
+
+            CREATE INDEX IF NOT EXISTS idx_trees_land
+                ON trees(land_id);
+
+            CREATE INDEX IF NOT EXISTS idx_soil_land
+                ON soil_tests(land_id);
+
+            CREATE INDEX IF NOT EXISTS idx_water_land
+                ON water_tests(land_id);
+
+            CREATE INDEX IF NOT EXISTS idx_feedback_user
+                ON feedback(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_payments_user
+                ON payments(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_subscriptions_user
+                ON subscriptions(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_devices_user
+                ON devices(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_notifications_user
+                ON notifications(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_alerts_user
+                ON agricultural_alerts(user_id);
+
+            CREATE INDEX IF NOT EXISTS idx_ai_usage_user_date
+                ON ai_usage(user_id,usage_date);
             """
+        )
+
+        conn.execute(
+            """
+            INSERT INTO schema_meta(
+                key,
+                value
+            )
+            VALUES('version',?)
+            ON CONFLICT(key)
+            DO UPDATE SET
+                value=excluded.value
+            """,
+            (VERSION,),
         )
 
         conn.commit()
@@ -481,7 +992,9 @@ def init_db():
         conn.close()
 
 
-# ----------------------------- schemas -----------------------------
+# ============================================================
+# SCHEMAS
+# ============================================================
 
 class RegisterIn(BaseModel):
     email: EmailStr
@@ -582,7 +1095,9 @@ class SoilTestIn(BaseModel):
     boron: Optional[float] = None
     soil_texture: str = ""
     salinity: str = ""
-    raw: dict = Field(default_factory=dict)
+    raw: dict = Field(
+        default_factory=dict
+    )
 
 
 class WaterTestIn(BaseModel):
@@ -597,7 +1112,9 @@ class WaterTestIn(BaseModel):
     bicarbonate: Optional[float] = None
     boron: Optional[float] = None
     sar: Optional[float] = None
-    raw: dict = Field(default_factory=dict)
+    raw: dict = Field(
+        default_factory=dict
+    )
 
 
 class WeatherIn(BaseModel):
@@ -609,7 +1126,9 @@ class WeatherIn(BaseModel):
     rain_mm: Optional[float] = None
     wind_kmh: Optional[float] = None
     source: str = "manual"
-    raw: dict = Field(default_factory=dict)
+    raw: dict = Field(
+        default_factory=dict
+    )
 
 
 class LocationIn(BaseModel):
@@ -627,17 +1146,26 @@ class FeedbackIn(BaseModel):
     language: str = "fa"
 
 
+class FeedbackMessageIn(BaseModel):
+    text: str
+    language: str = "fa"
+
+
 class AIRequestIn(BaseModel):
     prompt: str
     language: str = "fa"
-    context: dict = Field(default_factory=dict)
+    context: dict = Field(
+        default_factory=dict
+    )
 
 
 class RecommendationIn(BaseModel):
     land_id: int
     crop_name: str = ""
     goal: str = ""
-    context: dict = Field(default_factory=dict)
+    context: dict = Field(
+        default_factory=dict
+    )
 
 
 class PaymentIn(BaseModel):
@@ -671,10 +1199,38 @@ class SettingIn(BaseModel):
 class SyncIn(BaseModel):
     client_event_id: str
     operation: str
-    payload: dict = Field(default_factory=dict)
+    payload: dict = Field(
+        default_factory=dict
+    )
 
 
-# ----------------------------- provider infrastructure -----------------------------
+class ProviderConfigIn(BaseModel):
+    base_url: str = ""
+    health_url: str = ""
+    enabled: bool = False
+    required: bool = False
+    notes: str = ""
+
+
+class DestinationIn(BaseModel):
+    method: str
+    currency: str
+    network: str = ""
+    destination: str
+
+
+class KnowledgeIn(BaseModel):
+    category: str
+    title: str
+    content: str
+    language: str = "fa"
+    source: str = ""
+    version: str = "1"
+
+
+# ============================================================
+# PROVIDERS
+# ============================================================
 
 PROVIDERS = [
     (
@@ -684,7 +1240,7 @@ PROVIDERS = [
         "",
         "",
         1,
-        "Current weather and forecast"
+        "Weather"
     ),
     (
         "openai",
@@ -693,7 +1249,7 @@ PROVIDERS = [
         "",
         "OPENAI_API_KEY",
         1,
-        "AI analysis and multimodal processing"
+        "AI"
     ),
     (
         "geocoding",
@@ -702,7 +1258,7 @@ PROVIDERS = [
         "",
         "ARYA_GEOCODING_API_KEY",
         0,
-        "Address and reverse geocoding"
+        "Geocoding"
     ),
     (
         "maps",
@@ -711,7 +1267,7 @@ PROVIDERS = [
         "",
         "ARYA_MAPS_API_KEY",
         0,
-        "Maps and spatial services"
+        "Maps"
     ),
     (
         "soil",
@@ -720,7 +1276,7 @@ PROVIDERS = [
         "",
         "ARYA_SOIL_API_KEY",
         0,
-        "Soil data"
+        "Soil"
     ),
     (
         "satellite",
@@ -729,7 +1285,7 @@ PROVIDERS = [
         "",
         "ARYA_SATELLITE_API_KEY",
         0,
-        "Satellite imagery and remote sensing"
+        "Satellite"
     ),
     (
         "et0",
@@ -738,7 +1294,7 @@ PROVIDERS = [
         "",
         "ARYA_ET0_API_KEY",
         0,
-        "Reference evapotranspiration"
+        "ET0"
     ),
     (
         "crop_knowledge",
@@ -747,7 +1303,7 @@ PROVIDERS = [
         "",
         "ARYA_CROP_KNOWLEDGE_API_KEY",
         0,
-        "Crop knowledge and suitability"
+        "Crop knowledge"
     ),
     (
         "pest_disease",
@@ -756,7 +1312,7 @@ PROVIDERS = [
         "",
         "ARYA_PEST_API_KEY",
         0,
-        "Pest and disease information"
+        "Pests"
     ),
     (
         "pesticide",
@@ -765,7 +1321,7 @@ PROVIDERS = [
         "",
         "ARYA_PESTICIDE_API_KEY",
         0,
-        "Pesticide database"
+        "Pesticides"
     ),
     (
         "fertilizer",
@@ -774,7 +1330,7 @@ PROVIDERS = [
         "",
         "ARYA_FERTILIZER_API_KEY",
         0,
-        "Fertilizer data"
+        "Fertilizers"
     ),
     (
         "market",
@@ -783,16 +1339,16 @@ PROVIDERS = [
         "",
         "ARYA_MARKET_API_KEY",
         0,
-        "Agricultural market data"
+        "Market"
     ),
     (
         "translation",
         "Translation Provider",
-        "",
+        TRANSLATION_API_URL,
         "",
         "ARYA_TRANSLATION_API_KEY",
         0,
-        "Multilingual translation"
+        "Translation"
     ),
     (
         "email",
@@ -801,7 +1357,7 @@ PROVIDERS = [
         "",
         "ARYA_EMAIL_API_KEY",
         0,
-        "Transactional email"
+        "Email"
     ),
     (
         "sms",
@@ -810,7 +1366,7 @@ PROVIDERS = [
         "",
         "ARYA_SMS_API_KEY",
         0,
-        "SMS notifications"
+        "SMS"
     ),
     (
         "push",
@@ -819,7 +1375,7 @@ PROVIDERS = [
         "",
         "ARYA_PUSH_API_KEY",
         0,
-        "Push notifications"
+        "Push"
     ),
     (
         "blockchain",
@@ -828,7 +1384,7 @@ PROVIDERS = [
         "",
         "ARYA_BLOCKCHAIN_API_KEY",
         0,
-        "USDT payment verification"
+        "USDT verification"
     ),
     (
         "bank",
@@ -837,42 +1393,49 @@ PROVIDERS = [
         "",
         "ARYA_BANK_API_KEY",
         0,
-        "Bank transfer verification"
+        "Bank verification"
     ),
 ]
 
-PROVIDER_KEYS = {x[0] for x in PROVIDERS}
+PROVIDER_KEYS = {
+    item[0]
+    for item in PROVIDERS
+}
 
 
 def init_providers():
     conn = db()
 
     try:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS external_providers(
-                key TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                base_url TEXT DEFAULT '',
-                health_url TEXT DEFAULT '',
-                auth_env TEXT DEFAULT '',
-                enabled INTEGER DEFAULT 0,
-                required INTEGER DEFAULT 0,
-                notes TEXT DEFAULT '',
-                updated_at TEXT NOT NULL
-            )
-            """
-        )
+        for (
+            key,
+            name,
+            base,
+            health,
+            auth,
+            required,
+            notes,
+        ) in PROVIDERS:
 
-        for key, name, base, health, auth, required, notes in PROVIDERS:
             conn.execute(
                 """
                 INSERT INTO external_providers(
-                    key,name,base_url,health_url,
-                    auth_env,enabled,required,notes,updated_at
+                    key,
+                    name,
+                    base_url,
+                    health_url,
+                    auth_env,
+                    enabled,
+                    required,
+                    notes,
+                    updated_at
                 )
                 VALUES(?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(key) DO NOTHING
+                ON CONFLICT(key)
+                DO UPDATE SET
+                    name=excluded.name,
+                    auth_env=excluded.auth_env,
+                    required=excluded.required
                 """,
                 (
                     key,
@@ -887,23 +1450,15 @@ def init_providers():
                 ),
             )
 
-        conn.execute(
-            """
-            INSERT INTO schema_meta(key,value)
-            VALUES('version',?)
-            ON CONFLICT(key)
-            DO UPDATE SET value=excluded.value
-            """,
-            (VERSION,),
-        )
-
         conn.commit()
 
     finally:
         conn.close()
 
 
-def provider_row(key: str):
+def provider_row(
+    key: str,
+):
     return q(
         """
         SELECT *
@@ -915,7 +1470,9 @@ def provider_row(key: str):
     )
 
 
-def provider_enabled(key: str) -> bool:
+def provider_enabled(
+    key: str,
+) -> bool:
     row = provider_row(key)
 
     return bool(
@@ -925,21 +1482,30 @@ def provider_enabled(key: str) -> bool:
     )
 
 
-def provider_headers(key: str):
+def provider_headers(
+    key: str,
+):
     row = provider_row(key)
 
     if not row:
         return {}
 
     env = row["auth_env"] or ""
-    secret = os.getenv(env, "") if env else ""
+
+    secret = (
+        os.getenv(env, "")
+        if env
+        else ""
+    )
 
     if not secret:
         return {}
 
     return {
-        "Authorization": f"Bearer {secret}",
-        "X-API-Key": secret,
+        "Authorization":
+            f"Bearer {secret}",
+        "X-API-Key":
+            secret,
     }
 
 
@@ -955,24 +1521,30 @@ def provider_request(
     if not row:
         raise HTTPException(
             404,
-            f"provider not found: {key}",
+            "provider not found",
         )
 
     if not row["enabled"]:
         raise HTTPException(
             503,
-            f"provider disabled: {key}",
+            "provider disabled",
         )
 
-    base = (row["base_url"] or "").rstrip("/")
+    base = (
+        row["base_url"] or ""
+    ).rstrip("/")
 
     if not base:
         raise HTTPException(
             503,
-            f"provider not configured: {key}",
+            "provider not configured",
         )
 
-    url = base + "/" + path.lstrip("/")
+    url = (
+        base
+        + "/"
+        + path.lstrip("/")
+    )
 
     try:
         response = requests.request(
@@ -980,7 +1552,9 @@ def provider_request(
             url,
             params=params,
             json=json_body,
-            headers=provider_headers(key),
+            headers=provider_headers(
+                key
+            ),
             timeout=WEATHER_TIMEOUT,
         )
 
@@ -996,11 +1570,13 @@ def provider_request(
     except requests.RequestException as exc:
         raise HTTPException(
             502,
-            f"provider request failed: {key}: {exc}",
+            f"provider request failed: {exc}",
         )
 
 
-def provider_status(key: str):
+def provider_status(
+    key: str,
+):
     row = provider_row(key)
 
     if not row:
@@ -1008,39 +1584,45 @@ def provider_status(key: str):
             "key": key,
             "configured": False,
             "healthy": False,
-            "reason": "provider not found",
         }
 
     if not row["enabled"]:
         return {
             "key": key,
-            "configured": bool(row["base_url"]),
-            "healthy": None,
+            "configured": bool(
+                row["base_url"]
+            ),
             "enabled": False,
+            "healthy": None,
         }
 
-    url = row["health_url"] or row["base_url"]
+    url = (
+        row["health_url"]
+        or row["base_url"]
+    )
 
     if not url:
         return {
             "key": key,
             "configured": False,
             "healthy": False,
-            "reason": "no URL configured",
         }
 
     try:
-        r = requests.get(
+        response = requests.get(
             url,
-            headers=provider_headers(key),
+            headers=provider_headers(
+                key
+            ),
             timeout=10,
         )
 
         return {
             "key": key,
             "configured": True,
-            "healthy": r.ok,
-            "status_code": r.status_code,
+            "healthy": response.ok,
+            "status_code":
+                response.status_code,
         }
 
     except requests.RequestException as exc:
@@ -1052,10 +1634,14 @@ def provider_status(key: str):
         }
 
 
-# ----------------------------- authentication -----------------------------
+# ============================================================
+# AUTH
+# ============================================================
 
-def create_token(user_id: int):
-    token = secrets.token_urlsafe(48)
+def create_token(
+    user_id: int,
+):
+    raw = secrets.token_urlsafe(48)
 
     expires = (
         datetime.now(timezone.utc)
@@ -1075,14 +1661,14 @@ def create_token(user_id: int):
         """,
         (
             user_id,
-            token_hash(token),
+            token_hash(raw),
             expires,
             0,
             now_iso(),
         ),
     )
 
-    return token, expires
+    return raw, expires
 
 
 def current_user(
@@ -1094,9 +1680,11 @@ def current_user(
             "authorization required",
         )
 
-    token = authorization
+    token = authorization.strip()
 
-    if token.lower().startswith("bearer "):
+    if token.lower().startswith(
+        "bearer "
+    ):
         token = token[7:].strip()
 
     row = q(
@@ -1111,7 +1699,9 @@ def current_user(
           AND t.revoked=0
           AND u.active=1
         """,
-        (token_hash(token),),
+        (
+            token_hash(token),
+        ),
         one=True,
     )
 
@@ -1122,11 +1712,13 @@ def current_user(
         )
 
     try:
-        exp = datetime.fromisoformat(
+        expires = datetime.fromisoformat(
             row["token_expires"]
         )
 
-        if exp < datetime.now(timezone.utc):
+        if expires < datetime.now(
+            timezone.utc
+        ):
             raise HTTPException(
                 401,
                 "token expired",
@@ -1141,18 +1733,14 @@ def current_user(
     return row
 
 
-def require_owner(user):
-    if user["role"] != "owner":
-        raise HTTPException(
-            403,
-            "owner access required",
-        )
-
-
-# ----------------------------- auth endpoints -----------------------------
+# ============================================================
+# AUTH ROUTES
+# ============================================================
 
 @app.post("/auth/register")
-def register(x: RegisterIn):
+def register(
+    x: RegisterIn,
+):
     email = norm_email(x.email)
 
     if q(
@@ -1167,7 +1755,7 @@ def register(x: RegisterIn):
 
     created = now_iso()
 
-    uid = q(
+    user_id = q(
         """
         INSERT INTO users(
             email,
@@ -1198,29 +1786,31 @@ def register(x: RegisterIn):
     )
 
     audit(
-        uid,
+        user_id,
         "register",
         "users",
-        uid,
+        user_id,
     )
 
     return {
         "ok": True,
-        "user_id": uid,
+        "user_id": user_id,
     }
 
 
 @app.post("/auth/login")
-def login(x: LoginIn):
-    email = norm_email(x.email)
-
+def login(
+    x: LoginIn,
+):
     user = q(
         """
         SELECT *
         FROM users
         WHERE email=?
         """,
-        (email,),
+        (
+            norm_email(x.email),
+        ),
         one=True,
     )
 
@@ -1284,11 +1874,15 @@ def login(x: LoginIn):
 def logout(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
-    token = authorization
+    token = authorization.strip()
 
-    if token.lower().startswith("bearer "):
+    if token.lower().startswith(
+        "bearer "
+    ):
         token = token[7:].strip()
 
     q(
@@ -1297,7 +1891,9 @@ def logout(
         SET revoked=1
         WHERE token_hash=?
         """,
-        (token_hash(token),),
+        (
+            token_hash(token),
+        ),
     )
 
     audit(
@@ -1306,16 +1902,16 @@ def logout(
         "auth_tokens",
     )
 
-    return {
-        "ok": True
-    }
+    return {"ok": True}
 
 
 @app.get("/auth/me")
 def me(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     return {
         "id": user["id"],
@@ -1325,38 +1921,41 @@ def me(
         "country": user["country"],
         "language": user["language"],
         "role": user["role"],
-        "mfa_enabled": bool(
-            user["mfa_enabled"]
-        ),
+        "mfa_enabled":
+            bool(user["mfa_enabled"]),
     }
 
 
-@app.post("/auth/password-reset/request")
+@app.post(
+    "/auth/password-reset/request"
+)
 def password_reset_request(
     x: PasswordResetRequestIn,
 ):
-    email = norm_email(x.email)
-
     user = q(
         """
         SELECT *
         FROM users
         WHERE email=?
         """,
-        (email,),
+        (
+            norm_email(x.email),
+        ),
         one=True,
     )
 
-    # Do not disclose whether account exists.
     result = {
         "ok": True,
-        "message": "If the account exists, reset instructions will be sent."
+        "message":
+            "If the account exists, "
+            "reset instructions will be sent.",
     }
 
     if not user:
         return result
 
     raw = secrets.token_urlsafe(48)
+
     expires = (
         datetime.now(timezone.utc)
         + timedelta(hours=RESET_HOURS)
@@ -1382,8 +1981,6 @@ def password_reset_request(
         ),
     )
 
-    # Development/owner-controlled optional return.
-    # Production should deliver through an approved provider.
     if os.getenv(
         "ARYA_RESET_RETURN_TOKEN",
         "0",
@@ -1393,7 +1990,9 @@ def password_reset_request(
     return result
 
 
-@app.post("/auth/password-reset/confirm")
+@app.post(
+    "/auth/password-reset/confirm"
+)
 def password_reset_confirm(
     x: PasswordResetConfirmIn,
 ):
@@ -1404,7 +2003,9 @@ def password_reset_confirm(
         WHERE token_hash=?
           AND used=0
         """,
-        (token_hash(x.token),),
+        (
+            token_hash(x.token),
+        ),
         one=True,
     )
 
@@ -1415,16 +2016,15 @@ def password_reset_confirm(
         )
 
     try:
-        exp = datetime.fromisoformat(
+        if datetime.fromisoformat(
             row["expires_at"]
-        )
-
-        if exp < datetime.now(timezone.utc):
+        ) < datetime.now(
+            timezone.utc
+        ):
             raise HTTPException(
                 400,
                 "reset token expired",
             )
-
     except ValueError:
         raise HTTPException(
             400,
@@ -1472,19 +2072,21 @@ def password_reset_confirm(
         row["user_id"],
     )
 
-    return {
-        "ok": True
-    }
+    return {"ok": True}
 
 
-# ----------------------------- owner bootstrap / MFA -----------------------------
+# ============================================================
+# OWNER / MFA
+# ============================================================
 
 @app.post("/owner/bootstrap")
 def owner_bootstrap(
     x: OwnerBootstrapIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     if not OWNER_BOOTSTRAP_SECRET:
         raise HTTPException(
@@ -1556,7 +2158,10 @@ def owner_bootstrap(
 def owner_mfa_setup(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
+
     require_owner(user)
 
     secret = user["mfa_secret"]
@@ -1592,14 +2197,11 @@ def owner_mfa_enable(
     x: MFAEnableIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    user = current_user(
+        authorization
+    )
 
-    if not user["mfa_secret"]:
-        raise HTTPException(
-            400,
-            "run mfa setup first",
-        )
+    require_owner(user)
 
     if not verify_totp(
         user["mfa_secret"],
@@ -1641,7 +2243,10 @@ def owner_mfa_disable(
     x: MFAEnableIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
+
     require_owner(user)
 
     if not verify_totp(
@@ -1666,34 +2271,31 @@ def owner_mfa_disable(
         ),
     )
 
-    audit(
-        user["id"],
-        "mfa_disable",
-        "users",
-        user["id"],
-    )
-
     return {
         "ok": True,
         "mfa_enabled": False,
     }
 
 
-# ----------------------------- farms / lands -----------------------------
+# ============================================================
+# FARM / LAND / CROP / TREE
+# ============================================================
 
 @app.post("/farms")
 def create_farm(
     x: FarmIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     validate_coords(
         x.latitude,
         x.longitude,
     )
 
-    fid = q(
+    farm_id = q(
         """
         INSERT INTO farms(
             user_id,
@@ -1733,12 +2335,12 @@ def create_farm(
         user["id"],
         "farm_create",
         "farms",
-        fid,
+        farm_id,
     )
 
     return q(
         "SELECT * FROM farms WHERE id=?",
-        (fid,),
+        (farm_id,),
         one=True,
     )
 
@@ -1747,7 +2349,9 @@ def create_farm(
 def list_farms(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     return q(
         """
@@ -1766,7 +2370,9 @@ def get_farm(
     farm_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     row = q(
         """
@@ -1796,11 +2402,13 @@ def create_land(
     x: LandIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     farm = q(
         """
-        SELECT *
+        SELECT id
         FROM farms
         WHERE id=?
           AND user_id=?
@@ -1823,7 +2431,7 @@ def create_land(
         x.longitude,
     )
 
-    lid = q(
+    land_id = q(
         """
         INSERT INTO lands(
             farm_id,
@@ -1855,16 +2463,9 @@ def create_land(
         ),
     )
 
-    audit(
-        user["id"],
-        "land_create",
-        "lands",
-        lid,
-    )
-
     return q(
         "SELECT * FROM lands WHERE id=?",
-        (lid,),
+        (land_id,),
         one=True,
     )
 
@@ -1874,7 +2475,9 @@ def list_lands(
     farm_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     if not q(
         """
@@ -1911,11 +2514,13 @@ def create_crop(
     x: CropIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
-    land = q(
+    if not q(
         """
-        SELECT l.*
+        SELECT l.id
         FROM lands l
         JOIN farms f
             ON f.id=l.farm_id
@@ -1927,15 +2532,13 @@ def create_crop(
             user["id"],
         ),
         one=True,
-    )
-
-    if not land:
+    ):
         raise HTTPException(
             404,
             "land not found",
         )
 
-    cid = q(
+    crop_id = q(
         """
         INSERT INTO crops(
             land_id,
@@ -1971,16 +2574,9 @@ def create_crop(
         ),
     )
 
-    audit(
-        user["id"],
-        "crop_create",
-        "crops",
-        cid,
-    )
-
     return q(
         "SELECT * FROM crops WHERE id=?",
-        (cid,),
+        (crop_id,),
         one=True,
     )
 
@@ -1990,7 +2586,9 @@ def list_crops(
     land_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     return q(
         """
@@ -2017,11 +2615,13 @@ def create_tree(
     x: TreeIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
-    land = q(
+    if not q(
         """
-        SELECT l.*
+        SELECT l.id
         FROM lands l
         JOIN farms f
             ON f.id=l.farm_id
@@ -2033,15 +2633,13 @@ def create_tree(
             user["id"],
         ),
         one=True,
-    )
-
-    if not land:
+    ):
         raise HTTPException(
             404,
             "land not found",
         )
 
-    tid = q(
+    tree_id = q(
         """
         INSERT INTO trees(
             land_id,
@@ -2071,16 +2669,9 @@ def create_tree(
         ),
     )
 
-    audit(
-        user["id"],
-        "tree_create",
-        "trees",
-        tid,
-    )
-
     return q(
         "SELECT * FROM trees WHERE id=?",
-        (tid,),
+        (tree_id,),
         one=True,
     )
 
@@ -2090,7 +2681,9 @@ def list_trees(
     land_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     return q(
         """
@@ -2112,18 +2705,22 @@ def list_trees(
     )
 
 
-# ----------------------------- soil / water -----------------------------
+# ============================================================
+# SOIL / WATER
+# ============================================================
 
 @app.post("/soil/tests")
 def create_soil_test(
     x: SoilTestIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
-    land = q(
+    if not q(
         """
-        SELECT l.*
+        SELECT l.id
         FROM lands l
         JOIN farms f
             ON f.id=l.farm_id
@@ -2135,17 +2732,15 @@ def create_soil_test(
             user["id"],
         ),
         one=True,
-    )
-
-    if not land:
+    ):
         raise HTTPException(
             404,
             "land not found",
         )
 
-    validate_pH(x.ph)
+    validate_ph(x.ph)
 
-    sid = q(
+    test_id = q(
         """
         INSERT INTO soil_tests(
             land_id,
@@ -2191,16 +2786,9 @@ def create_soil_test(
         ),
     )
 
-    audit(
-        user["id"],
-        "soil_test_create",
-        "soil_tests",
-        sid,
-    )
-
     return q(
         "SELECT * FROM soil_tests WHERE id=?",
-        (sid,),
+        (test_id,),
         one=True,
     )
 
@@ -2210,7 +2798,9 @@ def list_soil_tests(
     land_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     return q(
         """
@@ -2237,11 +2827,13 @@ def create_water_test(
     x: WaterTestIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
-    land = q(
+    if not q(
         """
-        SELECT l.*
+        SELECT l.id
         FROM lands l
         JOIN farms f
             ON f.id=l.farm_id
@@ -2253,17 +2845,15 @@ def create_water_test(
             user["id"],
         ),
         one=True,
-    )
-
-    if not land:
+    ):
         raise HTTPException(
             404,
             "land not found",
         )
 
-    validate_pH(x.ph)
+    validate_ph(x.ph)
 
-    wid = q(
+    test_id = q(
         """
         INSERT INTO water_tests(
             land_id,
@@ -2299,16 +2889,9 @@ def create_water_test(
         ),
     )
 
-    audit(
-        user["id"],
-        "water_test_create",
-        "water_tests",
-        wid,
-    )
-
     return q(
         "SELECT * FROM water_tests WHERE id=?",
-        (wid,),
+        (test_id,),
         one=True,
     )
 
@@ -2318,7 +2901,9 @@ def list_water_tests(
     land_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     return q(
         """
@@ -2340,7 +2925,9 @@ def list_water_tests(
     )
 
 
-# ----------------------------- weather -----------------------------
+# ============================================================
+# WEATHER / LOCATION
+# ============================================================
 
 @app.get("/weather/current")
 def weather_current(
@@ -2348,7 +2935,9 @@ def weather_current(
     longitude: float,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    current_user(
+        authorization
+    )
 
     validate_coords(
         latitude,
@@ -2368,20 +2957,18 @@ def weather_current(
     }
 
     try:
-        r = requests.get(
+        response = requests.get(
             "https://api.open-meteo.com/v1/forecast",
             params=params,
             timeout=WEATHER_TIMEOUT,
         )
 
-        r.raise_for_status()
-
-        data = r.json()
+        response.raise_for_status()
 
         return {
             "verified": True,
             "provider": "open-meteo",
-            "data": data,
+            "data": response.json(),
         }
 
     except requests.RequestException as exc:
@@ -2399,7 +2986,9 @@ def weather_forecast(
     days: int = 7,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    current_user(
+        authorization
+    )
 
     validate_coords(
         latitude,
@@ -2411,32 +3000,30 @@ def weather_forecast(
         min(days, 16),
     )
 
-    params = {
-        "latitude": latitude,
-        "longitude": longitude,
-        "forecast_days": days,
-        "daily": (
-            "temperature_2m_max,"
-            "temperature_2m_min,"
-            "precipitation_sum,"
-            "wind_speed_10m_max"
-        ),
-        "timezone": "auto",
-    }
-
     try:
-        r = requests.get(
+        response = requests.get(
             "https://api.open-meteo.com/v1/forecast",
-            params=params,
+            params={
+                "latitude": latitude,
+                "longitude": longitude,
+                "forecast_days": days,
+                "daily": (
+                    "temperature_2m_max,"
+                    "temperature_2m_min,"
+                    "precipitation_sum,"
+                    "wind_speed_10m_max"
+                ),
+                "timezone": "auto",
+            },
             timeout=WEATHER_TIMEOUT,
         )
 
-        r.raise_for_status()
+        response.raise_for_status()
 
         return {
             "verified": True,
             "provider": "open-meteo",
-            "data": r.json(),
+            "data": response.json(),
         }
 
     except requests.RequestException as exc:
@@ -2452,7 +3039,9 @@ def weather_observation(
     x: WeatherIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     validate_coords(
         x.latitude,
@@ -2502,14 +3091,14 @@ def weather_observation(
     )
 
 
-# ----------------------------- location -----------------------------
-
 @app.post("/location")
 def create_location(
     x: LocationIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    user = current_user(
+        authorization
+    )
 
     validate_coords(
         x.latitude,
@@ -2555,13 +3144,1662 @@ def create_location(
     )
 
 
-# ----------------------------- provider management / health -----------------------------
+@app.get("/location/reverse")
+def reverse_geocode(
+    lat: float,
+    lon: float,
+    authorization: Optional[str] = Header(None),
+):
+    current_user(
+        authorization
+    )
+
+    validate_coords(
+        lat,
+        lon,
+    )
+
+    if not provider_enabled(
+        "geocoding"
+    ):
+        return {
+            "status": "unavailable",
+            "verified": False,
+            "latitude": lat,
+            "longitude": lon,
+            "reason":
+                "No approved geocoding provider configured.",
+        }
+
+    return {
+        "status": "ok",
+        "verified": True,
+        "provider": "geocoding",
+        "data": provider_request(
+            "geocoding",
+            "reverse",
+            {
+                "lat": lat,
+                "lon": lon,
+            },
+        ),
+    }
+
+
+# ============================================================
+# AI
+# ============================================================
+
+def ai_daily_count(
+    user_id: int,
+) -> int:
+    row = q(
+        """
+        SELECT COALESCE(
+            SUM(requests),
+            0
+        ) n
+        FROM ai_usage
+        WHERE user_id=?
+          AND usage_date=?
+        """,
+        (
+            user_id,
+            today(),
+        ),
+        one=True,
+    )
+
+    return int(row["n"])
+
+
+def record_ai_usage(
+    user_id: int,
+    tokens: int = 0,
+):
+    q(
+        """
+        INSERT INTO ai_usage(
+            user_id,
+            usage_date,
+            tokens,
+            requests,
+            created_at
+        )
+        VALUES(?,?,?,?,?)
+        """,
+        (
+            user_id,
+            today(),
+            tokens,
+            1,
+            now_iso(),
+        ),
+    )
+
+
+def openai_chat(
+    prompt: str,
+    context: dict,
+    language: str,
+):
+    if not OPENAI_API_KEY:
+        return None
+
+    url = (
+        OPENAI_BASE_URL
+        + "/chat/completions"
+    )
+
+    system = """
+You are ARYA AgriDoctor, a specialist
+agricultural decision-support assistant.
+
+Use supplied data first.
+Do not invent weather, pesticide doses,
+fertilizer rates, market prices, diagnoses,
+laboratory values or guaranteed yields.
+
+If reliable data is missing, explicitly say
+what is missing.
+
+Distinguish:
+1. verified data
+2. user-provided data
+3. inference
+4. recommendation.
+
+Never guarantee agricultural outcomes.
+"""
+
+    body = {
+        "model": OPENAI_MODEL,
+        "messages": [
+            {
+                "role": "system",
+                "content": system,
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Language: {language}\n"
+                    f"Context:\n{jdump(context)}\n\n"
+                    f"Question:\n{prompt}"
+                ),
+            },
+        ],
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers={
+                "Authorization":
+                    f"Bearer {OPENAI_API_KEY}",
+                "Content-Type":
+                    "application/json",
+            },
+            json=body,
+            timeout=60,
+        )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        choices = data.get(
+            "choices",
+            [],
+        )
+
+        if not choices:
+            return None
+
+        content = (
+            choices[0]
+            .get("message", {})
+            .get("content", "")
+        )
+
+        usage = data.get(
+            "usage",
+            {},
+        )
+
+        return {
+            "text": content,
+            "usage": usage,
+            "provider": "openai",
+            "verified": True,
+        }
+
+    except requests.RequestException:
+        return None
+
+
+def local_ai_fallback(
+    prompt: str,
+    context: dict,
+    language: str,
+):
+    return {
+        "text":
+            "برای ارائه پاسخ تخصصی و قابل اتکا، "
+            "داده معتبر کافی در دسترس نیست. "
+            "لطفاً اطلاعات مزرعه، محصول، خاک، آب، "
+            "موقعیت و شرایط فعلی را تکمیل کنید.",
+        "provider": "local-safe-fallback",
+        "verified": False,
+        "language": language,
+    }
+
+
+@app.post("/ai/analyze")
+def ai_analyze(
+    x: AIRequestIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    if ai_daily_count(
+        user["id"]
+    ) >= DAILY_AI_LIMIT:
+        raise HTTPException(
+            429,
+            "daily AI limit reached",
+        )
+
+    result = openai_chat(
+        x.prompt,
+        x.context,
+        x.language,
+    )
+
+    if result is None:
+        result = local_ai_fallback(
+            x.prompt,
+            x.context,
+            x.language,
+        )
+
+    tokens = int(
+        result.get(
+            "usage",
+            {},
+        ).get(
+            "total_tokens",
+            0,
+        )
+        if isinstance(
+            result.get(
+                "usage",
+                {},
+            ),
+            dict,
+        )
+        else 0
+    )
+
+    record_ai_usage(
+        user["id"],
+        tokens,
+    )
+
+    request_id = q(
+        """
+        INSERT INTO ai_requests(
+            user_id,
+            prompt,
+            language,
+            context_json,
+            response_json,
+            provider,
+            verified,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?,?)
+        """,
+        (
+            user["id"],
+            x.prompt,
+            x.language,
+            jdump(x.context),
+            jdump(result),
+            result.get(
+                "provider",
+                "",
+            ),
+            int(
+                bool(
+                    result.get(
+                        "verified",
+                        False,
+                    )
+                )
+            ),
+            now_iso(),
+        ),
+    )
+
+    audit(
+        user["id"],
+        "ai_analyze",
+        "ai_requests",
+        request_id,
+    )
+
+    return {
+        "id": request_id,
+        **result,
+    }
+
+
+@app.post("/recommendations")
+def recommendation(
+    x: RecommendationIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    land = q(
+        """
+        SELECT
+            l.*,
+            f.name AS farm_name,
+            f.region,
+            f.country,
+            f.latitude AS farm_latitude,
+            f.longitude AS farm_longitude,
+            f.climate_type
+        FROM lands l
+        JOIN farms f
+            ON f.id=l.farm_id
+        WHERE l.id=?
+          AND f.user_id=?
+        """,
+        (
+            x.land_id,
+            user["id"],
+        ),
+        one=True,
+    )
+
+    if not land:
+        raise HTTPException(
+            404,
+            "land not found",
+        )
+
+    context = {
+        "land": land,
+        "crop_name": x.crop_name,
+        "goal": x.goal,
+        **x.context,
+    }
+
+    prompt = (
+        "بر اساس اطلاعات مزرعه، "
+        "زمین، خاک، آب و محصول، "
+        "یک تحلیل کشاورزی محافظه‌کارانه ارائه کن."
+    )
+
+    result = openai_chat(
+        prompt,
+        context,
+        user["language"],
+    )
+
+    if result is None:
+        result = local_ai_fallback(
+            prompt,
+            context,
+            user["language"],
+        )
+
+    return {
+        "verified": result.get(
+            "verified",
+            False,
+        ),
+        "provider": result.get(
+            "provider"
+        ),
+        "recommendation":
+            result.get("text"),
+        "warning":
+            "این پاسخ توصیه تصمیم‌یار است و تضمین نتیجه نیست.",
+    }
+
+
+# ============================================================
+# MEDIA
+# ============================================================
+
+@app.post("/media/upload")
+async def media_upload(
+    kind: str = Query(
+        "image"
+    ),
+    file: UploadFile = File(...),
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    if kind not in (
+        "image",
+        "voice",
+        "document",
+    ):
+        raise HTTPException(
+            400,
+            "invalid media kind",
+        )
+
+    data = await file.read()
+
+    max_bytes = (
+        MAX_UPLOAD_MB
+        * 1024
+        * 1024
+    )
+
+    if len(data) > max_bytes:
+        raise HTTPException(
+            413,
+            "file too large",
+        )
+
+    digest = sha256_bytes(data)
+
+    stored = (
+        f"{uuid.uuid4().hex}_"
+        f"{safe_filename(file.filename)}"
+    )
+
+    path = MEDIA_DIR / stored
+
+    path.write_bytes(data)
+
+    media_id = q(
+        """
+        INSERT INTO media_files(
+            user_id,
+            kind,
+            original_name,
+            stored_name,
+            mime_type,
+            size_bytes,
+            sha256,
+            status,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            user["id"],
+            kind,
+            file.filename or "",
+            stored,
+            file.content_type or "",
+            len(data),
+            digest,
+            "stored",
+            now_iso(),
+        ),
+    )
+
+    return {
+        "id": media_id,
+        "kind": kind,
+        "size_bytes": len(data),
+        "sha256": digest,
+        "status": "stored",
+        "analysis": {
+            "verified": False,
+            "message":
+                "File stored. No diagnosis was invented.",
+        },
+    }
+
+
+@app.get("/media")
+def list_media(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    return q(
+        """
+        SELECT
+            id,
+            kind,
+            original_name,
+            mime_type,
+            size_bytes,
+            sha256,
+            status,
+            analysis_json,
+            created_at
+        FROM media_files
+        WHERE user_id=?
+        ORDER BY id DESC
+        """,
+        (
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+# ============================================================
+# FEEDBACK / SUPPORT
+# ============================================================
+
+@app.post("/feedback")
+def create_feedback(
+    x: FeedbackIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    fid = q(
+        """
+        INSERT INTO feedback(
+            user_id,
+            subject,
+            text,
+            language,
+            status,
+            created_at,
+            updated_at
+        )
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (
+            user["id"],
+            x.subject,
+            x.text,
+            x.language,
+            "open",
+            now_iso(),
+            now_iso(),
+        ),
+    )
+
+    q(
+        """
+        INSERT INTO feedback_messages(
+            feedback_id,
+            sender_user_id,
+            sender_role,
+            language,
+            text,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?)
+        """,
+        (
+            fid,
+            user["id"],
+            user["role"],
+            x.language,
+            x.text,
+            now_iso(),
+        ),
+    )
+
+    audit(
+        user["id"],
+        "feedback_create",
+        "feedback",
+        fid,
+    )
+
+    return q(
+        "SELECT * FROM feedback WHERE id=?",
+        (fid,),
+        one=True,
+    )
+
+
+@app.get("/feedback")
+def list_feedback(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    if user["role"] == "owner":
+        return q(
+            """
+            SELECT *
+            FROM feedback
+            ORDER BY id DESC
+            """,
+            many=True,
+        )
+
+    return q(
+        """
+        SELECT *
+        FROM feedback
+        WHERE user_id=?
+        ORDER BY id DESC
+        """,
+        (
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+@app.post(
+    "/feedback/{feedback_id}/messages"
+)
+def feedback_message(
+    feedback_id: int,
+    x: FeedbackMessageIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    feedback = q(
+        """
+        SELECT *
+        FROM feedback
+        WHERE id=?
+        """,
+        (feedback_id,),
+        one=True,
+    )
+
+    if not feedback:
+        raise HTTPException(
+            404,
+            "feedback not found",
+        )
+
+    if (
+        user["role"] != "owner"
+        and feedback["user_id"]
+        != user["id"]
+    ):
+        raise HTTPException(
+            403,
+            "access denied",
+        )
+
+    role = (
+        "owner"
+        if user["role"] == "owner"
+        else "user"
+    )
+
+    mid = q(
+        """
+        INSERT INTO feedback_messages(
+            feedback_id,
+            sender_user_id,
+            sender_role,
+            language,
+            text,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?)
+        """,
+        (
+            feedback_id,
+            user["id"],
+            role,
+            x.language,
+            x.text,
+            now_iso(),
+        ),
+    )
+
+    q(
+        """
+        UPDATE feedback
+        SET updated_at=?,
+            status=?
+        WHERE id=?
+        """,
+        (
+            now_iso(),
+            "answered"
+            if role == "owner"
+            else "open",
+            feedback_id,
+        ),
+    )
+
+    return q(
+        """
+        SELECT *
+        FROM feedback_messages
+        WHERE id=?
+        """,
+        (mid,),
+        one=True,
+    )
+
+
+# ============================================================
+# PAYMENTS / PRICING
+# ============================================================
+
+def pricing_for(
+    country: str,
+    user_number: int,
+):
+    if (
+        country or ""
+    ).strip().lower() in (
+        "iran",
+        "ir",
+        "ایران",
+    ):
+        if user_number <= 100:
+            return 500000, "IRR"
+        if user_number <= 600:
+            return 800000, "IRR"
+        return 1200000, "IRR"
+
+    if user_number <= 100:
+        return 10, "USDT"
+
+    if user_number <= 600:
+        return 15, "USDT"
+
+    return 20, "USDT"
+
+
+@app.get("/pricing")
+def pricing(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    count_row = q(
+        """
+        SELECT COUNT(*) n
+        FROM users
+        WHERE role='user'
+        """,
+        one=True,
+    )
+
+    number = int(
+        count_row["n"]
+    )
+
+    amount, currency = pricing_for(
+        user["country"],
+        number,
+    )
+
+    return {
+        "user_number": number,
+        "amount": amount,
+        "currency": currency,
+        "iran_method": "bank_transfer",
+        "international_method": "USDT",
+    }
+
+
+@app.post("/payments")
+def create_payment(
+    x: PaymentIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    method = x.method.lower()
+    currency = x.currency.upper()
+
+    if method == "bank_transfer":
+        if user["country"].lower() not in (
+            "iran",
+            "ir",
+            "ایران",
+        ):
+            raise HTTPException(
+                400,
+                "bank transfer is restricted to Iran",
+            )
+
+    if method == "usdt":
+        if currency != "USDT":
+            raise HTTPException(
+                400,
+                "USDT payment requires USDT currency",
+            )
+
+    if method not in (
+        "bank_transfer",
+        "usdt",
+    ):
+        raise HTTPException(
+            400,
+            "unsupported payment method",
+        )
+
+    destination = q(
+        """
+        SELECT *
+        FROM payment_destinations
+        WHERE method=?
+          AND currency=?
+          AND active=1
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        (
+            method,
+            currency,
+        ),
+        one=True,
+    )
+
+    pid = q(
+        """
+        INSERT INTO payments(
+            user_id,
+            amount,
+            currency,
+            method,
+            reference,
+            note,
+            status,
+            destination,
+            network,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            user["id"],
+            x.amount,
+            currency,
+            method,
+            x.reference,
+            x.note,
+            "pending",
+            destination[
+                "destination"
+            ]
+            if destination
+            else "",
+            destination[
+                "network"
+            ]
+            if destination
+            else "",
+            now_iso(),
+        ),
+    )
+
+    return q(
+        "SELECT * FROM payments WHERE id=?",
+        (pid,),
+        one=True,
+    )
+
+
+@app.get("/payments")
+def list_payments(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    if user["role"] == "owner":
+        return q(
+            """
+            SELECT *
+            FROM payments
+            ORDER BY id DESC
+            """,
+            many=True,
+        )
+
+    return q(
+        """
+        SELECT *
+        FROM payments
+        WHERE user_id=?
+        ORDER BY id DESC
+        """,
+        (
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+@app.post(
+    "/owner/payments/{payment_id}/approve"
+)
+def approve_payment(
+    payment_id: int,
+    x: PaymentDecisionIn,
+    authorization: Optional[str] = Header(None),
+):
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
+
+    payment = q(
+        """
+        SELECT *
+        FROM payments
+        WHERE id=?
+        """,
+        (payment_id,),
+        one=True,
+    )
+
+    if not payment:
+        raise HTTPException(
+            404,
+            "payment not found",
+        )
+
+    q(
+        """
+        UPDATE payments
+        SET status='approved',
+            approved_by=?,
+            approved_at=?,
+            note=?
+        WHERE id=?
+        """,
+        (
+            owner["id"],
+            now_iso(),
+            x.note,
+            payment_id,
+        ),
+    )
+
+    starts = datetime.now(
+        timezone.utc
+    )
+
+    expires = starts + timedelta(
+        days=30
+    )
+
+    q(
+        """
+        INSERT INTO subscriptions(
+            user_id,
+            plan,
+            amount,
+            currency,
+            starts_at,
+            expires_at,
+            status,
+            payment_id,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            payment["user_id"],
+            "standard",
+            payment["amount"],
+            payment["currency"],
+            starts.isoformat(),
+            expires.isoformat(),
+            "active",
+            payment_id,
+            now_iso(),
+        ),
+    )
+
+    audit(
+        owner["id"],
+        "payment_approve",
+        "payments",
+        payment_id,
+    )
+
+    return {
+        "ok": True,
+        "payment_id": payment_id,
+        "subscription_days": 30,
+    }
+
+
+@app.post(
+    "/owner/payments/{payment_id}/reject"
+)
+def reject_payment(
+    payment_id: int,
+    x: PaymentDecisionIn,
+    authorization: Optional[str] = Header(None),
+):
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
+
+    q(
+        """
+        UPDATE payments
+        SET status='rejected',
+            approved_by=?,
+            approved_at=?,
+            note=?
+        WHERE id=?
+        """,
+        (
+            owner["id"],
+            now_iso(),
+            x.note,
+            payment_id,
+        ),
+    )
+
+    return {
+        "ok": True
+    }
+
+
+# ============================================================
+# PAYMENT DESTINATIONS
+# ============================================================
+
+@app.get(
+    "/owner/payment-destinations"
+)
+def payment_destinations(
+    authorization: Optional[str] = Header(None),
+):
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
+
+    return q(
+        """
+        SELECT *
+        FROM payment_destinations
+        ORDER BY id DESC
+        """,
+        many=True,
+    )
+
+
+@app.post(
+    "/owner/payment-destinations"
+)
+def create_payment_destination(
+    x: DestinationIn,
+    authorization: Optional[str] = Header(None),
+):
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
+
+    did = q(
+        """
+        INSERT INTO payment_destinations(
+            method,
+            currency,
+            network,
+            destination,
+            active,
+            created_by,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (
+            x.method,
+            x.currency.upper(),
+            x.network,
+            x.destination,
+            1,
+            owner["id"],
+            now_iso(),
+        ),
+    )
+
+    return q(
+        """
+        SELECT *
+        FROM payment_destinations
+        WHERE id=?
+        """,
+        (did,),
+        one=True,
+    )
+
+
+@app.post(
+    "/owner/payment-destinations/{destination_id}/disable"
+)
+def disable_payment_destination(
+    destination_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
+
+    q(
+        """
+        UPDATE payment_destinations
+        SET active=0
+        WHERE id=?
+        """,
+        (destination_id,),
+    )
+
+    return {
+        "ok": True
+    }
+
+
+# ============================================================
+# SUBSCRIPTIONS / ACTIVATION / DEVICES
+# ============================================================
+
+@app.get("/subscriptions")
+def subscriptions(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    rows = q(
+        """
+        SELECT *
+        FROM subscriptions
+        WHERE user_id=?
+        ORDER BY id DESC
+        """,
+        (
+            user["id"],
+        ),
+        many=True,
+    )
+
+    return rows
+
+
+@app.post("/devices/register")
+def register_device(
+    x: DeviceIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    existing = q(
+        """
+        SELECT *
+        FROM devices
+        WHERE user_id=?
+          AND device_id=?
+        """,
+        (
+            user["id"],
+            x.device_id,
+        ),
+        one=True,
+    )
+
+    if existing:
+        q(
+            """
+            UPDATE devices
+            SET device_name=?,
+                platform=?,
+                active=1,
+                last_seen=?
+            WHERE id=?
+            """,
+            (
+                x.device_name,
+                x.platform,
+                now_iso(),
+                existing["id"],
+            ),
+        )
+
+        return {
+            "ok": True,
+            "device_id": x.device_id,
+        }
+
+    count = q(
+        """
+        SELECT COUNT(*) n
+        FROM devices
+        WHERE user_id=?
+          AND active=1
+        """,
+        (
+            user["id"],
+        ),
+        one=True,
+    )["n"]
+
+    if int(count) >= DEVICE_LIMIT:
+        raise HTTPException(
+            409,
+            "device limit reached",
+        )
+
+    did = q(
+        """
+        INSERT INTO devices(
+            user_id,
+            device_id,
+            device_name,
+            platform,
+            active,
+            last_seen,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?)
+        """,
+        (
+            user["id"],
+            x.device_id,
+            x.device_name,
+            x.platform,
+            1,
+            now_iso(),
+            now_iso(),
+        ),
+    )
+
+    return {
+        "ok": True,
+        "id": did,
+        "device_id": x.device_id,
+    }
+
+
+@app.get("/devices")
+def list_devices(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    return q(
+        """
+        SELECT *
+        FROM devices
+        WHERE user_id=?
+        ORDER BY id DESC
+        """,
+        (
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+@app.post("/activate")
+def activate(
+    x: ActivationIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    row = q(
+        """
+        SELECT *
+        FROM activation_codes
+        WHERE code_hash=?
+          AND used=0
+        """,
+        (
+            token_hash(x.code),
+        ),
+        one=True,
+    )
+
+    if not row:
+        raise HTTPException(
+            400,
+            "invalid activation code",
+        )
+
+    if row["expires_at"]:
+        if datetime.fromisoformat(
+            row["expires_at"]
+        ) < datetime.now(
+            timezone.utc
+        ):
+            raise HTTPException(
+                400,
+                "activation expired",
+            )
+
+    q(
+        """
+        UPDATE activation_codes
+        SET used=1,
+            user_id=?
+        WHERE id=?
+        """,
+        (
+            user["id"],
+            row["id"],
+        ),
+    )
+
+    starts = datetime.now(
+        timezone.utc
+    )
+
+    expires = starts + timedelta(
+        days=30
+    )
+
+    q(
+        """
+        INSERT INTO subscriptions(
+            user_id,
+            plan,
+            amount,
+            currency,
+            starts_at,
+            expires_at,
+            status,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?,?,?)
+        """,
+        (
+            user["id"],
+            row["plan"] or "standard",
+            0,
+            "",
+            starts.isoformat(),
+            expires.isoformat(),
+            "active",
+            now_iso(),
+        ),
+    )
+
+    return {
+        "ok": True,
+        "expires_at":
+            expires.isoformat(),
+    }
+
+
+# ============================================================
+# NOTIFICATIONS / ALERTS
+# ============================================================
+
+@app.get("/notifications")
+def notifications(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    return q(
+        """
+        SELECT *
+        FROM notifications
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 200
+        """,
+        (
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+@app.post(
+    "/notifications/{notification_id}/read"
+)
+def notification_read(
+    notification_id: int,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    q(
+        """
+        UPDATE notifications
+        SET read_at=?
+        WHERE id=?
+          AND user_id=?
+        """,
+        (
+            now_iso(),
+            notification_id,
+            user["id"],
+        ),
+    )
+
+    return {"ok": True}
+
+
+@app.get("/alerts")
+def alerts(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    return q(
+        """
+        SELECT *
+        FROM agricultural_alerts
+        WHERE
+            user_id=?
+            OR user_id IS NULL
+        ORDER BY id DESC
+        """,
+        (
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+# ============================================================
+# OFFLINE SYNC
+# ============================================================
+
+@app.post("/sync")
+def sync(
+    x: SyncIn,
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    existing = q(
+        """
+        SELECT *
+        FROM sync_events
+        WHERE user_id=?
+          AND client_event_id=?
+        """,
+        (
+            user["id"],
+            x.client_event_id,
+        ),
+        one=True,
+    )
+
+    if existing:
+        return existing
+
+    event_id = q(
+        """
+        INSERT INTO sync_events(
+            user_id,
+            client_event_id,
+            operation,
+            payload_json,
+            status,
+            created_at
+        )
+        VALUES(?,?,?,?,?,?)
+        """,
+        (
+            user["id"],
+            x.client_event_id,
+            x.operation,
+            jdump(x.payload),
+            "accepted",
+            now_iso(),
+        ),
+    )
+
+    return q(
+        """
+        SELECT *
+        FROM sync_events
+        WHERE id=?
+        """,
+        (event_id,),
+        one=True,
+    )
+
+
+@app.get("/sync")
+def sync_list(
+    authorization: Optional[str] = Header(None),
+):
+    user = current_user(
+        authorization
+    )
+
+    return q(
+        """
+        SELECT *
+        FROM sync_events
+        WHERE user_id=?
+        ORDER BY id DESC
+        LIMIT 500
+        """,
+        (
+            user["id"],
+        ),
+        many=True,
+    )
+
+
+# ============================================================
+# KNOWLEDGE
+# ============================================================
+
+@app.get("/knowledge")
+def knowledge(
+    category: str = "",
+    language: str = "fa",
+    authorization: Optional[str] = Header(None),
+):
+    current_user(
+        authorization
+    )
+
+    if category:
+        return q(
+            """
+            SELECT *
+            FROM knowledge_items
+            WHERE category=?
+              AND language=?
+              AND active=1
+            ORDER BY id DESC
+            """,
+            (
+                category,
+                language,
+            ),
+            many=True,
+        )
+
+    return q(
+        """
+        SELECT *
+        FROM knowledge_items
+        WHERE language=?
+          AND active=1
+        ORDER BY id DESC
+        """,
+        (
+            language,
+        ),
+        many=True,
+    )
+
+
+@app.post("/owner/knowledge")
+def create_knowledge(
+    x: KnowledgeIn,
+    authorization: Optional[str] = Header(None),
+):
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
+
+    kid = q(
+        """
+        INSERT INTO knowledge_items(
+            category,
+            title,
+            content,
+            language,
+            source,
+            version,
+            active,
+            created_at,
+            updated_at
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            x.category,
+            x.title,
+            x.content,
+            x.language,
+            x.source,
+            x.version,
+            1,
+            now_iso(),
+            now_iso(),
+        ),
+    )
+
+    return q(
+        """
+        SELECT *
+        FROM knowledge_items
+        WHERE id=?
+        """,
+        (kid,),
+        one=True,
+    )
+
+
+# ============================================================
+# PROVIDER MANAGEMENT
+# ============================================================
 
 @app.get("/integrations/status")
 def integrations_status(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
+    current_user(
+        authorization
+    )
 
     rows = q(
         """
@@ -2582,23 +4820,34 @@ def integrations_status(
 
     result = []
 
-    for r in rows:
-        x = dict(r)
+    for row in rows:
+        item = dict(row)
 
-        x["base_url_configured"] = bool(
-            x["base_url"]
+        item[
+            "base_url_configured"
+        ] = bool(
+            item["base_url"]
         )
 
-        x.pop("base_url", None)
-        x.pop("health_url", None)
+        item.pop(
+            "base_url",
+            None,
+        )
 
-        x["healthy"] = (
-            provider_status(x["key"])["healthy"]
-            if x["enabled"]
+        item.pop(
+            "health_url",
+            None,
+        )
+
+        item["healthy"] = (
+            provider_status(
+                item["key"]
+            ).get("healthy")
+            if item["enabled"]
             else None
         )
 
-        result.append(x)
+        result.append(item)
 
     return {
         "version": VERSION,
@@ -2610,45 +4859,31 @@ def integrations_status(
 def owner_providers(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
 
     rows = q(
         """
-        SELECT
-            key,
-            name,
-            base_url,
-            health_url,
-            auth_env,
-            enabled,
-            required,
-            notes,
-            updated_at
+        SELECT *
         FROM external_providers
         ORDER BY key
         """,
         many=True,
     )
 
-    for r in rows:
-        r["secret_configured"] = bool(
-            r["auth_env"]
+    for row in rows:
+        row["secret_configured"] = bool(
+            row["auth_env"]
             and os.getenv(
-                r["auth_env"],
+                row["auth_env"],
                 "",
             )
         )
 
     return rows
-
-
-class ProviderConfigIn(BaseModel):
-    base_url: str = ""
-    health_url: str = ""
-    enabled: bool = False
-    required: bool = False
-    notes: str = ""
 
 
 @app.put("/owner/providers/{key}")
@@ -2657,8 +4892,11 @@ def owner_provider_config(
     x: ProviderConfigIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
 
     if key not in PROVIDER_KEYS:
         raise HTTPException(
@@ -2666,10 +4904,13 @@ def owner_provider_config(
             "unknown provider",
         )
 
-    if x.enabled and not x.base_url:
+    if (
+        x.enabled
+        and not x.base_url.strip()
+    ):
         raise HTTPException(
             400,
-            "base_url required when enabling provider",
+            "base_url required",
         )
 
     q(
@@ -2695,7 +4936,7 @@ def owner_provider_config(
     )
 
     audit(
-        user["id"],
+        owner["id"],
         "provider_config_update",
         "external_providers",
         None,
@@ -2708,17 +4949,21 @@ def owner_provider_config(
     return {
         "ok": True,
         "key": key,
-        "enabled": x.enabled,
     }
 
 
-@app.post("/owner/providers/{key}/health")
+@app.post(
+    "/owner/providers/{key}/health"
+)
 def owner_provider_health(
     key: str,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
 
     if key not in PROVIDER_KEYS:
         raise HTTPException(
@@ -2726,70 +4971,38 @@ def owner_provider_health(
             "unknown provider",
         )
 
-    result = provider_status(key)
+    result = provider_status(
+        key
+    )
 
     audit(
-        user["id"],
+        owner["id"],
         "provider_health_check",
         "external_providers",
         None,
         {
             "key": key,
-            "healthy": result.get("healthy"),
+            "healthy":
+                result.get("healthy"),
         },
     )
 
     return result
 
 
-@app.get("/location/reverse")
-def reverse_geocode(
-    lat: float,
-    lon: float,
-    authorization: Optional[str] = Header(None),
-):
-    user = current_user(authorization)
-
-    validate_coords(
-        lat,
-        lon,
-    )
-
-    if not provider_enabled("geocoding"):
-        return {
-            "status": "unavailable",
-            "verified": False,
-            "latitude": lat,
-            "longitude": lon,
-            "reason": (
-                "No approved reverse-geocoding "
-                "provider configured."
-            ),
-        }
-
-    return {
-        "status": "ok",
-        "verified": True,
-        "provider": "geocoding",
-        "data": provider_request(
-            "geocoding",
-            "reverse",
-            {
-                "lat": lat,
-                "lon": lon,
-            },
-        ),
-    }
-
-
-@app.get("/agri/provider-query/{provider}")
+@app.get(
+    "/agri/provider-query/{provider}"
+)
 def provider_query(
     provider: str,
     path: str = "",
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
 
     if provider not in PROVIDER_KEYS:
         raise HTTPException(
@@ -2803,31 +5016,32 @@ def provider_query(
     )
 
 
-# ----------------------------- settings / owner stats / audit -----------------------------
+# ============================================================
+# OWNER SETTINGS / STATS / USERS
+# ============================================================
 
 @app.get("/owner/settings")
 def owner_settings(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
 
     rows = q(
         """
-        SELECT
-            key,
-            value,
-            secret,
-            updated_at
+        SELECT *
         FROM system_settings
         ORDER BY key
         """,
         many=True,
     )
 
-    for r in rows:
-        if r["secret"]:
-            r["value"] = "***"
+    for row in rows:
+        if row["secret"]:
+            row["value"] = "***"
 
     return rows
 
@@ -2838,8 +5052,11 @@ def owner_setting(
     x: SettingIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
 
     q(
         """
@@ -2862,111 +5079,23 @@ def owner_setting(
             key,
             x.value,
             int(x.secret),
-            user["id"],
+            owner["id"],
             now_iso(),
         ),
     )
 
-    audit(
-        user["id"],
-        "setting_update",
-        "system_settings",
-        None,
-        {"key": key},
-    )
-
-    return {
-        "ok": True
-    }
-
-
-@app.get("/owner/stats")
-def owner_stats(
-    authorization: Optional[str] = Header(None),
-):
-    user = current_user(authorization)
-    require_owner(user)
-
-    def count(
-        table,
-        where="",
-        args=(),
-    ):
-        return q(
-            f"""
-            SELECT COUNT(*) n
-            FROM {table}
-            {where}
-            """,
-            args,
-            one=True,
-        )["n"]
-
-    return {
-        "users": count(
-            "users",
-            "WHERE role='user'",
-        ),
-        "owners": count(
-            "users",
-            "WHERE role='owner'",
-        ),
-        "farms": count("farms"),
-        "payments_pending": count(
-            "payments",
-            "WHERE status='pending'",
-        ),
-        "payments_approved": count(
-            "payments",
-            "WHERE status='approved'",
-        ),
-        "subscriptions": count(
-            "subscriptions",
-            "WHERE status='active'",
-        ),
-        "feedback_open": count(
-            "feedback",
-            "WHERE status='open'",
-        ),
-        "ai_today": count(
-            "ai_usage",
-            "WHERE usage_date=?",
-            (today(),),
-        ),
-    }
-
-
-@app.get("/owner/audit")
-def owner_audit(
-    limit: int = 200,
-    authorization: Optional[str] = Header(None),
-):
-    user = current_user(authorization)
-    require_owner(user)
-
-    return q(
-        """
-        SELECT *
-        FROM audit_logs
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (
-            max(
-                1,
-                min(limit, 1000),
-            ),
-        ),
-        many=True,
-    )
+    return {"ok": True}
 
 
 @app.get("/owner/users")
 def owner_users(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
 
     return q(
         """
@@ -2974,6 +5103,7 @@ def owner_users(
             id,
             email,
             name,
+            phone,
             country,
             language,
             role,
@@ -2987,15 +5117,20 @@ def owner_users(
     )
 
 
-@app.post("/owner/users/{user_id}/disable")
+@app.post(
+    "/owner/users/{user_id}/disable"
+)
 def owner_disable_user(
     user_id: int,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
 
-    if user_id == user["id"]:
+    require_owner(owner)
+
+    if user_id == owner["id"]:
         raise HTTPException(
             400,
             "cannot disable current owner",
@@ -3023,28 +5158,125 @@ def owner_disable_user(
         (user_id,),
     )
 
-    audit(
-        user["id"],
-        "user_disable",
-        "users",
-        user_id,
+    return {"ok": True}
+
+
+@app.get("/owner/stats")
+def owner_stats(
+    authorization: Optional[str] = Header(None),
+):
+    owner = current_user(
+        authorization
     )
 
+    require_owner(owner)
+
+    def count(
+        table: str,
+        where: str = "",
+        args=(),
+    ):
+        row = q(
+            f"""
+            SELECT COUNT(*) n
+            FROM {table}
+            {where}
+            """,
+            args,
+            one=True,
+        )
+
+        return row["n"]
+
     return {
-        "ok": True
+        "users":
+            count(
+                "users",
+                "WHERE role='user'",
+            ),
+        "owners":
+            count(
+                "users",
+                "WHERE role='owner'",
+            ),
+        "farms":
+            count("farms"),
+        "lands":
+            count("lands"),
+        "crops":
+            count("crops"),
+        "trees":
+            count("trees"),
+        "payments_pending":
+            count(
+                "payments",
+                "WHERE status='pending'",
+            ),
+        "payments_approved":
+            count(
+                "payments",
+                "WHERE status='approved'",
+            ),
+        "active_subscriptions":
+            count(
+                "subscriptions",
+                "WHERE status='active'",
+            ),
+        "feedback_open":
+            count(
+                "feedback",
+                "WHERE status='open'",
+            ),
+        "ai_today":
+            count(
+                "ai_usage",
+                "WHERE usage_date=?",
+                (today(),),
+            ),
+        "devices":
+            count("devices"),
     }
 
 
-# ----------------------------- backup -----------------------------
+@app.get("/owner/audit")
+def owner_audit(
+    limit: int = 200,
+    authorization: Optional[str] = Header(None),
+):
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
+
+    return q(
+        """
+        SELECT *
+        FROM audit_logs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (
+            max(
+                1,
+                min(limit, 1000),
+            ),
+        ),
+        many=True,
+    )
+
+
+# ============================================================
+# BACKUP
+# ============================================================
 
 def create_backup_file():
     conn = db()
-    rows = {}
 
     try:
         tables = [
-            r["name"]
-            for r in conn.execute(
+            row["name"]
+            for row in conn.execute(
                 """
                 SELECT name
                 FROM sqlite_master
@@ -3054,47 +5286,65 @@ def create_backup_file():
             ).fetchall()
         ]
 
-        for t in tables:
-            rows[t] = [
-                dict(x)
-                for x in conn.execute(
-                    f"SELECT * FROM {t}"
+        data = {}
+
+        for table in tables:
+            data[table] = [
+                dict(row)
+                for row in conn.execute(
+                    f"SELECT * FROM {table}"
                 ).fetchall()
             ]
 
     finally:
         conn.close()
 
-    path = (
-        BASE_DIR
-        / f"arya_backup_"
-          f"{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
-          f".json"
-    )
-
-    data = jdump(
+    payload = jdump(
         {
             "version": VERSION,
             "created_at": now_iso(),
-            "tables": rows,
+            "tables": data,
         }
     ).encode()
 
-    path.write_bytes(data)
+    path = (
+        BASE_DIR
+        / (
+            "arya_backup_"
+            + datetime.now(
+                timezone.utc
+            ).strftime(
+                "%Y%m%dT%H%M%SZ"
+            )
+            + ".json"
+        )
+    )
 
-    return path, sha256_bytes(data)
+    path.write_bytes(
+        payload
+    )
+
+    return (
+        path,
+        sha256_bytes(payload),
+    )
 
 
 @app.post("/owner/backup")
-def backup(
+def create_backup(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
 
-    path, digest = create_backup_file()
+    require_owner(owner)
 
-    bid = q(
+    path, digest = (
+        create_backup_file()
+    )
+
+    backup_id = q(
         """
         INSERT INTO backups(
             created_by,
@@ -3105,33 +5355,29 @@ def backup(
         VALUES(?,?,?,?)
         """,
         (
-            user["id"],
+            owner["id"],
             str(path),
             digest,
             now_iso(),
         ),
     )
 
-    audit(
-        user["id"],
-        "backup",
-        "backups",
-        bid,
-    )
-
     return {
-        "id": bid,
+        "id": backup_id,
         "path": str(path),
         "sha256": digest,
     }
 
 
 @app.get("/owner/backups")
-def backups(
+def list_backups(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
 
     return q(
         """
@@ -3143,14 +5389,21 @@ def backups(
     )
 
 
-# ----------------------------- owner emergency audit controls -----------------------------
+# ============================================================
+# EMERGENCY CONTROLS
+# ============================================================
 
-@app.post("/owner/emergency/revoke-all-sessions")
+@app.post(
+    "/owner/emergency/revoke-all-sessions"
+)
 def revoke_all_sessions(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
 
     q(
         """
@@ -3158,25 +5411,30 @@ def revoke_all_sessions(
         SET revoked=1
         WHERE user_id!=?
         """,
-        (user["id"],),
+        (
+            owner["id"],
+        ),
     )
 
     audit(
-        user["id"],
+        owner["id"],
         "emergency_revoke_all_sessions",
     )
 
-    return {
-        "ok": True
-    }
+    return {"ok": True}
 
 
-@app.post("/owner/emergency/expire-all-subscriptions")
+@app.post(
+    "/owner/emergency/expire-all-subscriptions"
+)
 def expire_all_subscriptions(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(authorization)
-    require_owner(user)
+    owner = current_user(
+        authorization
+    )
+
+    require_owner(owner)
 
     q(
         """
@@ -3185,30 +5443,75 @@ def expire_all_subscriptions(
         WHERE status='active'
           AND user_id!=?
         """,
-        (user["id"],),
+        (
+            owner["id"],
+        ),
     )
 
     audit(
-        user["id"],
+        owner["id"],
         "emergency_expire_all_subscriptions",
     )
 
+    return {"ok": True}
+
+
+# ============================================================
+# HEALTH / SYSTEM
+# ============================================================
+
+@app.get("/health")
+def health():
+    try:
+        row = q(
+            "SELECT 1 AS ok",
+            one=True,
+        )
+
+        return {
+            "ok": bool(row),
+            "app": APP_NAME,
+            "version": VERSION,
+            "database": True,
+            "time": now_iso(),
+        }
+
+    except Exception as exc:
+        return {
+            "ok": False,
+            "app": APP_NAME,
+            "version": VERSION,
+            "database": False,
+            "error": str(exc),
+        }
+
+
+@app.get("/")
+def root():
     return {
-        "ok": True
+        "app": APP_NAME,
+        "version": VERSION,
+        "status": "online",
+        "docs": "/docs",
+        "health": "/health",
     }
 
 
-# ----------------------------- startup -----------------------------
+# ============================================================
+# STARTUP
+# ============================================================
 
 @app.on_event("startup")
 def startup():
     init_db()
+    init_providers()
 
 
 if __name__ == "__main__":
     import uvicorn
 
     init_db()
+    init_providers()
 
     uvicorn.run(
         app,
