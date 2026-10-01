@@ -6,22 +6,24 @@ Central runtime manager for ARYA AgriDoctor.
 
 Purpose:
 - Central registry of ARYA backend services.
-- Start/stop/restart services.
+- Start / stop / restart services.
 - Health monitoring.
-- Service status.
-- Automatic restart on unexpected termination.
-- No modification of main.py or existing modules.
-- Designed for Android/Windows client infrastructure and server deployment.
+- Automatic restart.
+- Unified runtime map.
+- Data-update service management.
+- Automatic-update scheduler management.
+- Provider infrastructure management.
+- Android / Windows / server deployment support.
+- No modification of backend/main.py.
 
-This file does NOT replace any existing ARYA service.
+This file manages existing ARYA services.
+It does not replace their implementation.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import signal
 import subprocess
 import sys
 import time
@@ -39,7 +41,7 @@ from fastapi.responses import JSONResponse
 # ============================================================
 
 APP_NAME = "ARYA Service Runtime"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 HOST = os.getenv(
     "ARYA_RUNTIME_HOST",
@@ -126,16 +128,38 @@ class ServiceProcess:
 
 
 # ============================================================
+# Environment helpers
+# ============================================================
+
+def env_port(
+    name: str,
+    default: int,
+) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except ValueError:
+        return default
+
+
+# ============================================================
 # Service Registry
 # ============================================================
 
 SERVICES: List[ServiceDefinition] = [
+
+    # --------------------------------------------------------
+    # Core
+    # --------------------------------------------------------
+
     ServiceDefinition(
         service_id="main_api",
         name="ARYA Main API",
         module="main:app",
         host="127.0.0.1",
-        port=8000,
+        port=env_port(
+            "ARYA_MAIN_API_PORT",
+            8000,
+        ),
         critical=True,
     ),
 
@@ -144,7 +168,10 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Vision",
         module="vision:app",
         host="127.0.0.1",
-        port=8001,
+        port=env_port(
+            "ARYA_VISION_PORT",
+            8001,
+        ),
         critical=True,
     ),
 
@@ -153,7 +180,10 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Voice Language",
         module="modules.voice_language:app",
         host="127.0.0.1",
-        port=8002,
+        port=env_port(
+            "ARYA_VOICE_LANGUAGE_PORT",
+            8002,
+        ),
         critical=False,
     ),
 
@@ -162,7 +192,10 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Agricultural Engine",
         module="modules.agri_engine:app",
         host="127.0.0.1",
-        port=8003,
+        port=env_port(
+            "ARYA_AGRI_ENGINE_PORT",
+            8003,
+        ),
         critical=True,
     ),
 
@@ -171,16 +204,38 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Commerce Security",
         module="modules.commerce_security:app",
         host="127.0.0.1",
-        port=8004,
+        port=env_port(
+            "ARYA_COMMERCE_SECURITY_PORT",
+            8004,
+        ),
         critical=True,
     ),
+
+    ServiceDefinition(
+        service_id="external_providers",
+        name="ARYA External Providers",
+        module="modules.external_providers:app",
+        host="127.0.0.1",
+        port=env_port(
+            "ARYA_EXTERNAL_PROVIDERS_PORT",
+            8005,
+        ),
+        critical=False,
+    ),
+
+    # --------------------------------------------------------
+    # Orchestration
+    # --------------------------------------------------------
 
     ServiceDefinition(
         service_id="orchestrator",
         name="ARYA Orchestrator",
         module="modules.orchestrator:app",
         host="127.0.0.1",
-        port=8010,
+        port=env_port(
+            "ARYA_ORCHESTRATOR_PORT",
+            8010,
+        ),
         critical=True,
     ),
 
@@ -189,7 +244,10 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Owner Manager",
         module="modules.owner_manager:app",
         host="127.0.0.1",
-        port=8014,
+        port=env_port(
+            "ARYA_OWNER_MANAGER_PORT",
+            8014,
+        ),
         critical=True,
     ),
 
@@ -198,7 +256,10 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Owner Integration",
         module="modules.owner_integration:app",
         host="127.0.0.1",
-        port=8015,
+        port=env_port(
+            "ARYA_OWNER_INTEGRATION_PORT",
+            8015,
+        ),
         critical=True,
     ),
 
@@ -207,7 +268,10 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Owner Runtime Gateway",
         module="modules.owner_runtime_gateway:app",
         host="127.0.0.1",
-        port=8016,
+        port=env_port(
+            "ARYA_OWNER_RUNTIME_GATEWAY_PORT",
+            8016,
+        ),
         critical=True,
     ),
 
@@ -216,16 +280,26 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Orchestrator Runtime Bridge",
         module="modules.orchestrator_runtime_bridge:app",
         host="127.0.0.1",
-        port=8017,
+        port=env_port(
+            "ARYA_ORCHESTRATOR_RUNTIME_BRIDGE_PORT",
+            8017,
+        ),
         critical=False,
     ),
+
+    # --------------------------------------------------------
+    # Runtime / Provider Bridges
+    # --------------------------------------------------------
 
     ServiceDefinition(
         service_id="runtime_data_provider_bridge",
         name="ARYA Runtime Data Provider Bridge",
         module="modules.runtime_data_provider_bridge:app",
         host="127.0.0.1",
-        port=8018,
+        port=env_port(
+            "ARYA_RUNTIME_DATA_PROVIDER_BRIDGE_PORT",
+            8018,
+        ),
         critical=False,
     ),
 
@@ -234,7 +308,10 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Owner Provider Control",
         module="modules.owner_provider_control:app",
         host="127.0.0.1",
-        port=8019,
+        port=env_port(
+            "ARYA_OWNER_PROVIDER_CONTROL_PORT",
+            8019,
+        ),
         critical=True,
     ),
 
@@ -243,16 +320,26 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Internal Service Security",
         module="modules.internal_service_security:app",
         host="127.0.0.1",
-        port=8020,
+        port=env_port(
+            "ARYA_INTERNAL_SERVICE_SECURITY_PORT",
+            8020,
+        ),
         critical=True,
     ),
+
+    # --------------------------------------------------------
+    # Client / API
+    # --------------------------------------------------------
 
     ServiceDefinition(
         service_id="client_api_gateway",
         name="ARYA Client API Gateway",
         module="modules.client_api_gateway:app",
         host="127.0.0.1",
-        port=8021,
+        port=env_port(
+            "ARYA_CLIENT_API_GATEWAY_PORT",
+            8021,
+        ),
         critical=True,
     ),
 
@@ -261,7 +348,10 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Main API Bridge",
         module="modules.arya_main_api_bridge:app",
         host="127.0.0.1",
-        port=8022,
+        port=env_port(
+            "ARYA_MAIN_API_BRIDGE_PORT",
+            8022,
+        ),
         critical=True,
     ),
 
@@ -270,8 +360,47 @@ SERVICES: List[ServiceDefinition] = [
         name="ARYA Unified API",
         module="modules.arya_unified_api:app",
         host="127.0.0.1",
-        port=8023,
+        port=env_port(
+            "ARYA_UNIFIED_API_PORT",
+            8023,
+        ),
         critical=True,
+    ),
+
+    # --------------------------------------------------------
+    # Runtime manager itself is 8024
+    # --------------------------------------------------------
+
+    # --------------------------------------------------------
+    # Automatic Update Scheduler
+    # --------------------------------------------------------
+
+    ServiceDefinition(
+        service_id="arya_auto_update_scheduler",
+        name="ARYA Automatic Update Scheduler",
+        module="modules.arya_auto_update_scheduler:app",
+        host="127.0.0.1",
+        port=env_port(
+            "ARYA_AUTO_UPDATE_PORT",
+            8025,
+        ),
+        critical=False,
+    ),
+
+    # --------------------------------------------------------
+    # Global Data Update
+    # --------------------------------------------------------
+
+    ServiceDefinition(
+        service_id="data_update",
+        name="ARYA Data Update",
+        module="modules.data_update:app",
+        host="127.0.0.1",
+        port=env_port(
+            "ARYA_DATA_UPDATE_PORT",
+            8026,
+        ),
+        critical=False,
     ),
 ]
 
@@ -339,6 +468,20 @@ def serialize_process(
     }
 
 
+def get_definition(
+    service_id: str,
+) -> ServiceDefinition:
+    if service_id not in RUNTIME:
+        raise HTTPException(
+            status_code=404,
+            detail="Service not found",
+        )
+
+    return RUNTIME[
+        service_id
+    ].definition
+
+
 # ============================================================
 # Process Manager
 # ============================================================
@@ -356,14 +499,13 @@ class ServiceManager:
 
         async with self.lock:
 
-            if service_id not in RUNTIME:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Service not found",
-                )
+            definition = get_definition(
+                service_id
+            )
 
-            runtime = RUNTIME[service_id]
-            definition = runtime.definition
+            runtime = RUNTIME[
+                service_id
+            ]
 
             if not definition.enabled:
                 raise HTTPException(
@@ -376,7 +518,9 @@ class ServiceManager:
                 and runtime.process.poll() is None
             ):
                 runtime.state = "running"
-                return serialize_process(runtime)
+                return serialize_process(
+                    runtime
+                )
 
             runtime.state = "starting"
             runtime.last_error = None
@@ -393,7 +537,6 @@ class ServiceManager:
             ]
 
             environment = os.environ.copy()
-
             environment.update(
                 definition.environment
             )
@@ -422,19 +565,21 @@ class ServiceManager:
             runtime.process = process
             runtime.started_at = time.time()
             runtime.stopped_at = None
-            runtime.state = "running"
+            runtime.state = "starting"
 
         healthy = await self.wait_for_health(
             service_id
         )
 
         if not healthy:
-            runtime.state = "starting"
-
             if automatic:
-                return serialize_process(runtime)
+                runtime.state = "degraded"
+            else:
+                runtime.state = "degraded"
 
-        return serialize_process(runtime)
+        return serialize_process(
+            runtime
+        )
 
     async def stop(
         self,
@@ -443,17 +588,19 @@ class ServiceManager:
 
         async with self.lock:
 
-            if service_id not in RUNTIME:
-                raise HTTPException(
-                    status_code=404,
-                    detail="Service not found",
-                )
+            get_definition(
+                service_id
+            )
 
-            runtime = RUNTIME[service_id]
+            runtime = RUNTIME[
+                service_id
+            ]
 
             if runtime.process is None:
                 runtime.state = "stopped"
-                return serialize_process(runtime)
+                return serialize_process(
+                    runtime
+                )
 
             process = runtime.process
 
@@ -471,21 +618,35 @@ class ServiceManager:
                 except subprocess.TimeoutExpired:
                     process.kill()
 
+                    try:
+                        await asyncio.to_thread(
+                            process.wait,
+                            timeout=5,
+                        )
+                    except Exception:
+                        pass
+
                 except Exception as exc:
-                    runtime.last_error = str(exc)
+                    runtime.last_error = str(
+                        exc
+                    )
 
             runtime.process = None
             runtime.stopped_at = time.time()
             runtime.state = "stopped"
 
-            return serialize_process(runtime)
+            return serialize_process(
+                runtime
+            )
 
     async def restart(
         self,
         service_id: str,
     ) -> Dict:
 
-        await self.stop(service_id)
+        await self.stop(
+            service_id
+        )
 
         await asyncio.sleep(
             RESTART_DELAY
@@ -503,7 +664,10 @@ class ServiceManager:
         if service_id not in RUNTIME:
             return False
 
-        runtime = RUNTIME[service_id]
+        runtime = RUNTIME[
+            service_id
+        ]
+
         definition = runtime.definition
 
         deadline = (
@@ -524,6 +688,8 @@ class ServiceManager:
                     "Process exited during startup"
                 )
 
+                runtime.process = None
+
                 return False
 
             try:
@@ -533,7 +699,9 @@ class ServiceManager:
                 ) as client:
 
                     response = await client.get(
-                        service_url(definition)
+                        service_url(
+                            definition
+                        )
                     )
 
                     if response.status_code < 500:
@@ -545,7 +713,13 @@ class ServiceManager:
 
             await asyncio.sleep(1)
 
-        runtime.state = "degraded"
+        if (
+            runtime.process is not None
+            and runtime.process.poll() is None
+        ):
+            runtime.state = "degraded"
+        else:
+            runtime.state = "failed"
 
         return False
 
@@ -554,14 +728,13 @@ class ServiceManager:
         service_id: str,
     ) -> Dict:
 
-        if service_id not in RUNTIME:
-            raise HTTPException(
-                status_code=404,
-                detail="Service not found",
-            )
+        definition = get_definition(
+            service_id
+        )
 
-        runtime = RUNTIME[service_id]
-        definition = runtime.definition
+        runtime = RUNTIME[
+            service_id
+        ]
 
         process_alive = (
             runtime.process is not None
@@ -569,6 +742,7 @@ class ServiceManager:
         )
 
         api_healthy = False
+        response_status = None
 
         try:
             async with httpx.AsyncClient(
@@ -577,7 +751,13 @@ class ServiceManager:
             ) as client:
 
                 response = await client.get(
-                    service_url(definition)
+                    service_url(
+                        definition
+                    )
+                )
+
+                response_status = (
+                    response.status_code
                 )
 
                 api_healthy = (
@@ -589,26 +769,44 @@ class ServiceManager:
 
         if api_healthy:
             runtime.state = "healthy"
+
         elif process_alive:
             runtime.state = "degraded"
+
         else:
             runtime.state = "stopped"
 
-        result = serialize_process(runtime)
+        result = serialize_process(
+            runtime
+        )
 
-        result["process_alive"] = process_alive
-        result["api_healthy"] = api_healthy
+        result["process_alive"] = (
+            process_alive
+        )
+
+        result["api_healthy"] = (
+            api_healthy
+        )
+
+        result["response_status"] = (
+            response_status
+        )
 
         return result
 
-    async def health_all(self) -> List[Dict]:
+    async def health_all(
+        self,
+    ) -> List[Dict]:
+
         results = []
 
         for service_id in RUNTIME:
+
             try:
                 result = await self.health(
                     service_id
                 )
+
             except Exception as exc:
                 result = {
                     "id": service_id,
@@ -620,8 +818,12 @@ class ServiceManager:
 
         return results
 
-    async def stop_all(self):
-        service_ids = list(RUNTIME.keys())
+    async def stop_all(
+        self,
+    ):
+        service_ids = list(
+            RUNTIME.keys()
+        )
 
         for service_id in reversed(
             service_ids
@@ -633,19 +835,23 @@ class ServiceManager:
             except Exception:
                 pass
 
-    async def start_all(self):
+    async def start_all(
+        self,
+    ):
         """
         Start services in registry order.
 
-        The order is intentional:
-        core services first, integration layers later.
+        Core services start first.
+        Integration and runtime services follow.
         """
 
         results = []
 
         for service_id in RUNTIME:
 
-            runtime = RUNTIME[service_id]
+            runtime = RUNTIME[
+                service_id
+            ]
 
             if not runtime.definition.enabled:
                 continue
@@ -654,19 +860,21 @@ class ServiceManager:
                 result = await self.start(
                     service_id
                 )
+
                 results.append(result)
 
             except Exception as exc:
-                results.append({
+
+                result = {
                     "id": service_id,
                     "state": "failed",
                     "error": str(exc),
-                })
+                    "critical": (
+                        runtime.definition.critical
+                    ),
+                }
 
-                if runtime.definition.critical:
-                    # Continue starting other services.
-                    # Critical status is reported separately.
-                    continue
+                results.append(result)
 
         return results
 
@@ -679,6 +887,7 @@ SERVICE_MANAGER = ServiceManager()
 # ============================================================
 
 async def supervisor_loop():
+
     while not SHUTDOWN_EVENT.is_set():
 
         if AUTO_RESTART:
@@ -700,6 +909,11 @@ async def supervisor_loop():
                 runtime.process = None
                 runtime.state = "crashed"
                 runtime.stopped_at = time.time()
+
+                runtime.last_error = (
+                    f"Process exited with code "
+                    f"{return_code}"
+                )
 
                 if (
                     runtime.restart_count
@@ -724,13 +938,16 @@ async def supervisor_loop():
 
                 except Exception as exc:
                     runtime.state = "failed"
-                    runtime.last_error = str(exc)
+                    runtime.last_error = str(
+                        exc
+                    )
 
         try:
             await asyncio.wait_for(
                 SHUTDOWN_EVENT.wait(),
                 timeout=5,
             )
+
         except asyncio.TimeoutError:
             pass
 
@@ -755,12 +972,14 @@ app = FastAPI(
 
 @app.get("/")
 async def root():
+
     return {
         "service": APP_NAME,
         "version": APP_VERSION,
         "status": "online",
         "services": len(SERVICES),
         "auto_restart": AUTO_RESTART,
+        "runtime_port": PORT,
         "timestamp": timestamp(),
     }
 
@@ -771,46 +990,41 @@ async def root():
 
 @app.get("/health")
 async def health():
-    services = await SERVICE_MANAGER.health_all()
+
+    services = (
+        await SERVICE_MANAGER.health_all()
+    )
 
     healthy = sum(
         1
         for item in services
-        if item.get("api_healthy") is True
+        if item.get(
+            "api_healthy"
+        ) is True
     )
 
     running = sum(
         1
         for item in services
-        if item.get("process_alive") is True
+        if item.get(
+            "process_alive"
+        ) is True
     )
 
-    critical_services = [
-        item
-        for item in services
-        if next(
-            (
-                s
-                for s in SERVICES
-                if s.service_id
-                == item.get("id")
-            ),
-            None,
-        )
-        and next(
-            (
-                s
-                for s in SERVICES
-                if s.service_id
-                == item.get("id")
-            )
-        ).critical
-    ]
+    critical_ids = {
+        service.service_id
+        for service in SERVICES
+        if service.critical
+    }
 
     critical_unhealthy = [
         item
-        for item in critical_services
-        if not item.get("api_healthy")
+        for item in services
+        if item.get("id")
+        in critical_ids
+        and not item.get(
+            "api_healthy"
+        )
     ]
 
     status = (
@@ -823,7 +1037,9 @@ async def health():
         "status": status,
         "service": APP_NAME,
         "version": APP_VERSION,
-        "total_services": len(SERVICES),
+        "total_services": len(
+            SERVICES
+        ),
         "running_services": running,
         "healthy_services": healthy,
         "critical_unhealthy": len(
@@ -839,6 +1055,7 @@ async def health():
 
 @app.get("/services")
 async def list_services():
+
     return {
         "services": [
             serialize_process(
@@ -856,15 +1073,12 @@ async def list_services():
 # Single Service
 # ============================================================
 
-@app.get("/services/{service_id}")
+@app.get(
+    "/services/{service_id}"
+)
 async def service_details(
     service_id: str,
 ):
-    if service_id not in RUNTIME:
-        raise HTTPException(
-            status_code=404,
-            detail="Service not found",
-        )
 
     return await SERVICE_MANAGER.health(
         service_id
@@ -875,10 +1089,13 @@ async def service_details(
 # Start
 # ============================================================
 
-@app.post("/services/{service_id}/start")
+@app.post(
+    "/services/{service_id}/start"
+)
 async def start_service(
     service_id: str,
 ):
+
     return await SERVICE_MANAGER.start(
         service_id
     )
@@ -888,10 +1105,13 @@ async def start_service(
 # Stop
 # ============================================================
 
-@app.post("/services/{service_id}/stop")
+@app.post(
+    "/services/{service_id}/stop"
+)
 async def stop_service(
     service_id: str,
 ):
+
     return await SERVICE_MANAGER.stop(
         service_id
     )
@@ -901,10 +1121,13 @@ async def stop_service(
 # Restart
 # ============================================================
 
-@app.post("/services/{service_id}/restart")
+@app.post(
+    "/services/{service_id}/restart"
+)
 async def restart_service(
     service_id: str,
 ):
+
     return await SERVICE_MANAGER.restart(
         service_id
     )
@@ -914,11 +1137,16 @@ async def restart_service(
 # Start All
 # ============================================================
 
-@app.post("/runtime/start-all")
+@app.post(
+    "/runtime/start-all"
+)
 async def start_all():
+
     return {
         "status": "started",
-        "results": await SERVICE_MANAGER.start_all(),
+        "results": (
+            await SERVICE_MANAGER.start_all()
+        ),
         "timestamp": timestamp(),
     }
 
@@ -927,8 +1155,11 @@ async def start_all():
 # Stop All
 # ============================================================
 
-@app.post("/runtime/stop-all")
+@app.post(
+    "/runtime/stop-all"
+)
 async def stop_all():
+
     await SERVICE_MANAGER.stop_all()
 
     return {
@@ -941,8 +1172,11 @@ async def stop_all():
 # Restart All
 # ============================================================
 
-@app.post("/runtime/restart-all")
+@app.post(
+    "/runtime/restart-all"
+)
 async def restart_all():
+
     await SERVICE_MANAGER.stop_all()
 
     await asyncio.sleep(
@@ -964,9 +1198,14 @@ async def restart_all():
 # Runtime Status
 # ============================================================
 
-@app.get("/runtime/status")
+@app.get(
+    "/runtime/status"
+)
 async def runtime_status():
-    services = await SERVICE_MANAGER.health_all()
+
+    services = (
+        await SERVICE_MANAGER.health_all()
+    )
 
     return {
         "runtime": APP_NAME,
@@ -987,88 +1226,130 @@ async def runtime_status():
 # System Map
 # ============================================================
 
-@app.get("/runtime/system-map")
+@app.get(
+    "/runtime/system-map"
+)
 async def system_map():
+
     return {
         "runtime": APP_NAME,
         "version": APP_VERSION,
-        "architecture": {
-            "client_layer": [
-                "Android",
-                "Windows",
-            ],
-            "entrypoint": (
-                "arya_unified_api"
-            ),
-            "client_gateway": (
-                "client_api_gateway"
-            ),
-            "runtime_gateway": (
-                "owner_runtime_gateway"
-            ),
-            "legacy_core": (
-                "main_api"
-            ),
-            "main_bridge": (
-                "arya_main_api_bridge"
-            ),
-            "orchestration": [
-                "orchestrator",
-                "orchestrator_runtime_bridge",
-            ],
-            "agriculture": [
-                "agri_engine",
-                "vision",
-                "voice_language",
-            ],
-            "data": [
-                "data_update",
-                "external_providers",
-                "runtime_data_provider_bridge",
-            ],
-            "commerce": [
-                "commerce_security",
-            ],
-            "owner": [
-                "owner_manager",
-                "owner_integration",
-                "owner_provider_control",
-            ],
-            "security": [
-                "internal_service_security",
-            ],
-        },
-        "services": [
-            serialize_process(
-                RUNTIME[
-                    service.service_id
-                ]
-            )
+
+        "client_layer": [
+            "Android",
+            "Windows",
+        ],
+
+        "entrypoint": (
+            "arya_unified_api"
+        ),
+
+        "client_gateway": (
+            "client_api_gateway"
+        ),
+
+        "runtime_gateway": (
+            "owner_runtime_gateway"
+        ),
+
+        "legacy_core": (
+            "main_api"
+        ),
+
+        "main_bridge": (
+            "arya_main_api_bridge"
+        ),
+
+        "orchestration": [
+            "orchestrator",
+            "orchestrator_runtime_bridge",
+        ],
+
+        "agriculture": [
+            "agri_engine",
+            "vision",
+            "voice_language",
+        ],
+
+        "data": [
+            "data_update",
+            "external_providers",
+            "runtime_data_provider_bridge",
+            "arya_auto_update_scheduler",
+        ],
+
+        "commerce": [
+            "commerce_security",
+        ],
+
+        "owner": [
+            "owner_manager",
+            "owner_integration",
+            "owner_provider_control",
+        ],
+
+        "security": [
+            "internal_service_security",
+        ],
+
+        "runtime_services": [
+            {
+                "id": service.service_id,
+                "port": service.port,
+                "critical": service.critical,
+                "enabled": service.enabled,
+            }
             for service in SERVICES
         ],
+
         "timestamp": timestamp(),
     }
 
 
 # ============================================================
-# Configuration Contract
+# Runtime Contract
 # ============================================================
 
-@app.get("/runtime/contract")
+@app.get(
+    "/runtime/contract"
+)
 async def runtime_contract():
+
     return {
         "service": APP_NAME,
         "version": APP_VERSION,
         "port": PORT,
+
+        "runtime_services": {
+            "runtime_manager": PORT,
+            "auto_update_scheduler": env_port(
+                "ARYA_AUTO_UPDATE_PORT",
+                8025,
+            ),
+            "data_update": env_port(
+                "ARYA_DATA_UPDATE_PORT",
+                8026,
+            ),
+        },
+
         "commands": {
-            "start_all": "POST /runtime/start-all",
-            "stop_all": "POST /runtime/stop-all",
-            "restart_all": "POST /runtime/restart-all",
-            "status": "GET /runtime/status",
+            "start_all": (
+                "POST /runtime/start-all"
+            ),
+            "stop_all": (
+                "POST /runtime/stop-all"
+            ),
+            "restart_all": (
+                "POST /runtime/restart-all"
+            ),
+            "status": (
+                "GET /runtime/status"
+            ),
             "system_map": (
                 "GET /runtime/system-map"
             ),
         },
+
         "service_routes": {
             "list": "GET /services",
             "details": (
@@ -1084,6 +1365,7 @@ async def runtime_contract():
                 "POST /services/{service_id}/restart"
             ),
         },
+
         "main_py": {
             "modified": False,
             "managed_as": "main_api",
@@ -1096,6 +1378,7 @@ async def runtime_contract():
 # ============================================================
 
 async def shutdown_runtime():
+
     SHUTDOWN_EVENT.set()
 
     try:
@@ -1104,8 +1387,11 @@ async def shutdown_runtime():
         pass
 
 
-@app.on_event("shutdown")
+@app.on_event(
+    "shutdown"
+)
 async def on_shutdown():
+
     await shutdown_runtime()
 
 
@@ -1113,8 +1399,13 @@ async def on_shutdown():
 # Startup
 # ============================================================
 
-@app.on_event("startup")
+@app.on_event(
+    "startup"
+)
 async def on_startup():
+
+    SHUTDOWN_EVENT.clear()
+
     asyncio.create_task(
         supervisor_loop()
     )
@@ -1124,15 +1415,20 @@ async def on_startup():
 # Error Handler
 # ============================================================
 
-@app.exception_handler(Exception)
+@app.exception_handler(
+    Exception
+)
 async def generic_exception_handler(
     request,
     exc: Exception,
 ):
+
     return JSONResponse(
         status_code=500,
         content={
-            "error": "internal_server_error",
+            "error": (
+                "internal_server_error"
+            ),
             "service": APP_NAME,
             "request_id": uuid.uuid4().hex,
         },
@@ -1144,10 +1440,11 @@ async def generic_exception_handler(
 # ============================================================
 
 if __name__ == "__main__":
+
     import uvicorn
 
     uvicorn.run(
-        "arya_service_runtime:app",
+        "modules.arya_service_runtime:app",
         host=HOST,
         port=PORT,
         reload=False,
