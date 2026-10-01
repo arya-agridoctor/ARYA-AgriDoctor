@@ -4,3 +4,4 @@ requests
 pydantic
 openai
 email-validator
+python-multipart
