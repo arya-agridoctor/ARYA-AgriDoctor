@@ -1,28 +1,39 @@
 """
 ARYA AgriDoctor
 Final Integration Layer
-Version: 1.0.0
+Version: 1.1.0
 
 Purpose:
-    Final integration/orchestration layer for the ARYA backend infrastructure.
+    Final integration/orchestration layer for the ARYA backend.
 
 Architecture:
-    Client API Gateway
-        ↓
-    Final Integration
-        ↓
-    Unified API
-        ↓
-    Runtime Config Bridge
-        ↓
-    Service Runtime / Runtime Gateway
-        ↓
-    ARYA Services / Main API
+
+    CLIENT
+       ↓
+    CLIENT API GATEWAY
+       ↓
+    ARYA FINAL INTEGRATION
+       ↓
+    ARYA UNIFIED API
+       ↓
+    RUNTIME CONFIG BRIDGE
+       ↓
+    SERVICE RUNTIME / RUNTIME GATEWAY
+       ↓
+    ARYA SERVICES
+       ↓
+    MAIN API BRIDGE
+       ↓
+    backend/main.py
 
 Important:
     - backend/main.py is NOT modified.
     - Existing modules are NOT modified.
-    - This module is an independent integration layer.
+    - This module is independent.
+    - Internal URLs are configuration driven.
+    - No arbitrary user supplied URLs are proxied.
+    - Request/response limits are enforced.
+    - Internal HMAC signing is supported.
 """
 
 from __future__ import annotations
@@ -48,10 +59,24 @@ from pydantic import BaseModel, Field
 # ============================================================
 
 APP_NAME = "ARYA Final Integration"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
-HOST = os.getenv("ARYA_FINAL_INTEGRATION_HOST", "127.0.0.1")
-PORT = int(os.getenv("ARYA_FINAL_INTEGRATION_PORT", "8027"))
+HOST = os.getenv(
+    "ARYA_FINAL_INTEGRATION_HOST",
+    "127.0.0.1",
+)
+
+PORT = int(
+    os.getenv(
+        "ARYA_FINAL_INTEGRATION_PORT",
+        "8027",
+    )
+)
+
+
+# ------------------------------------------------------------
+# Core services
+# ------------------------------------------------------------
 
 UNIFIED_API_URL = os.getenv(
     "ARYA_UNIFIED_API_URL",
@@ -88,10 +113,28 @@ MAIN_API_BRIDGE_URL = os.getenv(
     "http://127.0.0.1:8022",
 ).rstrip("/")
 
+
+# ------------------------------------------------------------
+# Security
+# ------------------------------------------------------------
+
 INTERNAL_SECRET = os.getenv(
     "ARYA_INTERNAL_GATEWAY_SECRET",
     "",
 )
+
+REQUIRE_INTERNAL_SIGNATURE = (
+    os.getenv(
+        "ARYA_FINAL_REQUIRE_INTERNAL_SIGNATURE",
+        "false",
+    ).strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+
+# ------------------------------------------------------------
+# Limits
+# ------------------------------------------------------------
 
 REQUEST_TIMEOUT = float(
     os.getenv(
@@ -130,9 +173,8 @@ app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description=(
-        "Final integration layer for ARYA AgriDoctor backend. "
-        "Connects the client API, unified API, runtime configuration, "
-        "service runtime, runtime gateway and main API bridge."
+        "Final integration layer connecting ARYA client, "
+        "unified API, runtime, configuration and main API layers."
     ),
 )
 
@@ -153,22 +195,37 @@ _state_lock = asyncio.Lock()
 # ============================================================
 
 class IntegrationRequest(BaseModel):
-    action: str = Field(..., min_length=1, max_length=100)
-    payload: Dict[str, Any] = Field(default_factory=dict)
+    action: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+    )
+
+    payload: Dict[str, Any] = Field(
+        default_factory=dict,
+    )
+
     request_id: Optional[str] = None
 
 
 class ServiceActionRequest(BaseModel):
-    service_id: str = Field(..., min_length=1, max_length=150)
+    service_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=150,
+    )
 
 
 class BroadcastRequest(BaseModel):
-    payload: Dict[str, Any] = Field(default_factory=dict)
+    payload: Dict[str, Any] = Field(
+        default_factory=dict,
+    )
+
     request_id: Optional[str] = None
 
 
 # ============================================================
-# Helpers
+# Utility
 # ============================================================
 
 def utc_now() -> str:
@@ -181,16 +238,35 @@ def new_request_id() -> str:
 
 def safe_json(value: Any) -> Any:
     try:
-        json.dumps(value)
+        json.dumps(
+            value,
+            ensure_ascii=False,
+        )
         return value
+
     except Exception:
         return str(value)
 
 
+def normalize_request_id(
+    request_id: Optional[str],
+) -> str:
+
+    if request_id:
+        request_id = str(request_id).strip()
+
+        if request_id:
+            return request_id[:200]
+
+    return new_request_id()
+
+
+# ============================================================
+# Internal Security
+# ============================================================
+
 def sign_body(body: bytes) -> str:
-    """
-    HMAC-SHA256 signature for internal service communication.
-    """
+
     if not INTERNAL_SECRET:
         return ""
 
@@ -201,11 +277,18 @@ def sign_body(body: bytes) -> str:
     ).hexdigest()
 
 
-def internal_headers(body: bytes = b"") -> Dict[str, str]:
+def internal_headers(
+    body: bytes = b"",
+    request_id: Optional[str] = None,
+) -> Dict[str, str]:
+
     headers = {
         "Content-Type": "application/json",
+        "Accept": "application/json",
         "X-ARYA-Internal": "1",
-        "X-ARYA-Request-ID": new_request_id(),
+        "X-ARYA-Request-ID": (
+            request_id or new_request_id()
+        ),
     }
 
     signature = sign_body(body)
@@ -216,23 +299,57 @@ def internal_headers(body: bytes = b"") -> Dict[str, str]:
     return headers
 
 
-def validate_internal_url(url: str) -> bool:
-    """
-    Integration layer only accepts configured service URLs.
-    This intentionally does not accept arbitrary user supplied URLs.
-    """
-    allowed = {
-        UNIFIED_API_URL,
-        SERVICE_RUNTIME_URL,
-        CENTRAL_CONFIG_URL,
-        RUNTIME_CONFIG_BRIDGE_URL,
-        RUNTIME_GATEWAY_URL,
-        CLIENT_API_GATEWAY_URL,
-        MAIN_API_BRIDGE_URL,
+def verify_internal_signature(
+    body: bytes,
+    signature: Optional[str],
+) -> bool:
+
+    if not INTERNAL_SECRET:
+        return not REQUIRE_INTERNAL_SIGNATURE
+
+    if not signature:
+        return False
+
+    expected = sign_body(body)
+
+    return hmac.compare_digest(
+        expected,
+        signature.strip(),
+    )
+
+
+# ============================================================
+# Approved Internal Services
+# ============================================================
+
+def approved_services() -> Dict[str, str]:
+
+    return {
+        "unified_api": UNIFIED_API_URL,
+        "service_runtime": SERVICE_RUNTIME_URL,
+        "central_config": CENTRAL_CONFIG_URL,
+        "runtime_config_bridge": RUNTIME_CONFIG_BRIDGE_URL,
+        "runtime_gateway": RUNTIME_GATEWAY_URL,
+        "client_api_gateway": CLIENT_API_GATEWAY_URL,
+        "main_api_bridge": MAIN_API_BRIDGE_URL,
     }
 
-    return url.rstrip("/") in allowed
 
+def validate_internal_url(
+    url: str,
+) -> bool:
+
+    normalized = url.rstrip("/")
+
+    return normalized in {
+        value.rstrip("/")
+        for value in approved_services().values()
+    }
+
+
+# ============================================================
+# HTTP Client
+# ============================================================
 
 async def http_request(
     method: str,
@@ -240,32 +357,51 @@ async def http_request(
     *,
     json_body: Optional[Dict[str, Any]] = None,
     timeout: Optional[float] = None,
+    request_id: Optional[str] = None,
 ) -> Any:
 
     if not validate_internal_url(url):
+
         raise HTTPException(
             status_code=500,
-            detail="Target URL is not an approved ARYA internal service.",
+            detail=(
+                "Target URL is not an approved "
+                "ARYA internal service."
+            ),
         )
 
     body = b""
 
     if json_body is not None:
-        body = json.dumps(
-            json_body,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
+
+        try:
+            body = json.dumps(
+                json_body,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+
+        except Exception:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Request payload is not JSON serializable.",
+            )
 
         if len(body) > MAX_REQUEST_BYTES:
+
             raise HTTPException(
                 status_code=413,
                 detail="Request body is too large.",
             )
 
-    headers = internal_headers(body)
+    headers = internal_headers(
+        body,
+        request_id=request_id,
+    )
 
     try:
+
         async with httpx.AsyncClient(
             timeout=timeout or REQUEST_TIMEOUT,
             follow_redirects=False,
@@ -274,26 +410,38 @@ async def http_request(
             response = await client.request(
                 method.upper(),
                 url,
-                content=body if json_body is not None else None,
+                content=(
+                    body
+                    if json_body is not None
+                    else None
+                ),
                 headers=headers,
             )
 
     except httpx.TimeoutException:
+
         raise HTTPException(
             status_code=504,
             detail="ARYA internal service timeout.",
         )
 
     except httpx.RequestError as exc:
+
         raise HTTPException(
             status_code=502,
-            detail=f"ARYA internal service connection failed: {exc}",
+            detail=(
+                "ARYA internal service connection failed: "
+                f"{str(exc)}"
+            ),
         )
 
     if len(response.content) > MAX_RESPONSE_BYTES:
+
         raise HTTPException(
             status_code=502,
-            detail="Internal service response is too large.",
+            detail=(
+                "Internal service response is too large."
+            ),
         )
 
     content_type = response.headers.get(
@@ -302,18 +450,24 @@ async def http_request(
     ).lower()
 
     if "application/json" in content_type:
+
         try:
             data = response.json()
+
         except Exception:
+
             data = {
                 "raw": response.text,
             }
+
     else:
+
         data = {
             "raw": response.text,
         }
 
     if response.status_code >= 400:
+
         raise HTTPException(
             status_code=response.status_code,
             detail=safe_json(data),
@@ -325,11 +479,14 @@ async def http_request(
 async def service_get(
     base_url: str,
     path: str = "",
+    *,
+    request_id: Optional[str] = None,
 ) -> Any:
 
     return await http_request(
         "GET",
         f"{base_url}{path}",
+        request_id=request_id,
     )
 
 
@@ -337,12 +494,48 @@ async def service_post(
     base_url: str,
     path: str,
     payload: Optional[Dict[str, Any]] = None,
+    *,
+    request_id: Optional[str] = None,
 ) -> Any:
 
     return await http_request(
         "POST",
         f"{base_url}{path}",
         json_body=payload or {},
+        request_id=request_id,
+    )
+
+
+# ============================================================
+# Incoming Internal Signature
+# ============================================================
+
+async def verify_incoming_request(
+    request: Request,
+) -> Optional[str]:
+
+    if not REQUIRE_INTERNAL_SIGNATURE:
+
+        return None
+
+    body = await request.body()
+
+    signature = request.headers.get(
+        "X-ARYA-Signature",
+    )
+
+    if not verify_internal_signature(
+        body,
+        signature,
+    ):
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid ARYA internal signature.",
+        )
+
+    return request.headers.get(
+        "X-ARYA-Request-ID",
     )
 
 
@@ -360,19 +553,28 @@ async def check_service(
     cached = _health_cache.get(name)
 
     if cached:
-        if now - cached["timestamp"] <= HEALTH_CACHE_SECONDS:
+
+        if (
+            now - cached["timestamp"]
+            <= HEALTH_CACHE_SECONDS
+        ):
+
             return cached["result"]
 
     started = time.perf_counter()
 
     try:
+
         result = await service_get(
             base_url,
             "/health",
         )
 
         elapsed = round(
-            (time.perf_counter() - started) * 1000,
+            (
+                time.perf_counter()
+                - started
+            ) * 1000,
             2,
         )
 
@@ -392,7 +594,10 @@ async def check_service(
             "url": base_url,
             "status": "offline",
             "latency_ms": round(
-                (time.perf_counter() - started) * 1000,
+                (
+                    time.perf_counter()
+                    - started
+                ) * 1000,
                 2,
             ),
             "error": str(exc),
@@ -409,19 +614,14 @@ async def check_service(
 
 async def all_health() -> Dict[str, Any]:
 
-    services = {
-        "client_api_gateway": CLIENT_API_GATEWAY_URL,
-        "unified_api": UNIFIED_API_URL,
-        "service_runtime": SERVICE_RUNTIME_URL,
-        "central_config": CENTRAL_CONFIG_URL,
-        "runtime_config_bridge": RUNTIME_CONFIG_BRIDGE_URL,
-        "runtime_gateway": RUNTIME_GATEWAY_URL,
-        "main_api_bridge": MAIN_API_BRIDGE_URL,
-    }
+    services = approved_services()
 
     results = await asyncio.gather(
         *[
-            check_service(name, url)
+            check_service(
+                name,
+                url,
+            )
             for name, url in services.items()
         ],
         return_exceptions=False,
@@ -433,22 +633,32 @@ async def all_health() -> Dict[str, Any]:
         if item.get("status") == "online"
     )
 
+    total = len(results)
+
+    if online == total:
+
+        status = "healthy"
+
+    elif online > 0:
+
+        status = "degraded"
+
+    else:
+
+        status = "offline"
+
     return {
-        "status": (
-            "healthy"
-            if online == len(results)
-            else "degraded"
-        ),
-        "total_services": len(results),
+        "status": status,
+        "total_services": total,
         "online_services": online,
-        "offline_services": len(results) - online,
+        "offline_services": total - online,
         "services": results,
         "checked_at": utc_now(),
     }
 
 
 # ============================================================
-# Root / Health
+# Root
 # ============================================================
 
 @app.get("/")
@@ -463,17 +673,21 @@ async def root():
             _started_at,
             timezone.utc,
         ).isoformat(),
-        "architecture": {
-            "client_api_gateway": CLIENT_API_GATEWAY_URL,
-            "unified_api": UNIFIED_API_URL,
-            "central_config": CENTRAL_CONFIG_URL,
-            "service_runtime": SERVICE_RUNTIME_URL,
-            "runtime_config_bridge": RUNTIME_CONFIG_BRIDGE_URL,
-            "runtime_gateway": RUNTIME_GATEWAY_URL,
-            "main_api_bridge": MAIN_API_BRIDGE_URL,
+        "architecture": approved_services(),
+        "security": {
+            "internal_secret_configured": bool(
+                INTERNAL_SECRET
+            ),
+            "signature_required": (
+                REQUIRE_INTERNAL_SIGNATURE
+            ),
         },
     }
 
+
+# ============================================================
+# Health
+# ============================================================
 
 @app.get("/health")
 async def health():
@@ -500,23 +714,39 @@ async def system_map():
         "timestamp": utc_now(),
 
         "layers": {
+
             "client": {
-                "client_api_gateway": CLIENT_API_GATEWAY_URL,
+                "client_api_gateway":
+                    CLIENT_API_GATEWAY_URL,
+            },
+
+            "integration": {
+                "final_integration":
+                    f"http://{HOST}:{PORT}",
             },
 
             "api": {
-                "unified_api": UNIFIED_API_URL,
-                "main_api_bridge": MAIN_API_BRIDGE_URL,
+                "unified_api":
+                    UNIFIED_API_URL,
+
+                "main_api_bridge":
+                    MAIN_API_BRIDGE_URL,
             },
 
             "configuration": {
-                "central_config": CENTRAL_CONFIG_URL,
-                "runtime_config_bridge": RUNTIME_CONFIG_BRIDGE_URL,
+                "central_config":
+                    CENTRAL_CONFIG_URL,
+
+                "runtime_config_bridge":
+                    RUNTIME_CONFIG_BRIDGE_URL,
             },
 
             "runtime": {
-                "service_runtime": SERVICE_RUNTIME_URL,
-                "runtime_gateway": RUNTIME_GATEWAY_URL,
+                "service_runtime":
+                    SERVICE_RUNTIME_URL,
+
+                "runtime_gateway":
+                    RUNTIME_GATEWAY_URL,
             },
         },
 
@@ -542,49 +772,41 @@ async def system_map():
 @app.get("/config")
 async def get_config():
 
-    result = await service_get(
-        RUNTIME_CONFIG_BRIDGE_URL,
-        "/config",
-    )
-
     return {
         "service": APP_NAME,
         "timestamp": utc_now(),
-        "config": result,
+        "config": await service_get(
+            RUNTIME_CONFIG_BRIDGE_URL,
+            "/config",
+        ),
     }
 
 
 @app.get("/runtime/config")
 async def runtime_config():
 
-    result = await service_get(
+    return await service_get(
         RUNTIME_CONFIG_BRIDGE_URL,
         "/runtime/config",
     )
-
-    return result
 
 
 @app.get("/providers")
 async def providers():
 
-    result = await service_get(
+    return await service_get(
         RUNTIME_CONFIG_BRIDGE_URL,
         "/providers",
     )
-
-    return result
 
 
 @app.get("/features")
 async def features():
 
-    result = await service_get(
+    return await service_get(
         RUNTIME_CONFIG_BRIDGE_URL,
         "/features",
     )
-
-    return result
 
 
 # ============================================================
@@ -594,45 +816,49 @@ async def features():
 @app.get("/runtime/services")
 async def runtime_services():
 
-    result = await service_get(
+    return await service_get(
         RUNTIME_CONFIG_BRIDGE_URL,
         "/runtime/services",
     )
 
-    return result
 
+@app.post(
+    "/runtime/services/{service_id}/start"
+)
+async def start_service(
+    service_id: str,
+):
 
-@app.post("/runtime/services/{service_id}/start")
-async def start_service(service_id: str):
-
-    result = await service_post(
+    return await service_post(
         RUNTIME_CONFIG_BRIDGE_URL,
         f"/runtime/services/{service_id}/start",
     )
 
-    return result
 
+@app.post(
+    "/runtime/services/{service_id}/stop"
+)
+async def stop_service(
+    service_id: str,
+):
 
-@app.post("/runtime/services/{service_id}/stop")
-async def stop_service(service_id: str):
-
-    result = await service_post(
+    return await service_post(
         RUNTIME_CONFIG_BRIDGE_URL,
         f"/runtime/services/{service_id}/stop",
     )
 
-    return result
 
+@app.post(
+    "/runtime/services/{service_id}/restart"
+)
+async def restart_service(
+    service_id: str,
+):
 
-@app.post("/runtime/services/{service_id}/restart")
-async def restart_service(service_id: str):
-
-    result = await service_post(
+    return await service_post(
         RUNTIME_CONFIG_BRIDGE_URL,
         f"/runtime/services/{service_id}/restart",
     )
-
-    return result
 
 
 @app.post("/runtime/start-all")
@@ -680,19 +906,30 @@ async def unified_api_proxy(
     request: Request,
 ):
 
+    request_id = (
+        request.headers.get(
+            "X-ARYA-Request-ID"
+        )
+        or new_request_id()
+    )
+
     raw = await request.body()
 
     if len(raw) > MAX_REQUEST_BYTES:
+
         raise HTTPException(
             status_code=413,
             detail="Request body is too large.",
         )
 
     try:
+
         payload = json.loads(
             raw.decode("utf-8")
         )
+
     except Exception:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid JSON body.",
@@ -702,6 +939,7 @@ async def unified_api_proxy(
         UNIFIED_API_URL,
         "/api",
         payload,
+        request_id=request_id,
     )
 
 
@@ -714,19 +952,30 @@ async def runtime_call(
     request: Request,
 ):
 
+    request_id = (
+        request.headers.get(
+            "X-ARYA-Request-ID"
+        )
+        or new_request_id()
+    )
+
     raw = await request.body()
 
     if len(raw) > MAX_REQUEST_BYTES:
+
         raise HTTPException(
             status_code=413,
             detail="Request body is too large.",
         )
 
     try:
+
         payload = json.loads(
             raw.decode("utf-8")
         )
+
     except Exception:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid JSON body.",
@@ -736,6 +985,7 @@ async def runtime_call(
         RUNTIME_GATEWAY_URL,
         "/runtime/call",
         payload,
+        request_id=request_id,
     )
 
 
@@ -757,19 +1007,30 @@ async def main_request(
     request: Request,
 ):
 
+    request_id = (
+        request.headers.get(
+            "X-ARYA-Request-ID"
+        )
+        or new_request_id()
+    )
+
     raw = await request.body()
 
     if len(raw) > MAX_REQUEST_BYTES:
+
         raise HTTPException(
             status_code=413,
             detail="Request body is too large.",
         )
 
     try:
+
         payload = json.loads(
             raw.decode("utf-8")
         )
+
     except Exception:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid JSON body.",
@@ -779,11 +1040,12 @@ async def main_request(
         MAIN_API_BRIDGE_URL,
         "/internal/main-api/request",
         payload,
+        request_id=request_id,
     )
 
 
 # ============================================================
-# Agricultural Doctor API
+# Agricultural Doctor
 # ============================================================
 
 async def doctor_action(
@@ -792,7 +1054,9 @@ async def doctor_action(
     request_id: Optional[str] = None,
 ):
 
-    rid = request_id or new_request_id()
+    rid = normalize_request_id(
+        request_id
+    )
 
     body = {
         "action": action,
@@ -801,10 +1065,12 @@ async def doctor_action(
     }
 
     try:
+
         result = await service_post(
             UNIFIED_API_URL,
             "/arya/doctor",
             body,
+            request_id=rid,
         )
 
         return {
@@ -816,6 +1082,7 @@ async def doctor_action(
         }
 
     except HTTPException:
+
         raise
 
     except Exception as exc:
@@ -959,27 +1226,33 @@ async def arya_updates_run(
 @app.get("/status")
 async def status():
 
-    health_task = all_health()
-
     async def get_runtime():
+
         try:
+
             return await service_get(
                 SERVICE_RUNTIME_URL,
                 "/services",
             )
+
         except Exception as exc:
+
             return {
                 "status": "unavailable",
                 "error": str(exc),
             }
 
     async def get_config_status():
+
         try:
+
             return await service_get(
                 RUNTIME_CONFIG_BRIDGE_URL,
                 "/status",
             )
+
         except Exception as exc:
+
             return {
                 "status": "unavailable",
                 "error": str(exc),
@@ -987,7 +1260,7 @@ async def status():
 
     health_result, runtime_result, config_result = (
         await asyncio.gather(
-            health_task,
+            all_health(),
             get_runtime(),
             get_config_status(),
         )
@@ -1009,15 +1282,7 @@ async def status():
             2,
         ),
 
-        "architecture": {
-            "client_api_gateway": CLIENT_API_GATEWAY_URL,
-            "unified_api": UNIFIED_API_URL,
-            "central_config": CENTRAL_CONFIG_URL,
-            "runtime_config_bridge": RUNTIME_CONFIG_BRIDGE_URL,
-            "service_runtime": SERVICE_RUNTIME_URL,
-            "runtime_gateway": RUNTIME_GATEWAY_URL,
-            "main_api_bridge": MAIN_API_BRIDGE_URL,
-        },
+        "architecture": approved_services(),
     }
 
 
@@ -1034,48 +1299,147 @@ async def contract():
 
         "purpose": (
             "Final integration layer connecting "
-            "ARYA client, API, configuration and runtime layers."
+            "ARYA client, API, configuration, "
+            "runtime and agricultural services."
         ),
 
         "routes": {
+
             "health": "/health",
-            "system_map": "/system-map",
-            "status": "/status",
-            "config": "/config",
-            "runtime_config": "/runtime/config",
-            "providers": "/providers",
-            "features": "/features",
-            "runtime_services": "/runtime/services",
-            "runtime_start_all": "/runtime/start-all",
-            "runtime_stop_all": "/runtime/stop-all",
-            "runtime_restart_all": "/runtime/restart-all",
-            "unified_api": "/api/unified",
-            "runtime_call": "/runtime/call",
-            "main_health": "/main/health",
-            "main_request": "/main/request",
-            "doctor": "/arya/doctor",
-            "analyze": "/arya/analyze",
-            "diagnose": "/arya/diagnose",
-            "recommend": "/arya/recommend",
-            "vision": "/arya/vision",
-            "weather": "/arya/weather",
-            "geocode": "/arya/geocode",
-            "payment": "/arya/payment",
-            "updates": "/arya/updates",
-            "updates_run": "/arya/updates/run",
+
+            "system_map":
+                "/system-map",
+
+            "status":
+                "/status",
+
+            "config":
+                "/config",
+
+            "runtime_config":
+                "/runtime/config",
+
+            "providers":
+                "/providers",
+
+            "features":
+                "/features",
+
+            "runtime_services":
+                "/runtime/services",
+
+            "runtime_start_all":
+                "/runtime/start-all",
+
+            "runtime_stop_all":
+                "/runtime/stop-all",
+
+            "runtime_restart_all":
+                "/runtime/restart-all",
+
+            "runtime_system_map":
+                "/runtime/system-map",
+
+            "unified_api":
+                "/api/unified",
+
+            "runtime_call":
+                "/runtime/call",
+
+            "main_health":
+                "/main/health",
+
+            "main_request":
+                "/main/request",
+
+            "doctor":
+                "/arya/doctor",
+
+            "analyze":
+                "/arya/analyze",
+
+            "diagnose":
+                "/arya/diagnose",
+
+            "recommend":
+                "/arya/recommend",
+
+            "vision":
+                "/arya/vision",
+
+            "weather":
+                "/arya/weather",
+
+            "geocode":
+                "/arya/geocode",
+
+            "payment":
+                "/arya/payment",
+
+            "updates":
+                "/arya/updates",
+
+            "updates_run":
+                "/arya/updates/run",
         },
 
         "principles": [
+
             "No modification of backend/main.py",
+
             "No deletion of existing services",
+
             "Internal service URLs are configuration driven",
-            "Internal requests use HMAC when configured",
+
+            "Internal requests support HMAC authentication",
+
             "No arbitrary user supplied URLs are proxied",
-            "Response size is limited",
+
             "Request size is limited",
+
+            "Response size is limited",
+
+            "Health results are cached",
+
+            "Request IDs are propagated",
+
             "Existing modules remain independent",
-            "Future providers can be added without changing main.py",
+
+            "Future providers can be added without "
+            "changing backend/main.py",
         ],
+    }
+
+
+# ============================================================
+# Security Information
+# ============================================================
+
+@app.get("/security")
+async def security_status():
+
+    return {
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "timestamp": utc_now(),
+
+        "internal_secret_configured": bool(
+            INTERNAL_SECRET
+        ),
+
+        "signature_required": (
+            REQUIRE_INTERNAL_SIGNATURE
+        ),
+
+        "request_limit_bytes":
+            MAX_REQUEST_BYTES,
+
+        "response_limit_bytes":
+            MAX_RESPONSE_BYTES,
+
+        "redirects_allowed": False,
+
+        "arbitrary_proxy_urls": False,
     }
 
 
@@ -1104,7 +1468,7 @@ async def global_exception_handler(
 
 
 # ============================================================
-# Startup / Shutdown
+# Startup
 # ============================================================
 
 @app.on_event("startup")
@@ -1112,11 +1476,21 @@ async def startup_event():
 
     app.state.started_at = utc_now()
 
+    async with _state_lock:
+
+        _health_cache.clear()
+
+
+# ============================================================
+# Shutdown
+# ============================================================
 
 @app.on_event("shutdown")
 async def shutdown_event():
 
-    _health_cache.clear()
+    async with _state_lock:
+
+        _health_cache.clear()
 
 
 # ============================================================
