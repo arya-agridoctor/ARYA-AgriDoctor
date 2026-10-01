@@ -1,40 +1,15 @@
 """
-===============================================================
- ARYA AgriDoctor — MASTER SYSTEM
- Version: 1.0.0
-===============================================================
+ARYA AgriDoctor — MASTER GATEWAY
+Version: 2.0.0
 
-هسته مرکزی یکپارچه ARYA AgriDoctor
+Central gateway for the real ARYA AgriDoctor backend.
 
-این فایل:
-- main.py را تغییر نمی‌دهد.
-- ماژول‌های موجود را حذف نمی‌کند.
-- تمام سرویس‌ها را از یک نقطه مدیریت می‌کند.
-- در صورت قطع یک سرویس، کل سیستم را از کار نمی‌اندازد.
-- Health Check
-- Retry
-- Circuit Breaker
-- HMAC داخلی
-- Service Registry
-- Provider Registry
-- OWNER / Runtime
-- Vision
-- Voice / Language
-- Agriculture AI
-- Weather
-- Geocoding
-- Payment
-- Updates
-- Orchestration
-- System Map
-- Generic Service Proxy
-را در یک هسته مرکزی جمع می‌کند.
-
-پورت پیش‌فرض:
-8030
-
-اجرای مستقیم:
-uvicorn arya_master_system:app --host 0.0.0.0 --port 8030
+Important:
+- backend/main.py is NOT modified by this file.
+- The master discovers the real backend routes from /openapi.json.
+- Generic proxy routes allow future backend endpoints without adding
+  another master wrapper.
+- Compatibility routes are provided for legacy /arya/* clients.
 """
 
 from __future__ import annotations
@@ -42,32 +17,33 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
-import ipaddress
 import json
 import os
-import socket
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
-from urllib.parse import urlparse
+from typing import Any, Optional
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 
 
 # ===============================================================
-# 1. CONFIG
+# CONFIG
 # ===============================================================
 
-APP_NAME = "ARYA AgriDoctor MASTER SYSTEM"
-APP_VERSION = "1.0.0"
+APP_NAME = "ARYA AgriDoctor MASTER GATEWAY"
+APP_VERSION = "2.0.0"
+
+BACKEND_URL = os.getenv(
+    "ARYA_BACKEND_URL",
+    "http://127.0.0.1:8000",
+).rstrip("/")
 
 HOST = os.getenv(
     "ARYA_MASTER_HOST",
-    "127.0.0.1",
+    "0.0.0.0",
 )
 
 PORT = int(
@@ -80,7 +56,7 @@ PORT = int(
 TIMEOUT = float(
     os.getenv(
         "ARYA_MASTER_TIMEOUT",
-        "25",
+        "30",
     )
 )
 
@@ -97,36 +73,35 @@ RETRIES = max(
 MAX_REQUEST_BYTES = int(
     os.getenv(
         "ARYA_MASTER_MAX_REQUEST_BYTES",
-        str(4 * 1024 * 1024),
+        str(8 * 1024 * 1024),
     )
 )
 
 MAX_RESPONSE_BYTES = int(
     os.getenv(
         "ARYA_MASTER_MAX_RESPONSE_BYTES",
-        str(8 * 1024 * 1024),
+        str(16 * 1024 * 1024),
     )
 )
 
-HEALTH_CACHE_SECONDS = float(
-    os.getenv(
-        "ARYA_MASTER_HEALTH_CACHE_SECONDS",
-        "5",
-    )
+CIRCUIT_FAILURE_THRESHOLD = max(
+    1,
+    int(
+        os.getenv(
+            "ARYA_MASTER_CIRCUIT_FAILURE_THRESHOLD",
+            "3",
+        )
+    ),
 )
 
-CIRCUIT_FAILURE_THRESHOLD = int(
-    os.getenv(
-        "ARYA_MASTER_CIRCUIT_FAILURE_THRESHOLD",
-        "3",
-    )
-)
-
-CIRCUIT_COOLDOWN_SECONDS = float(
-    os.getenv(
-        "ARYA_MASTER_CIRCUIT_COOLDOWN_SECONDS",
-        "30",
-    )
+CIRCUIT_COOLDOWN = max(
+    1.0,
+    float(
+        os.getenv(
+            "ARYA_MASTER_CIRCUIT_COOLDOWN_SECONDS",
+            "30",
+        )
+    ),
 )
 
 INTERNAL_SECRET = os.getenv(
@@ -134,316 +109,166 @@ INTERNAL_SECRET = os.getenv(
     "",
 )
 
-REQUIRE_INTERNAL_SIGNATURE = (
+REQUIRE_SIGNATURE = (
     os.getenv(
         "ARYA_MASTER_REQUIRE_INTERNAL_SIGNATURE",
         "false",
     ).lower()
-    in {"1", "true", "yes", "on"}
+    in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+)
+
+OPENAPI_CACHE_SECONDS = max(
+    1.0,
+    float(
+        os.getenv(
+            "ARYA_MASTER_OPENAPI_CACHE_SECONDS",
+            "15",
+        )
+    ),
 )
 
 
 # ===============================================================
-# 2. SERVICE REGISTRY
-# ===============================================================
-
-SERVICES: Dict[str, Dict[str, Any]] = {
-
-    "main": {
-        "url": os.getenv(
-            "ARYA_MAIN_API_URL",
-            "http://127.0.0.1:8000",
-        ),
-        "health": "/health",
-        "enabled": True,
-        "group": "core",
-    },
-
-    "vision": {
-        "url": os.getenv(
-            "ARYA_VISION_URL",
-            "http://127.0.0.1:8001",
-        ),
-        "health": "/health",
-        "enabled": True,
-        "group": "ai",
-    },
-
-    "voice_language": {
-        "url": os.getenv(
-            "ARYA_VOICE_LANGUAGE_URL",
-            "http://127.0.0.1:8002",
-        ),
-        "health": "/health",
-        "enabled": True,
-        "group": "accessibility",
-    },
-
-    "agri_engine": {
-        "url": os.getenv(
-            "ARYA_AGRI_ENGINE_URL",
-            "http://127.0.0.1:8003",
-        ),
-        "health": "/health",
-        "enabled": True,
-        "group": "agriculture",
-    },
-
-    "commerce_security": {
-        "url": os.getenv(
-            "ARYA_COMMERCE_URL",
-            "http://127.0.0.1:8004",
-        ),
-        "health": "/health",
-        "enabled": True,
-        "group": "commerce",
-    },
-
-    "orchestrator": {
-        "url": os.getenv(
-            "ARYA_ORCHESTRATOR_URL",
-            "http://127.0.0.1:8010",
-        ),
-        "health": "/health",
-        "enabled": True,
-        "group": "orchestration",
-    },
-
-    "data_update": {
-        "url": os.getenv(
-            "ARYA_DATA_UPDATE_URL",
-            "http://127.0.0.1:8014",
-        ),
-        "health": "/health",
-        "enabled": True,
-        "group": "updates",
-    },
-
-    "owner_integration": {
-        "url": os.getenv(
-            "ARYA_OWNER_INTEGRATION_URL",
-            "http://127.0.0.1:8015",
-        ),
-        "health": "/health",
-        "enabled": True,
-        "group": "owner",
-    },
-
-    "owner_runtime_gateway": {
-        "url": os.getenv(
-            "ARYA_RUNTIME_GATEWAY_URL",
-            "http://127.0.0.1:8016",
-        ),
-        "health": "/health",
-        "enabled": True,
-        "group": "runtime",
-    },
-
-    "final_integration": {
-        "url": os.getenv(
-            "ARYA_FINAL_INTEGRATION_URL",
-            "http://127.0.0.1:8027",
-        ),
-        "health": "/health",
-        "enabled": True,
-        "group": "compatibility",
-    },
-}
-
-
-# ===============================================================
-# 3. PROVIDER REGISTRY
-# ===============================================================
-
-PROVIDERS: Dict[str, Dict[str, Any]] = {
-
-    "open_meteo_weather": {
-        "type": "weather",
-        "url": os.getenv(
-            "ARYA_OPEN_METEO_WEATHER_URL",
-            "https://api.open-meteo.com/v1/forecast",
-        ),
-        "enabled": True,
-        "priority": 1,
-    },
-
-    "open_meteo_geocoding": {
-        "type": "geocoding",
-        "url": os.getenv(
-            "ARYA_OPEN_METEO_GEOCODING_URL",
-            "https://geocoding-api.open-meteo.com/v1/search",
-        ),
-        "enabled": True,
-        "priority": 1,
-    },
-}
-
-
-# ===============================================================
-# 4. STATE
-# ===============================================================
-
-@dataclass
-class CircuitState:
-    failures: int = 0
-    opened_at: float = 0.0
-
-
-@dataclass
-class HealthState:
-    timestamp: float = 0.0
-    result: Dict[str, Any] = field(
-        default_factory=dict
-    )
-
-
-circuits: Dict[str, CircuitState] = defaultdict(
-    CircuitState
-)
-
-health_cache: Dict[str, HealthState] = defaultdict(
-    HealthState
-)
-
-request_counters: Dict[str, int] = defaultdict(int)
-
-last_errors: Dict[str, str] = {}
-
-
-# ===============================================================
-# 5. FASTAPI
+# FASTAPI
 # ===============================================================
 
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description=(
-        "Central Master Gateway for ARYA AgriDoctor"
+        "Single gateway for the real "
+        "ARYA AgriDoctor backend"
     ),
 )
 
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 # ===============================================================
-# 6. SECURITY HELPERS
+# STATE
 # ===============================================================
 
-def is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
-    return (
-        ip.is_private
-        or ip.is_loopback
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
+class Circuit:
+
+    def __init__(self) -> None:
+
+        self.failures = 0
+        self.opened_at = 0.0
 
 
-def host_resolves_to_blocked_address(
-    hostname: str,
-) -> bool:
+backend_circuit = Circuit()
 
-    hostname = hostname.strip().lower()
+stats = defaultdict(int)
 
-    if hostname in {
-        "localhost",
-        "localhost.localdomain",
-    }:
-        return True
+last_error: Optional[str] = None
 
-    try:
-        records = socket.getaddrinfo(
-            hostname,
-            None,
-        )
-    except socket.gaierror:
+_openapi_cache: dict[str, Any] = {}
+
+_openapi_cached_at = 0.0
+
+
+# ===============================================================
+# HELPERS
+# ===============================================================
+
+def backend_url(
+    path: str,
+) -> str:
+
+    if not path.startswith("/"):
+        path = "/" + path
+
+    return BACKEND_URL + path
+
+
+def clean_headers(
+    headers: httpx.Headers,
+) -> dict[str, str]:
+
+    excluded = {
+        "host",
+        "content-length",
+        "connection",
+        "keep-alive",
+        "transfer-encoding",
+        "upgrade",
+    }
+
+    return {
+        key: value
+        for key, value
+        in headers.items()
+        if key.lower()
+        not in excluded
+    }
+
+
+# ===============================================================
+# CIRCUIT BREAKER
+# ===============================================================
+
+def circuit_open() -> bool:
+
+    if not backend_circuit.opened_at:
         return False
 
-    for record in records:
-
-        address = record[4][0]
-
-        try:
-            ip = ipaddress.ip_address(
-                address
-            )
-        except ValueError:
-            continue
-
-        if is_blocked_ip(ip):
-            return True
-
-    return False
-
-
-def validate_internal_url(
-    url: str,
-) -> str:
-
-    parsed = urlparse(url)
-
-    if parsed.scheme not in {
-        "http",
-        "https",
-    }:
-        raise ValueError(
-            "Unsupported internal URL scheme"
-        )
-
-    if not parsed.hostname:
-        raise ValueError(
-            "Missing hostname"
-        )
-
-    host = parsed.hostname.lower()
-
-    # Local services are explicitly configured.
-    if host in {
-        "127.0.0.1",
-        "::1",
-        "localhost",
-    }:
-        return url.rstrip("/")
-
-    if host_resolves_to_blocked_address(
-        host
+    if (
+        time.time()
+        - backend_circuit.opened_at
+        >= CIRCUIT_COOLDOWN
     ):
-        raise ValueError(
-            "Unsafe internal destination"
-        )
 
-    return url.rstrip("/")
+        backend_circuit.failures = 0
+        backend_circuit.opened_at = 0.0
+
+        return False
+
+    return True
 
 
-def validate_provider_url(
-    url: str,
-) -> str:
+def success() -> None:
 
-    parsed = urlparse(url)
+    backend_circuit.failures = 0
+    backend_circuit.opened_at = 0.0
 
-    if parsed.scheme not in {
-        "http",
-        "https",
-    }:
-        raise ValueError(
-            "Unsupported provider URL scheme"
-        )
 
-    if not parsed.hostname:
-        raise ValueError(
-            "Missing provider hostname"
-        )
+def failure(
+    error: str,
+) -> None:
 
-    if host_resolves_to_blocked_address(
-        parsed.hostname
+    global last_error
+
+    last_error = str(error)
+
+    backend_circuit.failures += 1
+
+    if (
+        backend_circuit.failures
+        >= CIRCUIT_FAILURE_THRESHOLD
     ):
-        raise ValueError(
-            "Unsafe provider destination"
+
+        backend_circuit.opened_at = (
+            time.time()
         )
 
-    return url.rstrip("/")
 
+# ===============================================================
+# HMAC
+# ===============================================================
 
-def create_signature(
+def signature(
     method: str,
     path: str,
     body: bytes,
@@ -452,17 +277,17 @@ def create_signature(
     if not INTERNAL_SECRET:
         return ""
 
-    payload = (
-        method.upper().encode()
+    message = (
+        method.upper().encode("utf-8")
         + b"\n"
-        + path.encode()
+        + path.encode("utf-8")
         + b"\n"
         + body
     )
 
     return hmac.new(
-        INTERNAL_SECRET.encode(),
-        payload,
+        INTERNAL_SECRET.encode("utf-8"),
+        message,
         hashlib.sha256,
     ).hexdigest()
 
@@ -473,211 +298,118 @@ def verify_signature(
 ) -> bool:
 
     if not INTERNAL_SECRET:
-        return not REQUIRE_INTERNAL_SIGNATURE
+
+        return not REQUIRE_SIGNATURE
 
     received = request.headers.get(
         "X-ARYA-Signature",
         "",
     )
 
-    expected = create_signature(
+    expected = signature(
         request.method,
         request.url.path,
         body,
     )
 
-    return bool(received) and hmac.compare_digest(
-        received,
-        expected,
+    return (
+        bool(received)
+        and hmac.compare_digest(
+            received,
+            expected,
+        )
     )
 
 
 # ===============================================================
-# 7. CIRCUIT BREAKER
+# RAW BACKEND REQUEST
 # ===============================================================
 
-def circuit_is_open(
-    service: str,
-) -> bool:
-
-    state = circuits[service]
-
-    if state.opened_at == 0:
-        return False
-
-    if (
-        time.time() - state.opened_at
-        >= CIRCUIT_COOLDOWN_SECONDS
-    ):
-        state.failures = 0
-        state.opened_at = 0
-        return False
-
-    return True
-
-
-def record_success(
-    service: str,
-) -> None:
-
-    state = circuits[service]
-
-    state.failures = 0
-    state.opened_at = 0
-
-
-def record_failure(
-    service: str,
-    error: str,
-) -> None:
-
-    state = circuits[service]
-
-    state.failures += 1
-
-    last_errors[service] = str(
-        error
-    )
-
-    if (
-        state.failures
-        >= CIRCUIT_FAILURE_THRESHOLD
-    ):
-        state.opened_at = time.time()
-
-
-# ===============================================================
-# 8. SAFE JSON
-# ===============================================================
-
-def parse_body(
-    body: bytes,
-) -> Any:
-
-    if not body:
-        return None
-
-    if len(body) > MAX_REQUEST_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail="Request too large",
-        )
-
-    try:
-        return json.loads(
-            body.decode("utf-8")
-        )
-    except Exception:
-        return {
-            "_raw_text": body.decode(
-                "utf-8",
-                errors="replace",
-            )
-        }
-
-
-# ===============================================================
-# 9. CORE HTTP ENGINE
-# ===============================================================
-
-async def http_call(
+async def raw_backend_call(
+    method: str,
+    path: str,
     *,
-    name: str,
-    base_url: str,
-    path: str = "",
-    method: str = "GET",
-    payload: Any = None,
+    body: bytes = b"",
     query: Optional[
-        Dict[str, Any]
+        list[tuple[str, str]]
     ] = None,
     headers: Optional[
-        Dict[str, str]
+        dict[str, str]
     ] = None,
-    external: bool = False,
-) -> Dict[str, Any]:
+    retry: bool = True,
+) -> httpx.Response:
 
-    if circuit_is_open(name):
-        return {
-            "ok": False,
-            "service": name,
-            "error": "circuit_open",
-        }
+    if circuit_open():
 
-    try:
-
-        if external:
-            base = validate_provider_url(
-                base_url
-            )
-        else:
-            base = validate_internal_url(
-                base_url
-            )
-
-    except Exception as exc:
-
-        record_failure(
-            name,
-            str(exc),
-        )
-
-        return {
-            "ok": False,
-            "service": name,
-            "error": "invalid_destination",
-            "message": str(exc),
-        }
-
-    if path:
-
-        if not path.startswith("/"):
-            path = "/" + path
-
-        target = base + path
-
-    else:
-        target = base
-
-    body = None
-
-    if payload is not None:
-
-        body = json.dumps(
-            payload,
-            ensure_ascii=False,
-        ).encode(
-            "utf-8"
-        )
-
-        if len(body) > MAX_REQUEST_BYTES:
-
-            return {
+        raise HTTPException(
+            status_code=503,
+            detail={
                 "ok": False,
-                "service": name,
-                "error": "request_too_large",
-            }
+                "error":
+                    "backend_circuit_open",
+            },
+        )
+
+    if (
+        len(body)
+        > MAX_REQUEST_BYTES
+    ):
+
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "ok": False,
+                "error":
+                    "request_too_large",
+            },
+        )
+
+    method = method.upper()
+
+    retryable_methods = {
+        "GET",
+        "HEAD",
+        "OPTIONS",
+    }
+
+    attempts = (
+        RETRIES + 1
+        if (
+            retry
+            and method
+            in retryable_methods
+        )
+        else 1
+    )
+
+    target = backend_url(
+        path
+    )
 
     request_headers = dict(
         headers or {}
     )
 
-    if (
-        INTERNAL_SECRET
-        and not external
-    ):
+    if INTERNAL_SECRET:
+
+        request_headers[
+            "X-ARYA-Gateway"
+        ] = "ARYA-MASTER"
 
         request_headers[
             "X-ARYA-Signature"
-        ] = create_signature(
+        ] = signature(
             method,
-            urlparse(target).path or "/",
-            body or b"",
+            path,
+            body,
         )
 
-    last_error = None
+    last_exc: Optional[
+        Exception
+    ] = None
 
     for attempt in range(
-        RETRIES + 1
+        attempts
     ):
 
         try:
@@ -692,424 +424,644 @@ async def http_call(
             ) as client:
 
                 response = await client.request(
-                    method=method.upper(),
+                    method=method,
                     url=target,
-                    params=query,
                     content=body,
+                    params=query,
                     headers=request_headers,
                 )
 
-                raw = response.content
+            if (
+                len(response.content)
+                > MAX_RESPONSE_BYTES
+            ):
 
-                if len(raw) > MAX_RESPONSE_BYTES:
-
-                    record_failure(
-                        name,
-                        "response_too_large",
-                    )
-
-                    return {
-                        "ok": False,
-                        "service": name,
-                        "error": "response_too_large",
-                    }
-
-                if response.status_code in {
-                    301,
-                    302,
-                    303,
-                    307,
-                    308,
-                }:
-
-                    record_failure(
-                        name,
-                        "redirect_rejected",
-                    )
-
-                    return {
-                        "ok": False,
-                        "service": name,
-                        "status_code": response.status_code,
-                        "error": "redirect_rejected",
-                    }
-
-                try:
-                    data = response.json()
-                except Exception:
-                    data = response.text
-
-                if (
-                    200
-                    <= response.status_code
-                    < 300
-                ):
-
-                    record_success(
-                        name
-                    )
-
-                    return {
-                        "ok": True,
-                        "service": name,
-                        "status_code": response.status_code,
-                        "data": data,
-                    }
-
-                last_error = (
-                    f"HTTP "
-                    f"{response.status_code}: "
-                    f"{data}"
+                failure(
+                    "backend_response_too_large"
                 )
 
-                if (
-                    400
-                    <= response.status_code
-                    < 500
-                ):
-                    break
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "ok": False,
+                        "error":
+                            "backend_response_too_large",
+                    },
+                )
 
-        except (
-            httpx.TimeoutException,
-            httpx.NetworkError,
-        ) as exc:
+            if (
+                response.status_code
+                in {
+                    502,
+                    503,
+                    504,
+                }
+                and attempt + 1
+                < attempts
+            ):
 
-            last_error = str(exc)
-
-            if attempt < RETRIES:
                 await asyncio.sleep(
                     0.35
                     * (attempt + 1)
                 )
 
-        except Exception as exc:
+                continue
 
-            last_error = str(exc)
-            break
+            if (
+                200
+                <= response.status_code
+                < 500
+            ):
 
-    record_failure(
-        name,
-        last_error or "unknown_error",
+                success()
+
+            elif (
+                response.status_code
+                >= 500
+            ):
+
+                failure(
+                    "backend_http_"
+                    + str(
+                        response.status_code
+                    )
+                )
+
+            else:
+
+                success()
+
+            return response
+
+        except HTTPException:
+
+            raise
+
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.ConnectError,
+        ) as exc:
+
+            last_exc = exc
+
+            failure(
+                str(exc)
+            )
+
+            if (
+                attempt + 1
+                < attempts
+            ):
+
+                await asyncio.sleep(
+                    0.35
+                    * (attempt + 1)
+                )
+
+                continue
+
+    raise HTTPException(
+        status_code=502,
+        detail={
+            "ok": False,
+            "error":
+                "backend_unreachable",
+            "message":
+                str(
+                    last_exc
+                    or "unknown error"
+                ),
+        },
     )
 
-    return {
-        "ok": False,
-        "service": name,
-        "error": "upstream_error",
-        "message": (
-            last_error
-            or "Unknown upstream error"
-        ),
-    }
-
 
 # ===============================================================
-# 10. SERVICE CALLER
+# JSON BACKEND REQUEST
 # ===============================================================
 
-async def call_service(
-    service: str,
+async def backend_json(
+    method: str,
     path: str,
     *,
-    method: str = "POST",
-    payload: Any = None,
+    body: Any = None,
     query: Optional[
-        Dict[str, Any]
+        list[tuple[str, str]]
     ] = None,
-) -> Dict[str, Any]:
+) -> Any:
 
-    config = SERVICES.get(
-        service
-    )
+    raw = b""
 
-    if not config:
+    headers = {
+        "Accept":
+            "application/json",
+    }
 
-        return {
-            "ok": False,
-            "service": service,
-            "error": "service_not_registered",
-        }
+    if body is not None:
 
-    if not config.get(
-        "enabled",
-        True,
-    ):
+        raw = json.dumps(
+            body,
+            ensure_ascii=False,
+        ).encode(
+            "utf-8"
+        )
 
-        return {
-            "ok": False,
-            "service": service,
-            "error": "service_disabled",
-        }
+        headers[
+            "Content-Type"
+        ] = "application/json"
 
-    request_counters[
-        service
-    ] += 1
-
-    return await http_call(
-        name=service,
-        base_url=config["url"],
-        path=path,
-        method=method,
-        payload=payload,
+    response = await raw_backend_call(
+        method,
+        path,
+        body=raw,
         query=query,
+        headers=headers,
     )
 
+    try:
 
-# ===============================================================
-# 11. HEALTH
-# ===============================================================
+        return response.json()
 
-async def service_health(
-    service: str,
-) -> Dict[str, Any]:
-
-    config = SERVICES.get(
-        service
-    )
-
-    if not config:
+    except Exception:
 
         return {
-            "service": service,
-            "status": "unknown",
+            "status_code":
+                response.status_code,
+
+            "text":
+                response.text,
         }
 
-    now = time.time()
 
-    cached = health_cache[
-        service
-    ]
+# ===============================================================
+# GENERIC PROXY
+# ===============================================================
+
+async def proxy_request(
+    request: Request,
+    path: str,
+) -> Response:
+
+    body = await request.body()
 
     if (
-        cached.result
-        and now - cached.timestamp
-        < HEALTH_CACHE_SECONDS
+        REQUIRE_SIGNATURE
+        and request.url.path.startswith(
+            "/internal/"
+        )
+        and not verify_signature(
+            request,
+            body,
+        )
     ):
-        return cached.result
 
-    if not config.get(
-        "enabled",
-        True,
-    ):
-
-        result = {
-            "service": service,
-            "status": "disabled",
-            "enabled": False,
-        }
-
-    else:
-
-        started = time.perf_counter()
-
-        result = await call_service(
-            service,
-            config.get(
-                "health",
-                "/health",
-            ),
-            method="GET",
+        return JSONResponse(
+            status_code=401,
+            content={
+                "ok": False,
+                "error":
+                    "invalid_internal_signature",
+            },
         )
 
-        latency = round(
-            (
-                time.perf_counter()
-                - started
-            )
-            * 1000,
-            2,
+    query = [
+        (
+            key,
+            value,
         )
 
-        result = {
-            **result,
-            "service": service,
-            "latency_ms": latency,
-            "enabled": True,
-            "circuit_open":
-                circuit_is_open(
-                    service
-                ),
-        }
+        for key, value
+        in request.query_params.multi_items()
+    ]
 
-    health_cache[
-        service
-    ] = HealthState(
-        timestamp=now,
-        result=result,
+    response = await raw_backend_call(
+        request.method,
+        path,
+        body=body,
+        query=query,
+        headers=clean_headers(
+            request.headers
+        ),
     )
+
+    response_headers = clean_headers(
+        response.headers
+    )
+
+    content_type = response.headers.get(
+        "content-type"
+    )
+
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=response_headers,
+        media_type=content_type,
+    )
+
+
+# ===============================================================
+# OPENAPI DISCOVERY
+# ===============================================================
+
+async def load_openapi(
+    force: bool = False,
+) -> dict[str, Any]:
+
+    global _openapi_cache
+    global _openapi_cached_at
+
+    if (
+        not force
+        and _openapi_cache
+        and (
+            time.time()
+            - _openapi_cached_at
+            < OPENAPI_CACHE_SECONDS
+        )
+    ):
+
+        return _openapi_cache
+
+    try:
+
+        response = await raw_backend_call(
+            "GET",
+            "/openapi.json",
+            retry=True,
+        )
+
+        if (
+            response.status_code
+            == 200
+        ):
+
+            data = response.json()
+
+            if isinstance(
+                data,
+                dict,
+            ):
+
+                _openapi_cache = data
+
+                _openapi_cached_at = (
+                    time.time()
+                )
+
+                return data
+
+    except Exception:
+
+        pass
+
+    return _openapi_cache
+
+
+def route_exists(
+    openapi: dict[str, Any],
+    path: str,
+    method: str,
+) -> bool:
+
+    item = (
+        openapi
+        .get(
+            "paths",
+            {}
+        )
+        .get(
+            path
+        )
+    )
+
+    if not isinstance(
+        item,
+        dict,
+    ):
+
+        return False
+
+    return (
+        method.lower()
+        in item
+    )
+
+
+async def resolve_candidate(
+    candidates: list[str],
+    method: str,
+) -> Optional[str]:
+
+    openapi = await load_openapi()
+
+    for path in candidates:
+
+        if route_exists(
+            openapi,
+            path,
+            method,
+        ):
+
+            return path
+
+    if not openapi:
+
+        if candidates:
+            return candidates[0]
+
+    return None
+
+
+# ===============================================================
+# QUERY
+# ===============================================================
+
+def query_to_dict(
+    request: Request,
+) -> dict[str, Any]:
+
+    result: dict[
+        str,
+        Any,
+    ] = {}
+
+    for key, value in (
+        request
+        .query_params
+        .multi_items()
+    ):
+
+        result[key] = value
 
     return result
 
 
-async def all_health():
+# ===============================================================
+# COMPATIBILITY ROUTER
+# ===============================================================
 
-    results = await asyncio.gather(
-        *(
-            service_health(name)
-            for name in SERVICES
-        ),
-        return_exceptions=True,
+async def compatibility_json_request(
+    request: Request,
+    candidates: list[str],
+    *,
+    default_body:
+        Optional[
+            dict[str, Any]
+        ] = None,
+) -> Response:
+
+    method = request.method.upper()
+
+    body = await request.body()
+
+    if body:
+
+        try:
+
+            payload = json.loads(
+                body.decode(
+                    "utf-8"
+                )
+            )
+
+        except Exception:
+
+            payload = (
+                default_body
+                or {}
+            )
+
+    else:
+
+        payload = (
+            default_body
+            or query_to_dict(
+                request
+            )
+        )
+
+    target_method = method
+
+    if method == "GET":
+
+        target_method = "POST"
+
+    target = await resolve_candidate(
+        candidates,
+        target_method,
     )
 
-    output = {}
+    if not target:
 
-    for name, result in zip(
-        SERVICES,
-        results,
+        return JSONResponse(
+            status_code=404,
+            content={
+                "ok": False,
+                "error":
+                    "compatible_backend_route_not_found",
+                "candidates":
+                    candidates,
+            },
+        )
+
+    if (
+        target_method
+        == "GET"
     ):
 
-        if isinstance(
-            result,
-            Exception,
-        ):
+        result = await backend_json(
+            "GET",
+            target,
+            query=[
+                (
+                    str(k),
+                    str(v),
+                )
 
-            output[name] = {
-                "service": name,
-                "status": "error",
-                "message": str(result),
-            }
+                for k, v
+                in payload.items()
+            ],
+        )
 
-        else:
+    else:
 
-            output[name] = result
+        result = await backend_json(
+            "POST",
+            target,
+            body=payload,
+        )
 
-    return output
-
-
-# ===============================================================
-# 12. MODELS
-# ===============================================================
-
-class MasterRequest(BaseModel):
-
-    action: str = Field(
-        ...,
-        min_length=1,
-        max_length=100,
-    )
-
-    data: Dict[str, Any] = Field(
-        default_factory=dict
-    )
-
-
-class ProviderRequest(BaseModel):
-
-    provider: str
-
-    params: Dict[str, Any] = Field(
-        default_factory=dict
+    return JSONResponse(
+        content=result,
+        status_code=200,
     )
 
 
 # ===============================================================
-# 13. ROOT
+# ROOT
 # ===============================================================
 
 @app.get("/")
 async def root():
 
     return {
-        "name": APP_NAME,
-        "version": APP_VERSION,
-        "status": "running",
-        "role": "master",
-        "port": PORT,
-    }
+        "service":
+            APP_NAME,
 
+        "version":
+            APP_VERSION,
 
-@app.get("/health")
-async def health():
+        "status":
+            "running",
 
-    return {
-        "ok": True,
-        "name": APP_NAME,
-        "version": APP_VERSION,
-        "services": await all_health(),
-    }
-
-
-@app.get("/status")
-async def status():
-
-    return {
-        "ok": True,
-        "version": APP_VERSION,
-
-        "services": {
-
-            name: {
-
-                "enabled":
-                    config.get(
-                        "enabled",
-                        True,
-                    ),
-
-                "group":
-                    config.get(
-                        "group"
-                    ),
-
-                "requests":
-                    request_counters[
-                        name
-                    ],
-
-                "circuit_open":
-                    circuit_is_open(
-                        name
-                    ),
-
-                "last_error":
-                    last_errors.get(
-                        name
-                    ),
-
-            }
-
-            for name, config
-            in SERVICES.items()
-        },
-
-        "providers": {
-
-            name: {
-
-                "enabled":
-                    config.get(
-                        "enabled",
-                        True,
-                    ),
-
-                "type":
-                    config.get(
-                        "type"
-                    ),
-
-                "priority":
-                    config.get(
-                        "priority"
-                    ),
-
-            }
-
-            for name, config
-            in PROVIDERS.items()
-        },
+        "backend":
+            BACKEND_URL,
     }
 
 
 # ===============================================================
-# 14. SYSTEM MAP
+# HEALTH
+# ===============================================================
+
+@app.get("/health")
+async def health():
+
+    started = (
+        time.perf_counter()
+    )
+
+    try:
+
+        response = await raw_backend_call(
+            "GET",
+            "/health",
+            retry=True,
+        )
+
+        healthy = (
+            200
+            <= response.status_code
+            < 300
+        )
+
+        return {
+            "ok":
+                healthy,
+
+            "master":
+                "ok",
+
+            "backend": {
+                "ok":
+                    healthy,
+
+                "status_code":
+                    response.status_code,
+            },
+
+            "latency_ms":
+                round(
+                    (
+                        time.perf_counter()
+                        - started
+                    )
+                    * 1000,
+                    2,
+                ),
+        }
+
+    except Exception as exc:
+
+        return {
+            "ok":
+                False,
+
+            "master":
+                "ok",
+
+            "backend": {
+                "ok":
+                    False,
+
+                "error":
+                    str(exc),
+            },
+
+            "latency_ms":
+                round(
+                    (
+                        time.perf_counter()
+                        - started
+                    )
+                    * 1000,
+                    2,
+                ),
+        }
+
+
+# ===============================================================
+# STATUS
+# ===============================================================
+
+@app.get("/status")
+async def status():
+
+    openapi = await load_openapi()
+
+    paths = (
+        openapi.get(
+            "paths",
+            {}
+        )
+        if openapi
+        else {}
+    )
+
+    return {
+
+        "ok":
+            True,
+
+        "service":
+            APP_NAME,
+
+        "version":
+            APP_VERSION,
+
+        "backend":
+            BACKEND_URL,
+
+        "backend_circuit_open":
+            circuit_open(),
+
+        "backend_failures":
+            backend_circuit.failures,
+
+        "last_error":
+            last_error,
+
+        "route_count":
+            len(paths),
+
+        "request_count":
+            dict(stats),
+    }
+
+
+# ===============================================================
+# SYSTEM MAP
 # ===============================================================
 
 @app.get("/system-map")
 async def system_map():
 
+    openapi = await load_openapi()
+
     return {
 
-        "name": APP_NAME,
+        "name":
+            APP_NAME,
 
         "version":
             APP_VERSION,
@@ -1117,1005 +1069,444 @@ async def system_map():
         "architecture": {
 
             "client":
-                "Client",
+                "ARYA Android / Windows",
 
             "master":
-                "ARYA Master System",
+                "arya_master_system.py",
 
-            "orchestrator":
-                "Orchestrator",
-
-            "runtime":
-                "OWNER Runtime Gateway",
-
-            "owner":
-                "OWNER Integration",
-
-            "services":
-                [
-                    "Vision",
-                    "Voice/Language",
-                    "Agri Engine",
-                    "Commerce/Security",
-                    "Data Update",
-                ],
-
-            "providers":
-                [
-                    "Weather",
-                    "Geocoding",
-                    "Future Providers",
-                ],
-
-            "legacy_core":
+            "backend":
                 "backend/main.py",
+
+            "weather":
+                "backend /weather",
+
+            "location":
+                "backend /location/resolve",
+
+            "ai":
+                "backend AI endpoints "
+                "discovered from OpenAPI",
+
+            "storage":
+                "backend SQLite",
         },
 
-        "services":
-            SERVICES,
+        "backend":
+            BACKEND_URL,
 
-        "providers":
-            PROVIDERS,
+        "routes":
+            sorted(
+                openapi.get(
+                    "paths",
+                    {}
+                ).keys()
+            )
+            if openapi
+            else [],
     }
 
 
 # ===============================================================
-# 15. SERVICE REGISTRY
+# BACKEND ROUTES
 # ===============================================================
 
-@app.get("/services")
-async def services():
+@app.get("/backend-routes")
+async def backend_routes():
 
-    return SERVICES
+    openapi = await load_openapi()
 
-
-@app.post(
-    "/services/{service}/enable"
-)
-async def enable_service(
-    service: str,
-):
-
-    if service not in SERVICES:
-        raise HTTPException(
-            404,
-            "Service not found",
+    paths = (
+        openapi.get(
+            "paths",
+            {}
         )
-
-    SERVICES[
-        service
-    ]["enabled"] = True
-
-    health_cache.pop(
-        service,
-        None,
-    )
-
-    return {
-        "ok": True,
-        "service": service,
-        "enabled": True,
-    }
-
-
-@app.post(
-    "/services/{service}/disable"
-)
-async def disable_service(
-    service: str,
-):
-
-    if service not in SERVICES:
-        raise HTTPException(
-            404,
-            "Service not found",
-        )
-
-    SERVICES[
-        service
-    ]["enabled"] = False
-
-    health_cache.pop(
-        service,
-        None,
-    )
-
-    return {
-        "ok": True,
-        "service": service,
-        "enabled": False,
-    }
-
-
-# ===============================================================
-# 16. PROVIDERS
-# ===============================================================
-
-@app.get("/providers")
-async def providers():
-
-    return PROVIDERS
-
-
-@app.post(
-    "/providers/{provider}/enable"
-)
-async def enable_provider(
-    provider: str,
-):
-
-    if provider not in PROVIDERS:
-        raise HTTPException(
-            404,
-            "Provider not found",
-        )
-
-    PROVIDERS[
-        provider
-    ]["enabled"] = True
-
-    return {
-        "ok": True,
-        "provider": provider,
-        "enabled": True,
-    }
-
-
-@app.post(
-    "/providers/{provider}/disable"
-)
-async def disable_provider(
-    provider: str,
-):
-
-    if provider not in PROVIDERS:
-        raise HTTPException(
-            404,
-            "Provider not found",
-        )
-
-    PROVIDERS[
-        provider
-    ]["enabled"] = False
-
-    return {
-        "ok": True,
-        "provider": provider,
-        "enabled": False,
-    }
-
-
-async def call_provider(
-    provider: str,
-    *,
-    query: Optional[
-        Dict[str, Any]
-    ] = None,
-    payload: Any = None,
-    method: str = "GET",
-):
-
-    config = PROVIDERS.get(
-        provider
-    )
-
-    if not config:
-
-        return {
-            "ok": False,
-            "provider": provider,
-            "error":
-                "provider_not_registered",
-        }
-
-    if not config.get(
-        "enabled",
-        True,
-    ):
-
-        return {
-            "ok": False,
-            "provider": provider,
-            "error":
-                "provider_disabled",
-        }
-
-    return await http_call(
-        name=f"provider:{provider}",
-        base_url=config["url"],
-        method=method,
-        payload=payload,
-        query=query,
-        external=True,
-    )
-
-
-# ===============================================================
-# 17. WEATHER
-# ===============================================================
-
-@app.get("/arya/weather")
-async def weather(
-    latitude: float,
-    longitude: float,
-    forecast_days: int = 7,
-):
-
-    forecast_days = max(
-        1,
-        min(
-            forecast_days,
-            16,
-        ),
-    )
-
-    result = await call_provider(
-        "open_meteo_weather",
-        query={
-
-            "latitude":
-                latitude,
-
-            "longitude":
-                longitude,
-
-            "forecast_days":
-                forecast_days,
-
-            "current":
-                (
-                    "temperature_2m,"
-                    "relative_humidity_2m,"
-                    "precipitation,"
-                    "wind_speed_10m"
-                ),
-
-            "daily":
-                (
-                    "temperature_2m_max,"
-                    "temperature_2m_min,"
-                    "precipitation_sum,"
-                    "weather_code"
-                ),
-
-            "timezone":
-                "auto",
-        },
-    )
-
-    return {
-        "ok":
-            result.get(
-                "ok",
-                False,
-            ),
-
-        "provider":
-            "open_meteo_weather",
-
-        "result":
-            result,
-    }
-
-
-# ===============================================================
-# 18. GEOCODING
-# ===============================================================
-
-@app.get("/arya/geocode")
-async def geocode(
-    name: str,
-    count: int = 5,
-    language: str = "en",
-):
-
-    count = max(
-        1,
-        min(
-            count,
-            20,
-        ),
-    )
-
-    result = await call_provider(
-        "open_meteo_geocoding",
-        query={
-
-            "name":
-                name,
-
-            "count":
-                count,
-
-            "language":
-                language,
-
-            "format":
-                "json",
-        },
-    )
-
-    return {
-        "ok":
-            result.get(
-                "ok",
-                False,
-            ),
-
-        "provider":
-            "open_meteo_geocoding",
-
-        "result":
-            result,
-    }
-
-
-@app.post("/provider/call")
-async def provider_call(
-    request: ProviderRequest,
-):
-
-    return await call_provider(
-        request.provider,
-        query=request.params,
-    )
-
-
-# ===============================================================
-# 19. ACTION MAP
-# ===============================================================
-
-ACTION_MAP = {
-
-    "vision":
-        (
-            "vision",
-            "/vision/analyze",
-        ),
-
-    "voice":
-        (
-            "voice_language",
-            "/voice",
-        ),
-
-    "language":
-        (
-            "voice_language",
-            "/language",
-        ),
-
-    "agri_analyze":
-        (
-            "agri_engine",
-            "/agri/analyze",
-        ),
-
-    "diagnose":
-        (
-            "agri_engine",
-            "/agri/diagnose",
-        ),
-
-    "recommend":
-        (
-            "agri_engine",
-            "/agri/recommend",
-        ),
-
-    "crop_suitability":
-        (
-            "agri_engine",
-            "/agri/crop-suitability",
-        ),
-
-    "payment":
-        (
-            "commerce_security",
-            "/payment",
-        ),
-
-    "updates":
-        (
-            "data_update",
-            "/updates",
-        ),
-}
-
-
-async def execute_action(
-    action: str,
-    data: Dict[str, Any],
-):
-
-    target = ACTION_MAP.get(
-        action
-    )
-
-    if not target:
-
-        return {
-            "ok": False,
-            "action": action,
-            "error":
-                "unknown_action",
-        }
-
-    service, path = target
-
-    return await call_service(
-        service,
-        path,
-        payload=data,
-    )
-
-
-# ===============================================================
-# 20. FULL AGRICULTURAL DOCTOR
-# ===============================================================
-
-async def full_diagnosis(
-    data: Dict[str, Any],
-):
-
-    results = {}
-
-    # Vision
-    if (
-        data.get("image")
-        or data.get("image_url")
-    ):
-
-        results[
-            "vision"
-        ] = await call_service(
-            "vision",
-            "/vision/analyze",
-            payload=data,
-        )
-
-    # Voice
-    if (
-        data.get("voice")
-        or data.get("audio")
-    ):
-
-        results[
-            "voice"
-        ] = await call_service(
-            "voice_language",
-            "/voice",
-            payload=data,
-        )
-
-    # Main agriculture diagnosis
-    results[
-        "agriculture"
-    ] = await call_service(
-        "agri_engine",
-        "/agri/diagnose",
-        payload=data,
-    )
-
-    # Fallback
-    if not results[
-        "agriculture"
-    ].get("ok"):
-
-        results[
-            "agriculture_fallback"
-        ] = await call_service(
-            "agri_engine",
-            "/agri/analyze",
-            payload=data,
-        )
-
-    success = any(
-        isinstance(
-            value,
-            dict,
-        )
-        and value.get("ok")
-        for value
-        in results.values()
+        if openapi
+        else {}
     )
 
     return {
 
         "ok":
-            success,
-
-        "action":
-            "full_diagnosis",
-
-        "results":
-            results,
-    }
-
-
-# ===============================================================
-# 21. ORCHESTRATION
-# ===============================================================
-
-@app.post("/orchestrate")
-async def orchestrate(
-    request: MasterRequest,
-):
-
-    if request.action in {
-        "doctor",
-        "full_diagnosis",
-        "complete_diagnosis",
-    }:
-
-        return await full_diagnosis(
-            request.data
-        )
-
-    return await execute_action(
-        request.action,
-        request.data,
-    )
-
-
-# ===============================================================
-# 22. ARYA MAIN API
-# ===============================================================
-
-@app.post("/arya/doctor")
-async def arya_doctor(
-    payload: Dict[str, Any],
-):
-
-    return await full_diagnosis(
-        payload
-    )
-
-
-@app.post("/arya/diagnose")
-async def arya_diagnose(
-    payload: Dict[str, Any],
-):
-
-    return await full_diagnosis(
-        payload
-    )
-
-
-@app.post("/arya/analyze")
-async def arya_analyze(
-    payload: Dict[str, Any],
-):
-
-    return await call_service(
-        "agri_engine",
-        "/agri/analyze",
-        payload=payload,
-    )
-
-
-@app.post("/arya/recommend")
-async def arya_recommend(
-    payload: Dict[str, Any],
-):
-
-    return await call_service(
-        "agri_engine",
-        "/agri/recommend",
-        payload=payload,
-    )
-
-
-@app.post("/arya/vision")
-async def arya_vision(
-    payload: Dict[str, Any],
-):
-
-    return await call_service(
-        "vision",
-        "/vision/analyze",
-        payload=payload,
-    )
-
-
-@app.post("/arya/voice")
-async def arya_voice(
-    payload: Dict[str, Any],
-):
-
-    return await call_service(
-        "voice_language",
-        "/voice",
-        payload=payload,
-    )
-
-
-@app.post("/arya/payment")
-async def arya_payment(
-    payload: Dict[str, Any],
-):
-
-    return await call_service(
-        "commerce_security",
-        "/payment",
-        payload=payload,
-    )
-
-
-# ===============================================================
-# 23. OWNER
-# ===============================================================
-
-@app.api_route(
-    "/arya/owner/{path:path}",
-    methods=[
-        "GET",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-    ],
-)
-async def owner_proxy(
-    path: str,
-    request: Request,
-):
-
-    body = await request.body()
-
-    return JSONResponse(
-        content=await call_service(
-            "owner_integration",
-            "/" + path,
-            method=request.method,
-            payload=parse_body(body),
-            query=dict(
-                request.query_params
-            ),
-        )
-    )
-
-
-# ===============================================================
-# 24. RUNTIME
-# ===============================================================
-
-@app.api_route(
-    "/arya/runtime/{path:path}",
-    methods=[
-        "GET",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-    ],
-)
-async def runtime_proxy(
-    path: str,
-    request: Request,
-):
-
-    body = await request.body()
-
-    return JSONResponse(
-        content=await call_service(
-            "owner_runtime_gateway",
-            "/" + path,
-            method=request.method,
-            payload=parse_body(body),
-            query=dict(
-                request.query_params
-            ),
-        )
-    )
-
-
-# ===============================================================
-# 25. DATA UPDATE
-# ===============================================================
-
-@app.api_route(
-    "/arya/updates/{path:path}",
-    methods=[
-        "GET",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-    ],
-)
-async def update_proxy(
-    path: str,
-    request: Request,
-):
-
-    body = await request.body()
-
-    return JSONResponse(
-        content=await call_service(
-            "data_update",
-            "/" + path,
-            method=request.method,
-            payload=parse_body(body),
-            query=dict(
-                request.query_params
-            ),
-        )
-    )
-
-
-@app.post("/arya/updates")
-async def arya_updates(
-    payload: Dict[str, Any],
-):
-
-    return await call_service(
-        "data_update",
-        "/updates",
-        payload=payload,
-    )
-
-
-@app.post("/arya/updates/run")
-async def arya_updates_run(
-    payload: Dict[str, Any],
-):
-
-    return await call_service(
-        "data_update",
-        "/updates/run",
-        payload=payload,
-    )
-
-
-# ===============================================================
-# 26. GENERIC SERVICE PROXY
-# ===============================================================
-
-@app.api_route(
-    "/service/{service}/{path:path}",
-    methods=[
-        "GET",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-    ],
-)
-async def service_proxy(
-    service: str,
-    path: str,
-    request: Request,
-):
-
-    if service not in SERVICES:
-
-        raise HTTPException(
-            404,
-            "Service not found",
-        )
-
-    body = await request.body()
-
-    return JSONResponse(
-        content=await call_service(
-            service,
-            "/" + path,
-            method=request.method,
-            payload=parse_body(body),
-            query=dict(
-                request.query_params
-            ),
-        )
-    )
-
-
-# ===============================================================
-# 27. INTERNAL MASTER CALL
-# ===============================================================
-
-@app.post("/internal/call")
-async def internal_call(
-    request: Request,
-):
-
-    body = await request.body()
-
-    if (
-        REQUIRE_INTERNAL_SIGNATURE
-        and not verify_signature(
-            request,
-            body,
-        )
-    ):
-
-        raise HTTPException(
-            401,
-            "Invalid internal signature",
-        )
-
-    data = parse_body(
-        body
-    )
-
-    if not isinstance(
-        data,
-        dict,
-    ):
-
-        raise HTTPException(
-            400,
-            "JSON object required",
-        )
-
-    service = data.get(
-        "service"
-    )
-
-    path = data.get(
-        "path"
-    )
-
-    method = data.get(
-        "method",
-        "POST",
-    )
-
-    payload = data.get(
-        "data"
-    )
-
-    if not service or not path:
-
-        raise HTTPException(
-            400,
-            "service and path required",
-        )
-
-    return await call_service(
-        service,
-        path,
-        method=method,
-        payload=payload,
-        query=data.get(
-            "query"
-        ),
-    )
-
-
-# ===============================================================
-# 28. SECURITY MIDDLEWARE
-# ===============================================================
-
-@app.middleware("http")
-async def security_middleware(
-    request: Request,
-    call_next,
-):
-
-    content_length = request.headers.get(
-        "content-length"
-    )
-
-    if content_length:
-
-        try:
-
-            if (
-                int(content_length)
-                > MAX_REQUEST_BYTES
-            ):
-
-                return JSONResponse(
-                    status_code=413,
-                    content={
-                        "ok": False,
-                        "error":
-                            "request_too_large",
-                    },
+            bool(openapi),
+
+        "count":
+            len(paths),
+
+        "routes": {
+
+            path:
+                sorted(
+                    [
+                        method.upper()
+
+                        for method
+                        in methods
+
+                        if method.lower()
+                        in {
+                            "get",
+                            "post",
+                            "put",
+                            "patch",
+                            "delete",
+                            "options",
+                            "head",
+                        }
+                    ]
                 )
 
-        except ValueError:
-            pass
+            for path, methods
+            in paths.items()
 
-    if (
-        request.url.path.startswith(
-            "/internal/"
-        )
-        and REQUIRE_INTERNAL_SIGNATURE
-    ):
-
-        body = await request.body()
-
-        if not verify_signature(
-            request,
-            body,
-        ):
-
-            return JSONResponse(
-                status_code=401,
-                content={
-                    "ok": False,
-                    "error":
-                        "invalid_internal_signature",
-                },
+            if isinstance(
+                methods,
+                dict,
             )
+        },
+    }
 
-    return await call_next(
-        request
+
+@app.post(
+    "/backend-routes/refresh"
+)
+async def refresh_backend_routes():
+
+    openapi = await load_openapi(
+        force=True
     )
 
+    return {
+
+        "ok":
+            bool(openapi),
+
+        "count":
+            (
+                len(
+                    openapi.get(
+                        "paths",
+                        {}
+                    )
+                )
+                if openapi
+                else 0
+            ),
+    }
+
 
 # ===============================================================
-# 29. GLOBAL ERROR HANDLER
+# WEATHER
 # ===============================================================
 
-@app.exception_handler(Exception)
-async def global_error(
+@app.api_route(
+    "/arya/weather",
+    methods=[
+        "GET",
+        "POST",
+    ],
+)
+async def arya_weather(
     request: Request,
-    exc: Exception,
 ):
 
-    return JSONResponse(
-        status_code=500,
-        content={
-            "ok": False,
-            "error":
-                "master_internal_error",
-            "message":
-                str(exc),
-            "path":
-                request.url.path,
-        },
+    return await compatibility_json_request(
+        request,
+        [
+            "/weather",
+        ],
     )
 
 
 # ===============================================================
-# 30. STARTUP
+# GEOCODING / LOCATION
 # ===============================================================
 
-@app.on_event("startup")
+@app.api_route(
+    "/arya/geocode",
+    methods=[
+        "GET",
+        "POST",
+    ],
+)
+async def arya_geocode(
+    request: Request,
+):
+
+    return await compatibility_json_request(
+        request,
+        [
+            "/location/resolve",
+        ],
+    )
+
+
+@app.api_route(
+    "/arya/location/resolve",
+    methods=[
+        "GET",
+        "POST",
+    ],
+)
+async def arya_location_resolve(
+    request: Request,
+):
+
+    return await compatibility_json_request(
+        request,
+        [
+            "/location/resolve",
+        ],
+    )
+
+
+# ===============================================================
+# AGRICULTURAL COMPATIBILITY
+# ===============================================================
+
+async def compatibility_ai(
+    request: Request,
+    candidates: list[str],
+) -> Response:
+
+    return await compatibility_json_request(
+        request,
+        candidates,
+    )
+
+
+@app.api_route(
+    "/arya/doctor",
+    methods=[
+        "POST",
+        "GET",
+    ],
+)
+async def arya_doctor(
+    request: Request,
+):
+
+    return await compatibility_ai(
+        request,
+        [
+            "/ai/ask",
+            "/ask",
+            "/agri/ask",
+            "/agri/analyze",
+            "/analyze",
+        ],
+    )
+
+
+@app.api_route(
+    "/arya/diagnose",
+    methods=[
+        "POST",
+        "GET",
+    ],
+)
+async def arya_diagnose(
+    request: Request,
+):
+
+    return await compatibility_ai(
+        request,
+        [
+            "/ai/ask",
+            "/ask",
+            "/agri/diagnose",
+            "/agri/analyze",
+            "/analyze",
+        ],
+    )
+
+
+@app.api_route(
+    "/arya/analyze",
+    methods=[
+        "POST",
+        "GET",
+    ],
+)
+async def arya_analyze(
+    request: Request,
+):
+
+    return await compatibility_ai(
+        request,
+        [
+            "/agri/analyze",
+            "/analyze",
+            "/ai/ask",
+            "/ask",
+        ],
+    )
+
+
+@app.api_route(
+    "/arya/recommend",
+    methods=[
+        "POST",
+        "GET",
+    ],
+)
+async def arya_recommend(
+    request: Request,
+):
+
+    return await compatibility_ai(
+        request,
+        [
+            "/agri/recommend",
+            "/recommend",
+            "/ai/ask",
+            "/ask",
+        ],
+    )
+
+
+@app.api_route(
+    "/arya/region-analysis",
+    methods=[
+        "POST",
+        "GET",
+    ],
+)
+async def arya_region_analysis(
+    request: Request,
+):
+
+    return await compatibility_ai(
+        request,
+        [
+            "/region/analyze",
+            "/region-analysis",
+            "/ai/region",
+            "/ai/ask",
+        ],
+    )
+
+
+# ===============================================================
+# GENERIC API PROXY
+# ===============================================================
+
+@app.api_route(
+    "/api/{path:path}",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+        "HEAD",
+    ],
+)
+async def api_proxy(
+    path: str,
+    request: Request,
+):
+
+    stats[
+        "/api/" + path
+    ] += 1
+
+    return await proxy_request(
+        request,
+        "/" + path,
+    )
+
+
+# ===============================================================
+# BACKEND PROXY
+# ===============================================================
+
+@app.api_route(
+    "/backend/{path:path}",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+        "HEAD",
+    ],
+)
+async def backend_proxy(
+    path: str,
+    request: Request,
+):
+
+    stats[
+        "/backend/" + path
+    ] += 1
+
+    return await proxy_request(
+        request,
+        "/" + path,
+    )
+
+
+# ===============================================================
+# INTERNAL PROXY
+# ===============================================================
+
+@app.api_route(
+    "/internal/{path:path}",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+        "HEAD",
+    ],
+)
+async def internal_proxy(
+    path: str,
+    request: Request,
+):
+
+    stats[
+        "/internal/" + path
+    ] += 1
+
+    return await proxy_request(
+        request,
+        "/" + path,
+    )
+
+
+# ===============================================================
+# STARTUP
+# ===============================================================
+
+@app.on_event(
+    "startup"
+)
 async def startup():
 
-    # Validate all configured services.
-    for name, config in SERVICES.items():
-
-        try:
-
-            validate_internal_url(
-                config["url"]
-            )
-
-        except Exception as exc:
-
-            last_errors[
-                name
-            ] = str(exc)
-
-    # Validate providers.
-    for name, config in PROVIDERS.items():
-
-        try:
-
-            validate_provider_url(
-                config["url"]
-            )
-
-        except Exception as exc:
-
-            last_errors[
-                "provider:" + name
-            ] = str(exc)
-
-
-@app.on_event("shutdown")
-async def shutdown():
-
-    health_cache.clear()
+    await load_openapi(
+        force=True
+    )
 
 
 # ===============================================================
-# 31. LOCAL RUN
+# SHUTDOWN
+# ===============================================================
+
+@app.on_event(
+    "shutdown"
+)
+async def shutdown():
+
+    _openapi_cache.clear()
+
+
+# ===============================================================
+# LOCAL RUN
 # ===============================================================
 
 if __name__ == "__main__":
