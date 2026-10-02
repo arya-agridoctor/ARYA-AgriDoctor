@@ -1,26 +1,21 @@
 """
-ARYA AgriDoctor — UPDATE / BACKUP / ROLLBACK SYSTEM
-Version: 1.0.0
+ARYA AgriDoctor - Secure Knowledge Update & Approval Gateway
+Version: 3.0.0
 
-Purpose:
-- Protect the current working ARYA version.
-- Create full backups before updates.
-- Stage updates separately.
-- Run tests before activation.
-- Roll back automatically when validation fails.
-- Keep update history and reports.
-- Never execute downloaded code automatically.
-
-Important:
-- This file does NOT modify backend/main.py.
-- This file does NOT modify arya_master_system.py directly.
-- Updates must pass validation before activation.
+Design:
+- Scientific knowledge is separate from executable code.
+- External sources are treated as untrusted DATA.
+- Every proposed change creates a report first.
+- Nothing is applied without explicit approval.
+- Backups exclude secrets but include application/core files needed for recovery.
+- Automatic rollback is limited to files changed by the current transaction.
+- No downloaded source code is executed.
+- Runtime tests are optional and must be explicitly configured.
 """
 
 from __future__ import annotations
 
 import argparse
-import datetime as dt
 import hashlib
 import json
 import os
@@ -28,16 +23,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
+import urllib.parse
+import urllib.request
+import zipfile
+from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 
-# ===============================================================
-# CONFIG
-# ===============================================================
-
-APP_NAME = "ARYA AgriDoctor"
-UPDATE_VERSION = "1.0.0"
+VERSION = "3.0.0"
 
 ROOT = Path(
     os.getenv(
@@ -51,161 +47,221 @@ STAGING_DIR = ROOT / ".arya_staging"
 REPORT_DIR = ROOT / ".arya_update_reports"
 KNOWLEDGE_DIR = ROOT / "data" / "arya_knowledge_updates"
 
-MAX_BACKUPS = int(
-    os.getenv(
-        "ARYA_MAX_BACKUPS",
-        "10",
-    )
-)
+STATE_FILE = ROOT / ".arya_update_state.json"
+LOCK_FILE = ROOT / ".arya_update_lock.json"
 
-VERSION_FILE = ROOT / ".arya_version.json"
+BACKUP_EXCLUDE_NAMES = {
+    ".env",
+    ".env.local",
+    ".env.production",
+    ".env.development",
+    ".env.test",
+}
 
-# Files/directories that must never be overwritten
-PROTECTED_PATHS = {
+BACKUP_EXCLUDE_DIRS = {
     ".git",
+    ".arya_backups",
+    ".arya_staging",
+    ".arya_update_reports",
+    ".pytest_cache",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".dart_tool",
+    "build",
+}
+
+# These paths may be backed up and restored during explicit disaster recovery,
+# but an automatic scientific knowledge update can NEVER replace them.
+UPDATE_PROTECTED = {
+    "backend/main.py",
+    "arya_master_system.py",
+    "arya_update_system.py",
     ".github",
     ".env",
     ".env.local",
     ".env.production",
 }
 
-# Core application files that require special protection
-CORE_FILES = {
-    "backend/main.py",
-    "arya_master_system.py",
+# External sources are DATA sources only.
+# New hosts must be manually reviewed before being added.
+ALLOWED_SOURCE_HOSTS = {
+    "fao.org",
+    "www.fao.org",
+    "who.int",
+    "www.who.int",
+    "usda.gov",
+    "www.usda.gov",
+    "aphis.usda.gov",
+    "epa.gov",
+    "www.epa.gov",
+    "efsa.europa.eu",
+    "www.efsa.europa.eu",
+    "ippc.int",
+    "www.ippc.int",
+    "cgiar.org",
+    "www.cgiar.org",
+    "cabi.org",
+    "www.cabi.org",
 }
 
+MAX_DOWNLOAD_BYTES = int(
+    os.getenv("ARYA_MAX_SOURCE_BYTES", "2000000")
+)
 
-# ===============================================================
-# BASIC UTILITIES
-# ===============================================================
+HTTP_TIMEOUT = int(
+    os.getenv("ARYA_SOURCE_TIMEOUT", "20")
+)
+
+MAX_BACKUPS = int(
+    os.getenv("ARYA_MAX_BACKUPS", "10")
+)
+
+# Runtime testing is opt-in.
+# Never execute an arbitrary command received from an external source.
+RUNTIME_TEST_COMMAND = os.getenv(
+    "ARYA_UPDATE_TEST_COMMAND",
+    "",
+).strip()
+
+
+@dataclass
+class SourceRecord:
+    url: str
+    title: str
+    retrieved_at: str
+    sha256: str
+    content_type: str
+    bytes: int
+
+
+@dataclass
+class ChangeRecord:
+    path: str
+    action: str
+    old_sha256: str | None
+    new_sha256: str | None
+    old_size: int
+    new_size: int
+    protected: bool
+
+
+@dataclass
+class UpdateReport:
+    report_id: str
+    created_at: str
+    system_version: str
+    status: str
+    reason: str
+    source_records: list[dict[str, Any]]
+    knowledge_summary: dict[str, Any]
+    changes: list[dict[str, Any]]
+    tests: list[dict[str, Any]]
+    security: list[str]
+    approval_required: bool
+    approval_token: str | None = None
+
 
 def now() -> str:
-    return dt.datetime.now(
-        dt.timezone.utc
-    ).strftime(
-        "%Y-%m-%dT%H:%M:%SZ"
-    )
+    return datetime.now(timezone.utc).isoformat()
 
 
-def run(
-    command: list[str],
-    *,
-    cwd: Path | None = None,
-    timeout: int = 300,
-) -> subprocess.CompletedProcess[str]:
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
 
-    return subprocess.run(
-        command,
-        cwd=str(cwd or ROOT),
-        text=True,
-        capture_output=True,
-        timeout=timeout,
-    )
+    with path.open("rb") as f:
+        for chunk in iter(
+            lambda: f.read(1024 * 1024),
+            b"",
+        ):
+            h.update(chunk)
+
+    return h.hexdigest()
 
 
-def sha256_file(
-    path: Path,
-) -> str:
-
-    digest = hashlib.sha256()
-
-    with path.open(
-        "rb"
-    ) as file:
-
-        while True:
-
-            chunk = file.read(
-                1024 * 1024
-            )
-
-            if not chunk:
-                break
-
-            digest.update(chunk)
-
-    return digest.hexdigest()
+def rel(path: Path) -> str:
+    return path.resolve().relative_to(ROOT).as_posix()
 
 
-def relative(
-    path: Path,
-) -> str:
+def safe_relative_path(value: str) -> Path:
+    normalized = value.replace("\\", "/")
+    p = Path(normalized)
 
-    return path.relative_to(
-        ROOT
-    ).as_posix()
-
-
-def ensure_directories() -> None:
-
-    BACKUP_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    STAGING_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    REPORT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    KNOWLEDGE_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-
-# ===============================================================
-# VERSION
-# ===============================================================
-
-def load_version() -> dict[str, Any]:
-
-    if not VERSION_FILE.exists():
-
-        return {
-            "application":
-                APP_NAME,
-
-            "version":
-                "unknown",
-
-            "created_at":
-                now(),
-        }
-
-    try:
-
-        return json.loads(
-            VERSION_FILE.read_text(
-                encoding="utf-8"
-            )
+    if p.is_absolute():
+        raise ValueError(
+            f"Unsafe absolute path: {value}"
         )
 
-    except Exception:
+    if ".." in p.parts:
+        raise ValueError(
+            f"Unsafe traversal path: {value}"
+        )
 
-        return {
-            "application":
-                APP_NAME,
-
-            "version":
-                "unknown",
-
-            "created_at":
-                now(),
-        }
+    return p
 
 
-def save_version(
-    data: dict[str, Any],
+def is_excluded(path: Path) -> bool:
+    r = path.resolve()
+
+    try:
+        rp = r.relative_to(ROOT)
+    except ValueError:
+        return True
+
+    parts = set(rp.parts)
+
+    if parts & BACKUP_EXCLUDE_DIRS:
+        return True
+
+    if r.name in BACKUP_EXCLUDE_NAMES:
+        return True
+
+    return False
+
+
+def is_update_protected(path: Path) -> bool:
+    try:
+        rp = rel(path)
+    except ValueError:
+        return True
+
+    for protected in UPDATE_PROTECTED:
+        if (
+            protected == rp
+            or rp.startswith(
+                protected.rstrip("/") + "/"
+            )
+        ):
+            return True
+
+    return False
+
+
+def iter_files(base: Path = ROOT):
+    for p in base.rglob("*"):
+        if not p.is_file():
+            continue
+
+        if is_excluded(p):
+            continue
+
+        yield p
+
+
+def json_dump(
+    path: Path,
+    data: Any,
 ) -> None:
+    path.parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    VERSION_FILE.write_text(
+    tmp = path.with_suffix(
+        path.suffix + ".tmp"
+    )
+
+    tmp.write_text(
         json.dumps(
             data,
             ensure_ascii=False,
@@ -214,1059 +270,1197 @@ def save_version(
         encoding="utf-8",
     )
 
+    os.replace(tmp, path)
 
-# ===============================================================
-# GIT INFORMATION
-# ===============================================================
 
-def git_revision() -> str:
+def create_lock(
+    kind: str,
+    details: dict[str, Any],
+) -> None:
+    if LOCK_FILE.exists():
+        raise RuntimeError(
+            "An ARYA update transaction is already active. "
+            "Do not start another transaction."
+        )
 
-    result = run(
-        [
-            "git",
-            "rev-parse",
-            "HEAD",
-        ]
+    json_dump(
+        LOCK_FILE,
+        {
+            "version": VERSION,
+            "kind": kind,
+            "started_at": now(),
+            "details": details,
+        },
     )
 
-    if result.returncode != 0:
-        return "unknown"
 
-    return result.stdout.strip()
+def clear_lock() -> None:
+    try:
+        LOCK_FILE.unlink()
+    except FileNotFoundError:
+        pass
 
 
-def git_status() -> str:
+def source_is_allowed(
+    url: str,
+) -> bool:
+    parsed = urllib.parse.urlparse(url)
 
-    result = run(
-        [
-            "git",
-            "status",
-            "--short",
-        ]
+    if parsed.scheme != "https":
+        return False
+
+    host = (
+        parsed.hostname or ""
+    ).lower().rstrip(".")
+
+    return host in ALLOWED_SOURCE_HOSTS
+
+
+def fetch_source(
+    url: str,
+    title: str = "",
+) -> SourceRecord:
+    if not source_is_allowed(url):
+        raise ValueError(
+            "Source is not on the ARYA trusted-host allow-list."
+        )
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent":
+                "ARYA-AgriDoctor-KnowledgeGateway/3.0",
+            "Accept":
+                "text/html,application/json,"
+                "application/xml,text/plain",
+        },
     )
 
-    if result.returncode != 0:
-        return ""
+    with urllib.request.urlopen(
+        req,
+        timeout=HTTP_TIMEOUT,
+    ) as response:
 
-    return result.stdout.strip()
+        content_type = response.headers.get(
+            "Content-Type",
+            "",
+        )
 
+        length = response.headers.get(
+            "Content-Length"
+        )
 
-# ===============================================================
-# BACKUP
-# ===============================================================
+        if length:
+            if int(length) > MAX_DOWNLOAD_BYTES:
+                raise ValueError(
+                    "Source exceeds configured download limit."
+                )
+
+        data = bytearray()
+
+        while True:
+            chunk = response.read(64 * 1024)
+
+            if not chunk:
+                break
+
+            data.extend(chunk)
+
+            if len(data) > MAX_DOWNLOAD_BYTES:
+                raise ValueError(
+                    "Source exceeds configured download limit."
+                )
+
+    digest = hashlib.sha256(
+        data
+    ).hexdigest()
+
+    source_dir = (
+        KNOWLEDGE_DIR / "sources"
+    )
+
+    source_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    target = (
+        source_dir
+        / f"{digest}.source"
+    )
+
+    if not target.exists():
+        target.write_bytes(
+            bytes(data)
+        )
+
+    return SourceRecord(
+        url=url,
+        title=title or url,
+        retrieved_at=now(),
+        sha256=digest,
+        content_type=content_type,
+        bytes=len(data),
+    )
+
 
 def create_backup(
-    reason: str = "manual",
+    reason: str,
 ) -> Path:
 
-    ensure_directories()
-
-    timestamp = dt.datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
-
-    revision = git_revision()
-
-    short_revision = (
-        revision[:12]
-        if revision != "unknown"
-        else "nogit"
-    )
-
-    backup_name = (
-        f"backup_"
-        f"{timestamp}_"
-        f"{short_revision}"
-    )
-
-    destination = (
-        BACKUP_DIR
-        / backup_name
-    )
-
-    destination.mkdir(
+    BACKUP_DIR.mkdir(
         parents=True,
-        exist_ok=False,
+        exist_ok=True,
     )
 
-    # Prefer Git archive because it captures the
-    # complete tracked application state.
-    archive = (
-        destination
-        / "source.tar"
+    stamp = datetime.now(
+        timezone.utc
+    ).strftime(
+        "%Y%m%dT%H%M%SZ"
     )
 
-    result = run(
-        [
-            "git",
-            "archive",
-            "--format=tar",
-            "HEAD",
-            "-o",
-            str(archive),
-        ]
+    unique = hashlib.sha256(
+        os.urandom(16)
+    ).hexdigest()[:8]
+
+    backup = (
+        BACKUP_DIR
+        / f"backup_{stamp}_{unique}.zip"
     )
 
-    if result.returncode != 0:
-
-        shutil.rmtree(
-            destination,
-            ignore_errors=True,
-        )
-
-        raise RuntimeError(
-            "Backup failed: "
-            + result.stderr.strip()
-        )
-
-    metadata = {
-        "application":
-            APP_NAME,
-
-        "update_system":
-            UPDATE_VERSION,
-
-        "created_at":
-            now(),
-
-        "reason":
-            reason,
-
-        "git_revision":
-            revision,
-
-        "git_status":
-            git_status(),
-
-        "archive":
-            archive.name,
+    manifest = {
+        "version": VERSION,
+        "created_at": now(),
+        "reason": reason,
+        "root": str(ROOT),
+        "files": [],
     }
 
-    (
-        destination
-        / "metadata.json"
-    ).write_text(
-        json.dumps(
-            metadata,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
+    with zipfile.ZipFile(
+        backup,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+        compresslevel=6,
+    ) as z:
 
-    cleanup_old_backups()
+        for path in iter_files():
+            rp = rel(path)
 
-    return destination
-
-
-def list_backups() -> list[Path]:
-
-    if not BACKUP_DIR.exists():
-        return []
-
-    return sorted(
-        [
-            item
-            for item
-            in BACKUP_DIR.iterdir()
-            if item.is_dir()
-            and item.name.startswith(
-                "backup_"
+            z.write(
+                path,
+                rp,
             )
-        ],
-        key=lambda item: item.name,
+
+            manifest["files"].append(
+                {
+                    "path": rp,
+                    "sha256": sha256_file(path),
+                    "size": path.stat().st_size,
+                }
+            )
+
+        z.writestr(
+            "ARYA_BACKUP_MANIFEST.json",
+            json.dumps(
+                manifest,
+                ensure_ascii=False,
+                indent=2,
+            ),
+        )
+
+    # Verify backup readability.
+    with zipfile.ZipFile(
+        backup,
+        "r",
+    ) as z:
+
+        if (
+            "ARYA_BACKUP_MANIFEST.json"
+            not in z.namelist()
+        ):
+            raise RuntimeError(
+                "Backup manifest missing."
+            )
+
+    prune_backups()
+
+    return backup
+
+
+def prune_backups() -> None:
+    backups = sorted(
+        BACKUP_DIR.glob(
+            "backup_*.zip"
+        ),
+        key=lambda p: p.stat().st_mtime,
         reverse=True,
     )
 
+    for old in backups[MAX_BACKUPS:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
 
-def cleanup_old_backups() -> None:
 
-    backups = list_backups()
+def safe_extract_zip(
+    archive: Path,
+    destination: Path,
+    members: list[str] | None = None,
+) -> None:
 
-    for old_backup in backups[
-        MAX_BACKUPS:
-    ]:
+    destination = destination.resolve()
 
-        shutil.rmtree(
-            old_backup,
-            ignore_errors=True,
+    with zipfile.ZipFile(
+        archive,
+        "r",
+    ) as z:
+
+        names = (
+            members
+            if members is not None
+            else z.namelist()
         )
 
+        for name in names:
 
-# ===============================================================
-# STAGING
-# ===============================================================
-
-def create_staging(
-    source: Path,
-) -> Path:
-
-    ensure_directories()
-
-    timestamp = dt.datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
-
-    destination = (
-        STAGING_DIR
-        / f"candidate_{timestamp}"
-    )
-
-    destination.mkdir(
-        parents=True,
-        exist_ok=False,
-    )
-
-    if source.is_dir():
-
-        for item in source.iterdir():
-
-            if item.name in PROTECTED_PATHS:
+            if name.endswith("/"):
                 continue
 
-            target = (
-                destination
-                / item.name
+            candidate = safe_relative_path(
+                name
             )
 
-            if item.is_dir():
+            target = (
+                destination / candidate
+            ).resolve()
 
-                shutil.copytree(
-                    item,
-                    target,
-                    ignore=shutil.ignore_patterns(
-                        *PROTECTED_PATHS
-                    ),
+            try:
+                target.relative_to(
+                    destination
+                )
+            except ValueError:
+                raise RuntimeError(
+                    f"Archive path escapes destination: {name}"
                 )
 
-            else:
+            target.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
 
-                shutil.copy2(
-                    item,
-                    target,
+            with z.open(
+                name,
+                "r",
+            ) as src:
+
+                with target.open(
+                    "wb"
+                ) as dst:
+
+                    shutil.copyfileobj(
+                        src,
+                        dst,
+                    )
+
+
+def rollback_transaction(
+    changed_files: list[dict[str, Any]],
+    backup: Path,
+) -> None:
+    """
+    Restore only files affected by the current transaction.
+
+    This deliberately does NOT sweep/delete unrelated files.
+    """
+
+    with zipfile.ZipFile(
+        backup,
+        "r",
+    ) as z:
+
+        names = set(
+            z.namelist()
+        )
+
+        for item in changed_files:
+
+            path = safe_relative_path(
+                item["path"]
+            )
+
+            live = (
+                ROOT / path
+            ).resolve()
+
+            try:
+                live.relative_to(ROOT)
+            except ValueError:
+                raise RuntimeError(
+                    "Rollback target escaped project root."
                 )
 
-    else:
+            action = item["action"]
 
-        raise RuntimeError(
-            "Staging source does not exist."
+            if action == "added":
+
+                if (
+                    live.exists()
+                    and live.is_file()
+                ):
+                    live.unlink()
+
+                continue
+
+            if action in {
+                "modified",
+                "deleted",
+            }:
+
+                name = path.as_posix()
+
+                if name not in names:
+                    raise RuntimeError(
+                        "Original file missing from backup: "
+                        + name
+                    )
+
+                live.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                with z.open(
+                    name,
+                    "r",
+                ) as src:
+
+                    with live.open(
+                        "wb"
+                    ) as dst:
+
+                        shutil.copyfileobj(
+                            src,
+                            dst,
+                        )
+
+
+def collect_tree(
+    source: Path,
+) -> dict[str, dict[str, Any]]:
+
+    result: dict[
+        str,
+        dict[str, Any],
+    ] = {}
+
+    for p in iter_files(source):
+
+        rp = (
+            p.resolve()
+            .relative_to(
+                source.resolve()
+            )
+            .as_posix()
         )
 
-    return destination
+        result[rp] = {
+            "sha256": sha256_file(p),
+            "size": p.stat().st_size,
+        }
+
+    return result
 
 
-# ===============================================================
-# PYTHON SYNTAX TEST
-# ===============================================================
-
-def python_syntax_test(
-    directory: Path,
-) -> tuple[bool, str]:
-
-    python_files = list(
-        directory.rglob(
-            "*.py"
-        )
-    )
+def validate_python_tree(
+    base: Path,
+) -> list[str]:
 
     errors: list[str] = []
 
-    for file in python_files:
+    for p in base.rglob("*.py"):
 
-        try:
+        if is_excluded(p):
+            continue
 
-            source = file.read_text(
-                encoding="utf-8"
-            )
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "py_compile",
+                str(p),
+            ],
+            cwd=str(base),
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
 
-            compile(
-                source,
-                str(file),
-                "exec",
-            )
-
-        except Exception as exc:
+        if proc.returncode != 0:
 
             errors.append(
-                f"{file}: {exc}"
+                f"{p}: "
+                f"{proc.stderr.strip()}"
             )
 
-    if errors:
-
-        return (
-            False,
-            "\n".join(errors),
-        )
-
-    return (
-        True,
-        f"Syntax OK: {len(python_files)} Python files",
-    )
+    return errors
 
 
-# ===============================================================
-# CORE FILE PROTECTION TEST
-# ===============================================================
+def validate_core_tokens(
+    base: Path,
+) -> list[str]:
 
-def protected_files_test() -> tuple[bool, str]:
+    errors: list[str] = []
 
-    missing = []
-
-    for name in CORE_FILES:
-
-        path = ROOT / name
-
-        if not path.exists():
-
-            missing.append(name)
-
-    if missing:
-
-        return (
-            False,
-            "Missing core files: "
-            + ", ".join(missing),
-        )
-
-    return (
-        True,
-        "Core files present.",
-    )
-
-
-# ===============================================================
-# MASTER / BACKEND STATIC TEST
-# ===============================================================
-
-def core_content_test() -> tuple[bool, str]:
-
-    checks = {
-        "backend/main.py":
-            [
-                "FastAPI",
-            ],
-
-        "arya_master_system.py":
-            [
-                "FastAPI",
-                "BACKEND_URL",
-                "raw_backend_call",
-            ],
+    required = {
+        "backend/main.py": [
+            "FastAPI",
+        ],
+        "arya_master_system.py": [
+            "FastAPI",
+        ],
+        "arya_update_system.py": [
+            "VERSION",
+            "UpdateReport",
+        ],
     }
 
-    errors = []
+    for filename, tokens in required.items():
 
-    for filename, required in checks.items():
+        p = base / filename
 
-        path = ROOT / filename
-
-        if not path.exists():
+        if not p.exists():
 
             errors.append(
-                f"{filename}: missing"
+                f"missing required file: {filename}"
             )
 
             continue
 
-        content = path.read_text(
-            encoding="utf-8"
+        text = p.read_text(
+            encoding="utf-8",
+            errors="replace",
         )
 
-        for token in required:
+        for token in tokens:
 
-            if token not in content:
+            if token not in text:
 
                 errors.append(
                     f"{filename}: "
                     f"missing required token "
-                    f"{token}"
+                    f"{token!r}"
                 )
 
-    if errors:
+    return errors
 
-        return (
-            False,
-            "\n".join(errors),
-        )
 
-    return (
-        True,
-        "Core content test passed.",
+def run_configured_runtime_test(
+    base: Path,
+) -> dict[str, Any]:
+
+    if not RUNTIME_TEST_COMMAND:
+
+        return {
+            "name":
+                "configured_runtime_test",
+            "status":
+                "SKIPPED",
+            "reason":
+                "ARYA_UPDATE_TEST_COMMAND "
+                "is not configured.",
+        }
+
+    import shlex
+
+    args = shlex.split(
+        RUNTIME_TEST_COMMAND,
+        posix=(os.name != "nt"),
     )
 
+    started = time.monotonic()
 
-# ===============================================================
-# OPTIONAL RUNTIME TEST
-# ===============================================================
-
-def runtime_test() -> tuple[bool, str]:
-
-    command = os.getenv(
-        "ARYA_UPDATE_TEST_COMMAND",
-        "",
-    ).strip()
-
-    if not command:
-
-        return (
-            True,
-            "Runtime test skipped; "
-            "ARYA_UPDATE_TEST_COMMAND "
-            "is not configured.",
-        )
-
-    result = subprocess.run(
-        command,
-        cwd=str(ROOT),
-        shell=True,
-        text=True,
+    proc = subprocess.run(
+        args,
+        cwd=str(base),
         capture_output=True,
-        timeout=600,
-    )
-
-    if result.returncode != 0:
-
-        return (
-            False,
-            (
-                "Runtime test failed.\n"
-                + result.stdout
-                + "\n"
-                + result.stderr
-            ),
-        )
-
-    return (
-        True,
-        "Runtime test passed.",
-    )
-
-
-# ===============================================================
-# FULL VALIDATION
-# ===============================================================
-
-def validate_current() -> dict[str, Any]:
-
-    results = []
-
-    ok, message = (
-        protected_files_test()
-    )
-
-    results.append({
-        "test":
-            "protected_files",
-        "ok":
-            ok,
-        "message":
-            message,
-    })
-
-    ok, message = (
-        core_content_test()
-    )
-
-    results.append({
-        "test":
-            "core_content",
-        "ok":
-            ok,
-        "message":
-            message,
-    })
-
-    ok, message = (
-        python_syntax_test(ROOT)
-    )
-
-    results.append({
-        "test":
-            "python_syntax",
-        "ok":
-            ok,
-        "message":
-            message,
-    })
-
-    ok, message = runtime_test()
-
-    results.append({
-        "test":
-            "runtime",
-        "ok":
-            ok,
-        "message":
-            message,
-    })
-
-    overall = all(
-        item["ok"]
-        for item in results
+        text=True,
+        timeout=180,
+        shell=False,
+        env={
+            **os.environ,
+            "ARYA_UPDATE_TEST_MODE": "1",
+        },
     )
 
     return {
-        "ok":
-            overall,
-
-        "timestamp":
-            now(),
-
-        "git_revision":
-            git_revision(),
-
-        "tests":
-            results,
+        "name":
+            "configured_runtime_test",
+        "status":
+            (
+                "PASS"
+                if proc.returncode == 0
+                else "FAIL"
+            ),
+        "returncode":
+            proc.returncode,
+        "duration_seconds":
+            round(
+                time.monotonic() - started,
+                3,
+            ),
+        "stdout_tail":
+            proc.stdout[-4000:],
+        "stderr_tail":
+            proc.stderr[-4000:],
     }
 
 
-# ===============================================================
-# REPORT
-# ===============================================================
+def validate_tree(
+    base: Path,
+) -> list[dict[str, Any]]:
 
-def save_report(
-    report: dict[str, Any],
-    prefix: str = "update",
+    results: list[
+        dict[str, Any]
+    ] = []
+
+    py_errors = validate_python_tree(
+        base
+    )
+
+    results.append(
+        {
+            "name":
+                "python_syntax",
+            "status":
+                (
+                    "PASS"
+                    if not py_errors
+                    else "FAIL"
+                ),
+            "errors":
+                py_errors[:50],
+        }
+    )
+
+    core_errors = validate_core_tokens(
+        base
+    )
+
+    results.append(
+        {
+            "name":
+                "core_integrity",
+            "status":
+                (
+                    "PASS"
+                    if not core_errors
+                    else "FAIL"
+                ),
+            "errors":
+                core_errors[:50],
+        }
+    )
+
+    runtime = run_configured_runtime_test(
+        base
+    )
+
+    results.append(runtime)
+
+    return results
+
+
+def tests_pass(
+    results: list[dict[str, Any]],
+) -> bool:
+
+    return all(
+        r.get("status")
+        in {
+            "PASS",
+            "SKIPPED",
+        }
+        for r in results
+    )
+
+
+def compare_candidate(
+    candidate: Path,
+) -> list[ChangeRecord]:
+
+    live = collect_tree(ROOT)
+    cand = collect_tree(candidate)
+
+    paths = sorted(
+        set(live) | set(cand)
+    )
+
+    changes: list[
+        ChangeRecord
+    ] = []
+
+    for rp in paths:
+
+        old = live.get(rp)
+        new = cand.get(rp)
+
+        if (
+            old
+            and new
+            and old["sha256"]
+            == new["sha256"]
+        ):
+            continue
+
+        if old and new:
+            action = "modified"
+        elif new:
+            action = "added"
+        else:
+            action = "deleted"
+
+        changes.append(
+            ChangeRecord(
+                path=rp,
+                action=action,
+                old_sha256=(
+                    old["sha256"]
+                    if old
+                    else None
+                ),
+                new_sha256=(
+                    new["sha256"]
+                    if new
+                    else None
+                ),
+                old_size=(
+                    old["size"]
+                    if old
+                    else 0
+                ),
+                new_size=(
+                    new["size"]
+                    if new
+                    else 0
+                ),
+                protected=is_update_protected(
+                    ROOT / rp
+                ),
+            )
+        )
+
+    return changes
+
+
+def security_check_changes(
+    changes: list[ChangeRecord],
+) -> list[str]:
+
+    errors: list[str] = []
+
+    for c in changes:
+
+        if c.protected:
+
+            errors.append(
+                "Protected path cannot be "
+                "changed automatically: "
+                + c.path
+            )
+
+    return errors
+
+
+def create_proposal(
+    changes: list[ChangeRecord],
+    source_records: list[SourceRecord],
+    reason: str,
+    knowledge_summary: dict[str, Any],
 ) -> Path:
 
-    ensure_directories()
+    report_id = (
+        datetime.now(
+            timezone.utc
+        ).strftime(
+            "%Y%m%dT%H%M%SZ"
+        )
+        + "-"
+        + hashlib.sha256(
+            os.urandom(16)
+        ).hexdigest()[:10]
+    )
 
-    timestamp = dt.datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
+    report = UpdateReport(
+        report_id=report_id,
+        created_at=now(),
+        system_version=VERSION,
+        status="PROPOSED",
+        reason=reason,
+        source_records=[
+            asdict(s)
+            for s in source_records
+        ],
+        knowledge_summary=(
+            knowledge_summary
+        ),
+        changes=[
+            asdict(c)
+            for c in changes
+        ],
+        tests=[],
+        security=[
+            "External sources are treated "
+            "as data, never executable code.",
+
+            "Only HTTPS and an explicit "
+            "trusted-host allow-list are accepted.",
+
+            "Protected core files cannot "
+            "be replaced by an automatic "
+            "knowledge update.",
+
+            "No change is applied without "
+            "explicit approval.",
+
+            "Backup is created before "
+            "an approved transaction.",
+
+            "Rollback restores only files "
+            "changed by that transaction.",
+
+            "Downloaded archives are "
+            "path-validated before extraction.",
+        ],
+        approval_required=True,
+    )
+
+    REPORT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
     path = (
         REPORT_DIR
-        / f"{prefix}_{timestamp}.json"
+        / f"{report_id}.json"
     )
 
-    path.write_text(
-        json.dumps(
-            report,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    json_dump(
+        path,
+        asdict(report),
     )
 
     return path
 
 
-# ===============================================================
-# ROLLBACK
-# ===============================================================
-
-def rollback(
-    backup: Path | None = None,
+def approve_report(
+    report_path: Path,
 ) -> None:
 
-    backups = list_backups()
-
-    if backup is None:
-
-        if not backups:
-
-            raise RuntimeError(
-                "No backup available."
-            )
-
-        backup = backups[0]
-
-    archive = (
-        backup
-        / "source.tar"
+    data = json.loads(
+        report_path.read_text(
+            encoding="utf-8"
+        )
     )
 
-    if not archive.exists():
+    if data.get("status") != "PROPOSED":
 
         raise RuntimeError(
-            "Backup archive missing: "
-            + str(archive)
+            "Only a PROPOSED report "
+            "can be approved."
         )
 
-    # Extract into a temporary directory first.
-    with tempfile.TemporaryDirectory(
-        prefix="arya_rollback_"
-    ) as temp:
+    token = hashlib.sha256(
+        (
+            f"{data['report_id']}"
+            f"|{VERSION}"
+            f"|{data['created_at']}"
+        ).encode()
+    ).hexdigest()[:16]
 
-        temp_path = Path(temp)
+    data["approval_token"] = token
+    data["status"] = "APPROVED"
+    data["approved_at"] = now()
 
-        result = run(
-            [
-                "tar",
-                "-xf",
-                str(archive),
-                "-C",
-                str(temp_path),
-            ]
+    json_dump(
+        report_path,
+        data,
+    )
+
+    print(
+        f"APPROVAL TOKEN: {token}"
+    )
+
+    print(
+        "The report is approved, "
+        "but no code is changed "
+        "by this command."
+    )
+
+
+def apply_report(
+    report_path: Path,
+    candidate: Path,
+) -> None:
+
+    data = json.loads(
+        report_path.read_text(
+            encoding="utf-8"
+        )
+    )
+
+    if data.get("status") != "APPROVED":
+
+        raise RuntimeError(
+            "Report must be explicitly "
+            "approved first."
         )
 
-        if result.returncode != 0:
+    changes = [
+        ChangeRecord(**c)
+        for c in data.get(
+            "changes",
+            [],
+        )
+    ]
 
-            raise RuntimeError(
-                "Cannot extract backup: "
-                + result.stderr
+    security_errors = (
+        security_check_changes(
+            changes
+        )
+    )
+
+    if security_errors:
+
+        raise RuntimeError(
+            "; ".join(
+                security_errors
             )
+        )
 
-        # Do not touch protected runtime secrets.
-        for item in temp_path.iterdir():
+    if not candidate.resolve().is_dir():
 
-            if item.name in PROTECTED_PATHS:
-                continue
+        raise RuntimeError(
+            "Candidate directory "
+            "does not exist."
+        )
 
-            target = ROOT / item.name
-
-            if target.exists():
-
-                if target.is_dir():
-
-                    shutil.rmtree(
-                        target
-                    )
-
-                else:
-
-                    target.unlink()
-
-            if item.is_dir():
-
-                shutil.copytree(
-                    item,
-                    target,
-                )
-
-            else:
-
-                shutil.copy2(
-                    item,
-                    target,
-                )
-
-    save_report(
+    create_lock(
+        "apply",
         {
-            "ok": True,
-            "action": "rollback",
-            "timestamp": now(),
-            "backup": str(backup),
+            "report":
+                str(report_path),
+            "candidate":
+                str(candidate),
         },
-        "rollback",
     )
 
-
-# ===============================================================
-# KNOWLEDGE UPDATE STORAGE
-# ===============================================================
-
-def register_knowledge_update(
-    title: str,
-    source: str,
-    content: str,
-) -> Path:
-
-    """
-    Stores new scientific knowledge separately.
-
-    It does NOT inject the knowledge directly
-    into the application code.
-    """
-
-    ensure_directories()
-
-    timestamp = dt.datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
-
-    record = {
-        "title":
-            title,
-
-        "source":
-            source,
-
-        "received_at":
-            now(),
-
-        "content":
-            content,
-    }
-
-    path = (
-        KNOWLEDGE_DIR
-        / f"knowledge_{timestamp}.json"
-    )
-
-    path.write_text(
-        json.dumps(
-            record,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    return path
-
-
-# ===============================================================
-# UPDATE SAFETY CHECK
-# ===============================================================
-
-def update_is_safe(
-    candidate: Path,
-) -> tuple[bool, str]:
-
-    # Never allow update package to replace
-    # the update system itself automatically.
-    update_system = candidate / Path(
-        __file__
-    ).name
-
-    if update_system.exists():
-
-        return (
-            False,
-            "Candidate cannot replace "
-            "the update system automatically.",
-        )
-
-    # Ensure candidate contains no protected
-    # repository metadata.
-    for protected in PROTECTED_PATHS:
-
-        if (candidate / protected).exists():
-
-            return (
-                False,
-                f"Protected path found: {protected}",
-            )
-
-    return (
-        True,
-        "Update safety check passed.",
-    )
-
-
-# ===============================================================
-# APPLY UPDATE
-# ===============================================================
-
-def apply_candidate(
-    candidate: Path,
-) -> dict[str, Any]:
-
-    safe, message = (
-        update_is_safe(candidate)
-    )
-
-    if not safe:
-
-        return {
-            "ok": False,
-            "stage": "safety",
-            "message": message,
-        }
-
-    # -----------------------------------------------------------
-    # 1. BACKUP CURRENT WORKING VERSION
-    # -----------------------------------------------------------
-
-    backup = create_backup(
-        reason="before_update"
-    )
-
-    # -----------------------------------------------------------
-    # 2. VALIDATE CANDIDATE
-    # -----------------------------------------------------------
-
-    syntax_ok, syntax_message = (
-        python_syntax_test(candidate)
-    )
-
-    if not syntax_ok:
-
-        return {
-            "ok": False,
-            "stage": "candidate_syntax",
-            "message":
-                syntax_message,
-            "backup":
-                str(backup),
-        }
-
-    # -----------------------------------------------------------
-    # 3. APPLY FILES
-    # -----------------------------------------------------------
+    backup = None
 
     try:
 
-        for item in candidate.iterdir():
-
-            if item.name in PROTECTED_PATHS:
-                continue
-
-            target = ROOT / item.name
-
-            if target.exists():
-
-                if target.is_dir():
-
-                    shutil.rmtree(
-                        target
-                    )
-
-                else:
-
-                    target.unlink()
-
-            if item.is_dir():
-
-                shutil.copytree(
-                    item,
-                    target,
-                )
-
-            else:
-
-                shutil.copy2(
-                    item,
-                    target,
-                )
-
-        # -------------------------------------------------------
-        # 4. VALIDATE NEW VERSION
-        # -------------------------------------------------------
-
-        report = validate_current()
-
-        if not report["ok"]:
-
-            raise RuntimeError(
-                "Post-update validation failed."
-            )
-
-        report["backup"] = str(
-            backup
+        backup = create_backup(
+            "before approved knowledge update"
         )
 
-        report["candidate"] = str(
+        results = validate_tree(
             candidate
         )
 
-        save_report(
-            report,
-            "successful_update",
+        if not tests_pass(results):
+
+            raise RuntimeError(
+                "Candidate validation "
+                "failed; nothing was applied."
+            )
+
+        approved_paths = {
+            c.path
+            for c in changes
+        }
+
+        cand = collect_tree(
+            candidate
         )
 
-        return {
-            "ok":
-                True,
+        for rp in sorted(
+            approved_paths
+        ):
 
-            "message":
-                "Update applied successfully.",
+            dst = (
+                ROOT / rp
+            )
 
-            "backup":
-                str(backup),
+            if rp not in cand:
 
-            "report":
-                report,
-        }
+                if (
+                    dst.exists()
+                    and dst.is_file()
+                ):
+                    dst.unlink()
+
+                continue
+
+            src = (
+                candidate / rp
+            )
+
+            if is_update_protected(
+                dst
+            ):
+
+                raise RuntimeError(
+                    f"Protected file blocked: {rp}"
+                )
+
+            dst.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            # Atomic replacement.
+            with src.open(
+                "rb"
+            ) as fsrc:
+
+                fd, tmp_name = (
+                    tempfile.mkstemp(
+                        prefix=".arya-update-",
+                        dir=str(
+                            dst.parent
+                        ),
+                    )
+                )
+
+                try:
+
+                    with os.fdopen(
+                        fd,
+                        "wb",
+                    ) as fdst:
+
+                        shutil.copyfileobj(
+                            fsrc,
+                            fdst,
+                        )
+
+                    os.replace(
+                        tmp_name,
+                        dst,
+                    )
+
+                finally:
+
+                    try:
+                        os.unlink(
+                            tmp_name
+                        )
+                    except FileNotFoundError:
+                        pass
+
+        live_results = validate_tree(
+            ROOT
+        )
+
+        if not tests_pass(
+            live_results
+        ):
+
+            rollback_transaction(
+                data["changes"],
+                backup,
+            )
+
+            raise RuntimeError(
+                "Post-apply tests failed. "
+                "Automatic rollback completed."
+            )
+
+        data["status"] = "APPLIED"
+        data["applied_at"] = now()
+        data["backup"] = str(
+            backup
+        )
+        data["post_apply_tests"] = (
+            live_results
+        )
+
+        json_dump(
+            report_path,
+            data,
+        )
 
     except Exception as exc:
 
-        # -------------------------------------------------------
-        # 5. AUTOMATIC ROLLBACK
-        # -------------------------------------------------------
+        data["status"] = (
+            "FAILED_OR_ROLLED_BACK"
+        )
 
-        try:
+        data["failure"] = str(exc)
 
-            rollback(
+        if backup:
+
+            data["backup"] = str(
                 backup
             )
 
-        except Exception as rollback_error:
+        json_dump(
+            report_path,
+            data,
+        )
 
-            return {
-                "ok":
-                    False,
+        raise
 
-                "stage":
-                    "rollback_failed",
+    finally:
 
-                "error":
-                    str(exc),
-
-                "rollback_error":
-                    str(
-                        rollback_error
-                    ),
-
-                "backup":
-                    str(backup),
-            }
-
-        return {
-            "ok":
-                False,
-
-            "stage":
-                "update_failed_rolled_back",
-
-            "error":
-                str(exc),
-
-            "backup":
-                str(backup),
-
-            "message":
-                "Update failed. "
-                "Previous version restored.",
-        }
+        clear_lock()
 
 
-# ===============================================================
-# STATUS
-# ===============================================================
+def status() -> None:
 
-def status() -> dict[str, Any]:
+    print(
+        f"ARYA Update Gateway {VERSION}"
+    )
 
-    ensure_directories()
+    print(
+        f"ROOT: {ROOT}"
+    )
 
-    backups = list_backups()
+    print(
+        f"BACKUPS: {BACKUP_DIR}"
+    )
 
-    return {
-        "application":
-            APP_NAME,
+    print(
+        f"REPORTS: {REPORT_DIR}"
+    )
 
-        "update_system":
-            UPDATE_VERSION,
+    print(
+        f"KNOWLEDGE: {KNOWLEDGE_DIR}"
+    )
 
-        "current_version":
-            load_version(),
+    print(
+        "LOCK ACTIVE: "
+        + (
+            "YES"
+            if LOCK_FILE.exists()
+            else "NO"
+        )
+    )
 
-        "git_revision":
-            git_revision(),
-
-        "working_tree":
-            git_status(),
-
-        "backup_count":
-            len(backups),
-
-        "backups":
-            [
-                item.name
-                for item in backups
-            ],
-
-        "staging":
-            [
-                item.name
-                for item
-                in STAGING_DIR.iterdir()
-            ]
-            if STAGING_DIR.exists()
-            else [],
-    }
-
-
-# ===============================================================
-# CLI
-# ===============================================================
 
 def main() -> int:
 
     parser = argparse.ArgumentParser(
-        description=
-            "ARYA safe update manager"
+        description=(
+            "ARYA secure knowledge "
+            "update gateway"
+        )
     )
 
-    parser.add_argument(
-        "command",
-        choices=[
-            "status",
-            "backup",
-            "test",
-            "rollback",
-            "knowledge",
-        ],
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
     )
 
-    parser.add_argument(
-        "--source",
-        default="",
-        help=
-            "Staging source directory",
+    sub.add_parser("status")
+    sub.add_parser("backup")
+    sub.add_parser("test")
+
+    p_fetch = sub.add_parser(
+        "fetch"
     )
 
-    parser.add_argument(
+    p_fetch.add_argument(
+        "url"
+    )
+
+    p_fetch.add_argument(
         "--title",
         default="",
     )
 
-    parser.add_argument(
-        "--url",
-        default="",
+    p_report = sub.add_parser(
+        "report"
     )
 
-    parser.add_argument(
-        "--content",
-        default="",
+    p_report.add_argument(
+        "--reason",
+        required=True,
+    )
+
+    p_report.add_argument(
+        "--candidate",
+        required=True,
+    )
+
+    p_report.add_argument(
+        "--source",
+        action="append",
+        default=[],
+    )
+
+    p_approve = sub.add_parser(
+        "approve"
+    )
+
+    p_approve.add_argument(
+        "--report",
+        required=True,
+    )
+
+    p_apply = sub.add_parser(
+        "apply"
+    )
+
+    p_apply.add_argument(
+        "--report",
+        required=True,
+    )
+
+    p_apply.add_argument(
+        "--candidate",
+        required=True,
     )
 
     args = parser.parse_args()
-
-    ensure_directories()
 
     try:
 
         if args.command == "status":
 
-            print(
-                json.dumps(
-                    status(),
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-
+            status()
             return 0
 
         if args.command == "backup":
 
-            path = create_backup(
-                reason="manual"
+            create_lock(
+                "backup",
+                {},
             )
 
-            print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "backup":
-                            str(path),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
+            try:
+
+                print(
+                    create_backup(
+                        "manual backup"
+                    )
                 )
-            )
+
+            finally:
+
+                clear_lock()
 
             return 0
 
         if args.command == "test":
 
-            report = validate_current()
-
-            path = save_report(
-                report,
-                "test",
-            )
-
-            report["report"] = str(
-                path
+            results = validate_tree(
+                ROOT
             )
 
             print(
                 json.dumps(
-                    report,
+                    results,
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -1274,21 +1468,20 @@ def main() -> int:
 
             return (
                 0
-                if report["ok"]
+                if tests_pass(results)
                 else 1
             )
 
-        if args.command == "rollback":
+        if args.command == "fetch":
 
-            rollback()
+            record = fetch_source(
+                args.url,
+                args.title,
+            )
 
             print(
                 json.dumps(
-                    {
-                        "ok": True,
-                        "message":
-                            "Rollback completed.",
-                    },
+                    asdict(record),
                     ensure_ascii=False,
                     indent=2,
                 )
@@ -1296,30 +1489,118 @@ def main() -> int:
 
             return 0
 
-        if args.command == "knowledge":
+        if args.command == "report":
 
-            if not args.title:
+            candidate = Path(
+                args.candidate
+            ).resolve()
+
+            if not candidate.is_dir():
 
                 raise RuntimeError(
-                    "--title is required"
+                    "Candidate directory "
+                    "does not exist."
                 )
 
-            path = register_knowledge_update(
-                title=args.title,
-                source=args.url,
-                content=args.content,
+            sources = [
+                fetch_source(u)
+                for u in args.source
+            ]
+
+            changes = compare_candidate(
+                candidate
+            )
+
+            errors = (
+                security_check_changes(
+                    changes
+                )
+            )
+
+            summary = {
+                "change_count":
+                    len(changes),
+
+                "added":
+                    sum(
+                        c.action == "added"
+                        for c in changes
+                    ),
+
+                "modified":
+                    sum(
+                        c.action == "modified"
+                        for c in changes
+                    ),
+
+                "deleted":
+                    sum(
+                        c.action == "deleted"
+                        for c in changes
+                    ),
+
+                "protected_blocked":
+                    len(errors),
+
+                "changed_bytes":
+                    sum(
+                        abs(
+                            c.new_size
+                            - c.old_size
+                        )
+                        for c in changes
+                    ),
+            }
+
+            path = create_proposal(
+                changes,
+                sources,
+                args.reason,
+                summary,
+            )
+
+            print(path)
+
+            if errors:
+
+                print(
+                    json.dumps(
+                        {
+                            "SECURITY_BLOCK":
+                                errors
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+
+                return 2
+
+            return 0
+
+        if args.command == "approve":
+
+            approve_report(
+                Path(
+                    args.report
+                ).resolve()
+            )
+
+            return 0
+
+        if args.command == "apply":
+
+            apply_report(
+                Path(
+                    args.report
+                ).resolve(),
+                Path(
+                    args.candidate
+                ).resolve(),
             )
 
             print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "file":
-                            str(path),
-                    },
-                    ensure_ascii=False,
-                    indent=2,
-                )
+                "UPDATE APPLIED AND VERIFIED."
             )
 
             return 0
@@ -1327,14 +1608,8 @@ def main() -> int:
     except Exception as exc:
 
         print(
-            json.dumps(
-                {
-                    "ok": False,
-                    "error": str(exc),
-                },
-                ensure_ascii=False,
-                indent=2,
-            )
+            f"ERROR: {exc}",
+            file=sys.stderr,
         )
 
         return 1
