@@ -1,56 +1,100 @@
-"""
-ARYA AgriDoctor - Secure Knowledge Update & Approval Gateway
-Version: 3.0.0
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-Design:
-- Scientific knowledge is separate from executable code.
-- External sources are treated as untrusted DATA.
-- Every proposed change creates a report first.
-- Nothing is applied without explicit approval.
-- Backups exclude secrets but include application/core files needed for recovery.
-- Automatic rollback is limited to files changed by the current transaction.
-- No downloaded source code is executed.
-- Runtime tests are optional and must be explicitly configured.
+"""
+ARYA AgriDoctor - Secure Update / Backup / Validation System
+Version: 3.1.0
+
+Security goals:
+- LIVE_ROOT is the only tree that Apply may modify.
+- Candidate/Staging trees are evaluated relative to their own root.
+- Protected core files cannot be automatically replaced.
+- Secrets are excluded from backups and candidates.
+- ZIP traversal, symlink and special-file attacks are rejected.
+- Apply requires explicit approval bound to the exact candidate hash.
+- Backup is created before Apply.
+- Failed Apply triggers transaction rollback.
+- No shell=True.
+- External scientific sources are treated as DATA, never executable code.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import os
+import py_compile
+from pathlib import Path, PurePosixPath
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-VERSION = "3.0.0"
+# ============================================================
+# VERSION / ROOT
+# ============================================================
 
-ROOT = Path(
-    os.getenv(
-        "ARYA_PROJECT_ROOT",
-        Path(__file__).resolve().parent,
-    )
-).resolve()
+VERSION = "3.1.0"
 
-BACKUP_DIR = ROOT / ".arya_backups"
-STAGING_DIR = ROOT / ".arya_staging"
-REPORT_DIR = ROOT / ".arya_update_reports"
-KNOWLEDGE_DIR = ROOT / "data" / "arya_knowledge_updates"
+ROOT = Path(__file__).resolve().parent
+LIVE_ROOT = ROOT
 
-STATE_FILE = ROOT / ".arya_update_state.json"
-LOCK_FILE = ROOT / ".arya_update_lock.json"
+INTERNAL_DIR = LIVE_ROOT / ".arya_update"
 
-BACKUP_EXCLUDE_NAMES = {
+BACKUP_DIR = INTERNAL_DIR / "backups"
+REPORT_DIR = INTERNAL_DIR / "reports"
+CANDIDATE_DIR = INTERNAL_DIR / "candidates"
+TRANSACTION_DIR = INTERNAL_DIR / "transactions"
+
+LOCK_FILE = INTERNAL_DIR / ".update.lock"
+
+
+# ============================================================
+# LIMITS
+# ============================================================
+
+DEFAULT_MAX_FILE_SIZE = 25 * 1024 * 1024
+DEFAULT_MAX_ZIP_FILES = 10000
+DEFAULT_TIMEOUT = int(
+    os.environ.get("ARYA_UPDATE_TEST_TIMEOUT", "180")
+)
+
+DEFAULT_RUNTIME_TEST_COMMAND = os.environ.get(
+    "ARYA_UPDATE_TEST_COMMAND",
+    ""
+).strip()
+
+
+# ============================================================
+# PROTECTED FILES / DIRECTORIES
+# ============================================================
+
+PROTECTED_PATHS = {
+    "backend/main.py",
+    "arya_master_system.py",
+    "arya_update_system.py",
+}
+
+PROTECTED_DIRS = {
+    ".github",
+}
+
+
+# ============================================================
+# SECRET FILES
+# ============================================================
+
+SECRET_NAMES = {
     ".env",
     ".env.local",
     ".env.production",
@@ -58,982 +102,962 @@ BACKUP_EXCLUDE_NAMES = {
     ".env.test",
 }
 
-BACKUP_EXCLUDE_DIRS = {
+SECRET_SUFFIXES = {
+    ".pem",
+    ".key",
+    ".p12",
+    ".pfx",
+}
+
+
+# ============================================================
+# EXCLUDED DIRECTORIES
+# ============================================================
+
+EXCLUDED_DIRS = {
     ".git",
-    ".arya_backups",
-    ".arya_staging",
-    ".arya_update_reports",
-    ".pytest_cache",
     "__pycache__",
+    ".pytest_cache",
     ".mypy_cache",
     ".ruff_cache",
-    ".dart_tool",
-    "build",
+    ".idea",
+    ".vscode",
+    ".arya_update",
 }
 
-# These paths may be backed up and restored during explicit disaster recovery,
-# but an automatic scientific knowledge update can NEVER replace them.
-UPDATE_PROTECTED = {
-    "backend/main.py",
-    "arya_master_system.py",
-    "arya_update_system.py",
-    ".github",
-    ".env",
-    ".env.local",
-    ".env.production",
-}
 
-# External sources are DATA sources only.
-# New hosts must be manually reviewed before being added.
+# ============================================================
+# TRUSTED SCIENTIFIC SOURCES
+# ============================================================
+
 ALLOWED_SOURCE_HOSTS = {
     "fao.org",
-    "www.fao.org",
     "who.int",
-    "www.who.int",
     "usda.gov",
-    "www.usda.gov",
     "aphis.usda.gov",
     "epa.gov",
-    "www.epa.gov",
     "efsa.europa.eu",
-    "www.efsa.europa.eu",
     "ippc.int",
-    "www.ippc.int",
     "cgiar.org",
-    "www.cgiar.org",
     "cabi.org",
-    "www.cabi.org",
 }
 
-MAX_DOWNLOAD_BYTES = int(
-    os.getenv("ARYA_MAX_SOURCE_BYTES", "2000000")
-)
 
-HTTP_TIMEOUT = int(
-    os.getenv("ARYA_SOURCE_TIMEOUT", "20")
-)
+# ============================================================
+# ERRORS
+# ============================================================
 
-MAX_BACKUPS = int(
-    os.getenv("ARYA_MAX_BACKUPS", "10")
-)
-
-# Runtime testing is opt-in.
-# Never execute an arbitrary command received from an external source.
-RUNTIME_TEST_COMMAND = os.getenv(
-    "ARYA_UPDATE_TEST_COMMAND",
-    "",
-).strip()
+class UpdateError(RuntimeError):
+    pass
 
 
-@dataclass
-class SourceRecord:
-    url: str
-    title: str
-    retrieved_at: str
-    sha256: str
-    content_type: str
-    bytes: int
+# ============================================================
+# BASIC HELPERS
+# ============================================================
+
+def utc_now() -> str:
+    return (
+        dt.datetime.now(dt.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+    )
 
 
-@dataclass
-class ChangeRecord:
-    path: str
-    action: str
-    old_sha256: str | None
-    new_sha256: str | None
-    old_size: int
-    new_size: int
-    protected: bool
+def rel_posix(path: Path, base: Path) -> str:
+    return path.relative_to(base).as_posix()
 
 
-@dataclass
-class UpdateReport:
-    report_id: str
-    created_at: str
-    system_version: str
-    status: str
-    reason: str
-    source_records: list[dict[str, Any]]
-    knowledge_summary: dict[str, Any]
-    changes: list[dict[str, Any]]
-    tests: list[dict[str, Any]]
-    security: list[str]
-    approval_required: bool
-    approval_token: str | None = None
+def safe_resolve(path: Path, base: Path) -> Path:
+    """
+    Resolve a path and ensure it remains inside the specified base.
 
+    IMPORTANT:
+    The base is supplied explicitly. We do NOT compare candidate
+    paths against LIVE_ROOT.
+    """
+    base_r = base.resolve()
+    p = path.resolve()
 
-def now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-
-    with path.open("rb") as f:
-        for chunk in iter(
-            lambda: f.read(1024 * 1024),
-            b"",
-        ):
-            h.update(chunk)
-
-    return h.hexdigest()
-
-
-def rel(path: Path) -> str:
-    return path.resolve().relative_to(ROOT).as_posix()
-
-
-def safe_relative_path(value: str) -> Path:
-    normalized = value.replace("\\", "/")
-    p = Path(normalized)
-
-    if p.is_absolute():
-        raise ValueError(
-            f"Unsafe absolute path: {value}"
-        )
-
-    if ".." in p.parts:
-        raise ValueError(
-            f"Unsafe traversal path: {value}"
-        )
+    try:
+        p.relative_to(base_r)
+    except ValueError as exc:
+        raise UpdateError(
+            f"Path escapes allowed root: {path}"
+        ) from exc
 
     return p
 
 
-def is_excluded(path: Path) -> bool:
-    r = path.resolve()
+# ============================================================
+# SECRET / PROTECTED PATH DETECTION
+# ============================================================
 
-    try:
-        rp = r.relative_to(ROOT)
-    except ValueError:
+def is_secret_rel(rel: str) -> bool:
+    p = PurePosixPath(rel)
+    name = p.name
+
+    if name in SECRET_NAMES:
         return True
 
-    parts = set(rp.parts)
-
-    if parts & BACKUP_EXCLUDE_DIRS:
+    if name.startswith(".env."):
         return True
 
-    if r.name in BACKUP_EXCLUDE_NAMES:
+    return any(
+        name.lower().endswith(suffix)
+        for suffix in SECRET_SUFFIXES
+    )
+
+
+def is_protected_rel(rel: str) -> bool:
+    p = PurePosixPath(rel)
+
+    if rel in PROTECTED_PATHS:
         return True
 
-    return False
+    return any(
+        part in PROTECTED_DIRS
+        for part in p.parts
+    )
 
 
-def is_update_protected(path: Path) -> bool:
-    try:
-        rp = rel(path)
-    except ValueError:
-        return True
+def is_excluded_rel(
+    rel: str,
+    *,
+    include_internal: bool = False,
+) -> bool:
 
-    for protected in UPDATE_PROTECTED:
+    p = PurePosixPath(rel)
+
+    if any(
+        part in EXCLUDED_DIRS
+        for part in p.parts
+    ):
         if (
-            protected == rp
-            or rp.startswith(
-                protected.rstrip("/") + "/"
-            )
+            include_internal
+            and ".arya_update" in p.parts
         ):
-            return True
+            return False
+
+        return True
+
+    if is_secret_rel(rel):
+        return True
 
     return False
 
 
-def iter_files(base: Path = ROOT):
-    for p in base.rglob("*"):
-        if not p.is_file():
-            continue
+# ============================================================
+# FILE ENUMERATION
+# ============================================================
 
-        if is_excluded(p):
-            continue
+def iter_files(
+    base: Path,
+    *,
+    include_internal: bool = False,
+) -> Iterable[Path]:
+    """
+    Enumerate regular files relative to 'base'.
 
-        yield p
+    CRITICAL FIX:
+    Exclusions are evaluated relative to the supplied base,
+    NOT relative to LIVE_ROOT.
+
+    This allows a Candidate outside LIVE_ROOT to be correctly
+    inspected.
+    """
+
+    base = base.resolve()
+
+    if not base.is_dir():
+        raise UpdateError(
+            f"Not a directory: {base}"
+        )
+
+    for root, dirs, files in os.walk(
+        base,
+        topdown=True,
+        followlinks=False,
+    ):
+
+        root_p = Path(root)
+
+        kept_dirs = []
+
+        for d in dirs:
+
+            p = root_p / d
+
+            rel = (
+                p.relative_to(base)
+                .as_posix()
+            )
+
+            if is_excluded_rel(
+                rel,
+                include_internal=include_internal,
+            ):
+                continue
+
+            if p.is_symlink():
+                raise UpdateError(
+                    f"Symlink directory rejected: {p}"
+                )
+
+            kept_dirs.append(d)
+
+        dirs[:] = kept_dirs
+
+        for name in files:
+
+            p = root_p / name
+
+            rel = (
+                p.relative_to(base)
+                .as_posix()
+            )
+
+            if is_excluded_rel(
+                rel,
+                include_internal=include_internal,
+            ):
+                continue
+
+            if p.is_symlink():
+                raise UpdateError(
+                    f"Symlink file rejected: {p}"
+                )
+
+            st = p.stat()
+
+            if not stat.S_ISREG(st.st_mode):
+                raise UpdateError(
+                    f"Non-regular file rejected: {p}"
+                )
+
+            yield p
 
 
-def json_dump(
+# ============================================================
+# HASHING
+# ============================================================
+
+def sha256_file(
     path: Path,
-    data: Any,
+    chunk: int = 1024 * 1024,
+) -> str:
+
+    h = hashlib.sha256()
+
+    with path.open("rb") as f:
+
+        while True:
+
+            data = f.read(chunk)
+
+            if not data:
+                break
+
+            h.update(data)
+
+    return h.hexdigest()
+
+
+def tree_manifest(
+    base: Path,
+    *,
+    include_internal: bool = False,
+) -> Dict[str, str]:
+
+    base = base.resolve()
+
+    result: Dict[str, str] = {}
+
+    for path in iter_files(
+        base,
+        include_internal=include_internal,
+    ):
+
+        rel = (
+            path.relative_to(base)
+            .as_posix()
+        )
+
+        result[rel] = sha256_file(path)
+
+    return dict(
+        sorted(result.items())
+    )
+
+
+def tree_digest(
+    manifest: Dict[str, str]
+) -> str:
+
+    h = hashlib.sha256()
+
+    for rel, digest in sorted(
+        manifest.items()
+    ):
+
+        h.update(
+            rel.encode("utf-8")
+        )
+
+        h.update(b"\0")
+
+        h.update(
+            digest.encode("ascii")
+        )
+
+        h.update(b"\n")
+
+    return h.hexdigest()
+
+
+# ============================================================
+# JSON ATOMIC WRITE
+# ============================================================
+
+def atomic_write_json(
+    path: Path,
+    obj: object,
 ) -> None:
+
     path.parent.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    tmp = path.with_suffix(
-        path.suffix + ".tmp"
+    fd, tmp = tempfile.mkstemp(
+        prefix=".tmp-",
+        suffix=".json",
+        dir=str(path.parent),
     )
 
-    tmp.write_text(
-        json.dumps(
-            data,
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    os.replace(tmp, path)
-
-
-def create_lock(
-    kind: str,
-    details: dict[str, Any],
-) -> None:
-    if LOCK_FILE.exists():
-        raise RuntimeError(
-            "An ARYA update transaction is already active. "
-            "Do not start another transaction."
-        )
-
-    json_dump(
-        LOCK_FILE,
-        {
-            "version": VERSION,
-            "kind": kind,
-            "started_at": now(),
-            "details": details,
-        },
-    )
-
-
-def clear_lock() -> None:
     try:
-        LOCK_FILE.unlink()
-    except FileNotFoundError:
-        pass
 
+        with os.fdopen(
+            fd,
+            "w",
+            encoding="utf-8",
+        ) as f:
 
-def source_is_allowed(
-    url: str,
-) -> bool:
-    parsed = urllib.parse.urlparse(url)
+            json.dump(
+                obj,
+                f,
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
 
-    if parsed.scheme != "https":
-        return False
+            f.write("\n")
 
-    host = (
-        parsed.hostname or ""
-    ).lower().rstrip(".")
+            f.flush()
+            os.fsync(f.fileno())
 
-    return host in ALLOWED_SOURCE_HOSTS
-
-
-def fetch_source(
-    url: str,
-    title: str = "",
-) -> SourceRecord:
-    if not source_is_allowed(url):
-        raise ValueError(
-            "Source is not on the ARYA trusted-host allow-list."
+        os.replace(
+            tmp,
+            path,
         )
 
-    req = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent":
-                "ARYA-AgriDoctor-KnowledgeGateway/3.0",
-            "Accept":
-                "text/html,application/json,"
-                "application/xml,text/plain",
-        },
-    )
+    finally:
 
-    with urllib.request.urlopen(
-        req,
-        timeout=HTTP_TIMEOUT,
-    ) as response:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
-        content_type = response.headers.get(
-            "Content-Type",
-            "",
+
+def load_json(path: Path) -> dict:
+
+    with path.open(
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        obj = json.load(f)
+
+    if not isinstance(obj, dict):
+        raise UpdateError(
+            f"Invalid JSON object: {path}"
         )
 
-        length = response.headers.get(
-            "Content-Length"
-        )
+    return obj
 
-        if length:
-            if int(length) > MAX_DOWNLOAD_BYTES:
-                raise ValueError(
-                    "Source exceeds configured download limit."
-                )
 
-        data = bytearray()
-
-        while True:
-            chunk = response.read(64 * 1024)
-
-            if not chunk:
-                break
-
-            data.extend(chunk)
-
-            if len(data) > MAX_DOWNLOAD_BYTES:
-                raise ValueError(
-                    "Source exceeds configured download limit."
-                )
-
-    digest = hashlib.sha256(
-        data
-    ).hexdigest()
-
-    source_dir = (
-        KNOWLEDGE_DIR / "sources"
-    )
-
-    source_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    target = (
-        source_dir
-        / f"{digest}.source"
-    )
-
-    if not target.exists():
-        target.write_bytes(
-            bytes(data)
-        )
-
-    return SourceRecord(
-        url=url,
-        title=title or url,
-        retrieved_at=now(),
-        sha256=digest,
-        content_type=content_type,
-        bytes=len(data),
-    )
-
+# ============================================================
+# BACKUP
+# ============================================================
 
 def create_backup(
-    reason: str,
+    label: str = "pre-update",
 ) -> Path:
+    """
+    Full project backup.
+
+    Secrets and updater internal files are excluded.
+
+    Protected core files ARE included in the backup because
+    they are needed for disaster recovery.
+    """
 
     BACKUP_DIR.mkdir(
         parents=True,
         exist_ok=True,
     )
 
-    stamp = datetime.now(
-        timezone.utc
-    ).strftime(
-        "%Y%m%dT%H%M%SZ"
+    stamp = dt.datetime.now().strftime(
+        "%Y%m%d-%H%M%S"
     )
 
-    unique = hashlib.sha256(
-        os.urandom(16)
-    ).hexdigest()[:8]
-
-    backup = (
+    output = (
         BACKUP_DIR
-        / f"backup_{stamp}_{unique}.zip"
+        / f"{stamp}-{label}-{uuid.uuid4().hex[:8]}.zip"
     )
 
-    manifest = {
-        "version": VERSION,
-        "created_at": now(),
-        "reason": reason,
-        "root": str(ROOT),
-        "files": [],
-    }
+    manifest = tree_manifest(
+        LIVE_ROOT
+    )
 
     with zipfile.ZipFile(
-        backup,
+        output,
         "w",
         compression=zipfile.ZIP_DEFLATED,
-        compresslevel=6,
     ) as z:
 
-        for path in iter_files():
-            rp = rel(path)
+        for rel in manifest:
 
-            z.write(
-                path,
-                rp,
+            path = (
+                LIVE_ROOT
+                / Path(rel)
             )
 
-            manifest["files"].append(
-                {
-                    "path": rp,
-                    "sha256": sha256_file(path),
-                    "size": path.stat().st_size,
-                }
+            info = zipfile.ZipInfo(rel)
+
+            info.date_time = (
+                time.localtime(
+                    path.stat().st_mtime
+                )[:6]
             )
+
+            info.compress_type = (
+                zipfile.ZIP_DEFLATED
+            )
+
+            with path.open("rb") as f:
+                z.writestr(
+                    info,
+                    f.read(),
+                )
+
+        metadata = {
+            "version": VERSION,
+            "created_at": utc_now(),
+            "root": str(LIVE_ROOT),
+            "tree_digest": tree_digest(
+                manifest
+            ),
+            "file_count": len(manifest),
+            "purpose": label,
+        }
 
         z.writestr(
-            "ARYA_BACKUP_MANIFEST.json",
+            ".arya_backup_manifest.json",
             json.dumps(
-                manifest,
+                metadata,
                 ensure_ascii=False,
                 indent=2,
             ),
         )
 
-    # Verify backup readability.
-    with zipfile.ZipFile(
-        backup,
-        "r",
-    ) as z:
-
-        if (
-            "ARYA_BACKUP_MANIFEST.json"
-            not in z.namelist()
-        ):
-            raise RuntimeError(
-                "Backup manifest missing."
-            )
-
-    prune_backups()
-
-    return backup
+    return output
 
 
-def prune_backups() -> None:
-    backups = sorted(
-        BACKUP_DIR.glob(
-            "backup_*.zip"
-        ),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
+# ============================================================
+# ZIP SECURITY
+# ============================================================
 
-    for old in backups[MAX_BACKUPS:]:
-        try:
-            old.unlink()
-        except OSError:
-            pass
-
-
-def safe_extract_zip(
-    archive: Path,
-    destination: Path,
-    members: list[str] | None = None,
+def validate_zip_member(
+    name: str,
 ) -> None:
 
-    destination = destination.resolve()
-
-    with zipfile.ZipFile(
-        archive,
-        "r",
-    ) as z:
-
-        names = (
-            members
-            if members is not None
-            else z.namelist()
+    if not name:
+        raise UpdateError(
+            "Invalid ZIP member name"
         )
 
-        for name in names:
+    if "\x00" in name:
+        raise UpdateError(
+            "NUL byte in ZIP member"
+        )
 
-            if name.endswith("/"):
-                continue
+    p = PurePosixPath(name)
 
-            candidate = safe_relative_path(
-                name
-            )
+    if p.is_absolute():
+        raise UpdateError(
+            f"Absolute ZIP path rejected: {name}"
+        )
 
-            target = (
-                destination / candidate
-            ).resolve()
+    if any(
+        part in ("", ".", "..")
+        for part in p.parts
+    ):
+        raise UpdateError(
+            f"Unsafe ZIP path rejected: {name}"
+        )
 
-            try:
-                target.relative_to(
-                    destination
+    if len(p.parts) > 100:
+        raise UpdateError(
+            f"ZIP path too deep: {name}"
+        )
+
+    if len(name) > 4096:
+        raise UpdateError(
+            f"ZIP path too long: {name}"
+        )
+
+
+def extract_zip_candidate(
+    zip_path: Path,
+) -> Path:
+
+    zip_path = zip_path.resolve()
+
+    if not zip_path.is_file():
+        raise UpdateError(
+            f"Candidate ZIP not found: {zip_path}"
+        )
+
+    CANDIDATE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    candidate = (
+        CANDIDATE_DIR
+        / uuid.uuid4().hex
+    )
+
+    candidate.mkdir(
+        parents=True,
+        exist_ok=False,
+    )
+
+    try:
+
+        with zipfile.ZipFile(
+            zip_path,
+            "r",
+        ) as z:
+
+            infos = z.infolist()
+
+            if len(infos) > DEFAULT_MAX_ZIP_FILES:
+                raise UpdateError(
+                    "ZIP contains too many entries"
                 )
-            except ValueError:
-                raise RuntimeError(
-                    f"Archive path escapes destination: {name}"
+
+            for info in infos:
+
+                validate_zip_member(
+                    info.filename
                 )
 
-            target.parent.mkdir(
-                parents=True,
-                exist_ok=True,
-            )
+                # Unix mode check.
+                mode = (
+                    info.external_attr
+                    >> 16
+                ) & 0xFFFF
 
-            with z.open(
-                name,
-                "r",
-            ) as src:
+                if mode:
 
-                with target.open(
-                    "wb"
-                ) as dst:
+                    file_type = stat.S_IFMT(
+                        mode
+                    )
 
+                    if (
+                        file_type
+                        and file_type != stat.S_IFREG
+                        and not info.is_dir()
+                    ):
+                        raise UpdateError(
+                            "ZIP special/symlink entry rejected: "
+                            + info.filename
+                        )
+
+                if (
+                    info.file_size
+                    > DEFAULT_MAX_FILE_SIZE
+                ):
+                    raise UpdateError(
+                        "Candidate file too large: "
+                        + info.filename
+                    )
+
+                target = safe_resolve(
+                    candidate
+                    / Path(info.filename),
+                    candidate,
+                )
+
+                if info.is_dir():
+
+                    target.mkdir(
+                        parents=True,
+                        exist_ok=True,
+                    )
+
+                    continue
+
+                if is_secret_rel(
+                    info.filename
+                ):
+                    raise UpdateError(
+                        "Secret file cannot enter candidate: "
+                        + info.filename
+                    )
+
+                target.parent.mkdir(
+                    parents=True,
+                    exist_ok=True,
+                )
+
+                with (
+                    z.open(info, "r") as src,
+                    target.open("xb") as dst
+                ):
                     shutil.copyfileobj(
                         src,
                         dst,
                     )
 
+        return candidate
 
-def rollback_transaction(
-    changed_files: list[dict[str, Any]],
-    backup: Path,
-) -> None:
-    """
-    Restore only files affected by the current transaction.
+    except Exception:
 
-    This deliberately does NOT sweep/delete unrelated files.
-    """
-
-    with zipfile.ZipFile(
-        backup,
-        "r",
-    ) as z:
-
-        names = set(
-            z.namelist()
+        shutil.rmtree(
+            candidate,
+            ignore_errors=True,
         )
 
-        for item in changed_files:
-
-            path = safe_relative_path(
-                item["path"]
-            )
-
-            live = (
-                ROOT / path
-            ).resolve()
-
-            try:
-                live.relative_to(ROOT)
-            except ValueError:
-                raise RuntimeError(
-                    "Rollback target escaped project root."
-                )
-
-            action = item["action"]
-
-            if action == "added":
-
-                if (
-                    live.exists()
-                    and live.is_file()
-                ):
-                    live.unlink()
-
-                continue
-
-            if action in {
-                "modified",
-                "deleted",
-            }:
-
-                name = path.as_posix()
-
-                if name not in names:
-                    raise RuntimeError(
-                        "Original file missing from backup: "
-                        + name
-                    )
-
-                live.parent.mkdir(
-                    parents=True,
-                    exist_ok=True,
-                )
-
-                with z.open(
-                    name,
-                    "r",
-                ) as src:
-
-                    with live.open(
-                        "wb"
-                    ) as dst:
-
-                        shutil.copyfileobj(
-                            src,
-                            dst,
-                        )
+        raise
 
 
-def collect_tree(
-    source: Path,
-) -> dict[str, dict[str, Any]]:
-
-    result: dict[
-        str,
-        dict[str, Any],
-    ] = {}
-
-    for p in iter_files(source):
-
-        rp = (
-            p.resolve()
-            .relative_to(
-                source.resolve()
-            )
-            .as_posix()
-        )
-
-        result[rp] = {
-            "sha256": sha256_file(p),
-            "size": p.stat().st_size,
-        }
-
-    return result
-
+# ============================================================
+# PYTHON VALIDATION
+# ============================================================
 
 def validate_python_tree(
     base: Path,
-) -> list[str]:
+) -> List[str]:
 
-    errors: list[str] = []
+    errors: List[str] = []
 
-    for p in base.rglob("*.py"):
+    for path in iter_files(base):
 
-        if is_excluded(p):
+        if path.suffix.lower() != ".py":
             continue
 
-        proc = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "py_compile",
-                str(p),
-            ],
-            cwd=str(base),
-            capture_output=True,
-            text=True,
-            timeout=60,
-        )
+        try:
 
-        if proc.returncode != 0:
+            py_compile.compile(
+                str(path),
+                doraise=True,
+                quiet=1,
+            )
+
+        except Exception as exc:
 
             errors.append(
-                f"{p}: "
-                f"{proc.stderr.strip()}"
+                f"{path.relative_to(base).as_posix()}: {exc}"
             )
 
     return errors
 
 
-def validate_core_tokens(
-    base: Path,
-) -> list[str]:
+# ============================================================
+# CANDIDATE VALIDATION
+# ============================================================
 
-    errors: list[str] = []
+def validate_candidate(
+    candidate: Path,
+    candidate_type: str = "application",
+) -> dict:
 
-    required = {
-        "backend/main.py": [
-            "FastAPI",
-        ],
-        "arya_master_system.py": [
-            "FastAPI",
-        ],
-        "arya_update_system.py": [
-            "VERSION",
-            "UpdateReport",
-        ],
-    }
+    candidate = candidate.resolve()
 
-    for filename, tokens in required.items():
-
-        p = base / filename
-
-        if not p.exists():
-
-            errors.append(
-                f"missing required file: {filename}"
-            )
-
-            continue
-
-        text = p.read_text(
-            encoding="utf-8",
-            errors="replace",
+    if not candidate.is_dir():
+        raise UpdateError(
+            "Candidate directory does not exist"
         )
 
-        for token in tokens:
+    manifest = tree_manifest(
+        candidate
+    )
 
-            if token not in text:
+    if not manifest:
+        raise UpdateError(
+            "Candidate is empty"
+        )
+
+    errors: List[str] = []
+
+    if candidate_type == "application":
+
+        errors.extend(
+            validate_python_tree(
+                candidate
+            )
+        )
+
+        required = {
+            "backend",
+            "arya_main",
+        }
+
+        top_dirs = {
+            PurePosixPath(rel).parts[0]
+            for rel in manifest
+            if PurePosixPath(rel).parts
+        }
+
+        missing = sorted(
+            required - top_dirs
+        )
+
+        if missing:
+
+            errors.append(
+                "Candidate is missing expected "
+                "project areas: "
+                + ", ".join(missing)
+            )
+
+    elif candidate_type == "knowledge":
+
+        for rel in manifest:
+
+            path = (
+                candidate
+                / Path(rel)
+            )
+
+            if (
+                path.suffix.lower()
+                not in {
+                    ".json",
+                    ".jsonl",
+                    ".md",
+                    ".txt",
+                    ".csv",
+                }
+            ):
 
                 errors.append(
-                    f"{filename}: "
-                    f"missing required token "
-                    f"{token!r}"
+                    "Knowledge candidate contains "
+                    f"unsupported file type: {rel}"
                 )
 
-    return errors
+    else:
 
-
-def run_configured_runtime_test(
-    base: Path,
-) -> dict[str, Any]:
-
-    if not RUNTIME_TEST_COMMAND:
-
-        return {
-            "name":
-                "configured_runtime_test",
-            "status":
-                "SKIPPED",
-            "reason":
-                "ARYA_UPDATE_TEST_COMMAND "
-                "is not configured.",
-        }
-
-    import shlex
-
-    args = shlex.split(
-        RUNTIME_TEST_COMMAND,
-        posix=(os.name != "nt"),
-    )
-
-    started = time.monotonic()
-
-    proc = subprocess.run(
-        args,
-        cwd=str(base),
-        capture_output=True,
-        text=True,
-        timeout=180,
-        shell=False,
-        env={
-            **os.environ,
-            "ARYA_UPDATE_TEST_MODE": "1",
-        },
-    )
+        raise UpdateError(
+            f"Unknown candidate type: {candidate_type}"
+        )
 
     return {
-        "name":
-            "configured_runtime_test",
-        "status":
-            (
-                "PASS"
-                if proc.returncode == 0
-                else "FAIL"
-            ),
-        "returncode":
-            proc.returncode,
-        "duration_seconds":
-            round(
-                time.monotonic() - started,
-                3,
-            ),
-        "stdout_tail":
-            proc.stdout[-4000:],
-        "stderr_tail":
-            proc.stderr[-4000:],
+        "valid": not errors,
+        "errors": errors,
+        "file_count": len(manifest),
+        "tree_digest": tree_digest(
+            manifest
+        ),
+        "manifest": manifest,
+        "candidate_type": candidate_type,
     }
 
 
-def validate_tree(
-    base: Path,
-) -> list[dict[str, Any]]:
-
-    results: list[
-        dict[str, Any]
-    ] = []
-
-    py_errors = validate_python_tree(
-        base
-    )
-
-    results.append(
-        {
-            "name":
-                "python_syntax",
-            "status":
-                (
-                    "PASS"
-                    if not py_errors
-                    else "FAIL"
-                ),
-            "errors":
-                py_errors[:50],
-        }
-    )
-
-    core_errors = validate_core_tokens(
-        base
-    )
-
-    results.append(
-        {
-            "name":
-                "core_integrity",
-            "status":
-                (
-                    "PASS"
-                    if not core_errors
-                    else "FAIL"
-                ),
-            "errors":
-                core_errors[:50],
-        }
-    )
-
-    runtime = run_configured_runtime_test(
-        base
-    )
-
-    results.append(runtime)
-
-    return results
-
-
-def tests_pass(
-    results: list[dict[str, Any]],
-) -> bool:
-
-    return all(
-        r.get("status")
-        in {
-            "PASS",
-            "SKIPPED",
-        }
-        for r in results
-    )
-
+# ============================================================
+# CANDIDATE / LIVE COMPARISON
+# ============================================================
 
 def compare_candidate(
     candidate: Path,
-) -> list[ChangeRecord]:
+) -> dict:
+    """
+    Compare Candidate against LIVE_ROOT.
 
-    live = collect_tree(ROOT)
-    cand = collect_tree(candidate)
+    IMPORTANT:
+    Candidate enumeration uses candidate as its root.
+    Live enumeration uses LIVE_ROOT as its root.
 
-    paths = sorted(
-        set(live) | set(cand)
+    Candidate is NEVER interpreted relative to LIVE_ROOT.
+    """
+
+    candidate = candidate.resolve()
+
+    live = tree_manifest(
+        LIVE_ROOT
     )
 
-    changes: list[
-        ChangeRecord
-    ] = []
+    cand = tree_manifest(
+        candidate
+    )
 
-    for rp in paths:
+    added = sorted(
+        set(cand)
+        - set(live)
+    )
 
-        old = live.get(rp)
-        new = cand.get(rp)
+    removed = sorted(
+        set(live)
+        - set(cand)
+    )
 
-        if (
-            old
-            and new
-            and old["sha256"]
-            == new["sha256"]
-        ):
-            continue
-
-        if old and new:
-            action = "modified"
-        elif new:
-            action = "added"
-        else:
-            action = "deleted"
-
-        changes.append(
-            ChangeRecord(
-                path=rp,
-                action=action,
-                old_sha256=(
-                    old["sha256"]
-                    if old
-                    else None
-                ),
-                new_sha256=(
-                    new["sha256"]
-                    if new
-                    else None
-                ),
-                old_size=(
-                    old["size"]
-                    if old
-                    else 0
-                ),
-                new_size=(
-                    new["size"]
-                    if new
-                    else 0
-                ),
-                protected=is_update_protected(
-                    ROOT / rp
-                ),
-            )
+    changed = sorted(
+        p
+        for p in (
+            set(live)
+            & set(cand)
         )
+        if live[p] != cand[p]
+    )
 
-    return changes
+    protected_changes = sorted(
+        p
+        for p in (
+            set(changed)
+            | set(added)
+        )
+        if is_protected_rel(p)
+    )
+
+    secret_changes = sorted(
+        p
+        for p in (
+            set(changed)
+            | set(added)
+        )
+        if is_secret_rel(p)
+    )
+
+    changed_bytes = 0
+    added_bytes = 0
+    removed_bytes = 0
+
+    for rel in changed:
+
+        changed_bytes += (
+            candidate
+            / Path(rel)
+        ).stat().st_size
+
+    for rel in added:
+
+        added_bytes += (
+            candidate
+            / Path(rel)
+        ).stat().st_size
+
+    for rel in removed:
+
+        removed_bytes += (
+            LIVE_ROOT
+            / Path(rel)
+        ).stat().st_size
+
+    total_candidate_bytes = sum(
+        (
+            candidate
+            / Path(rel)
+        ).stat().st_size
+        for rel in cand
+    )
+
+    return {
+        "live_tree_digest": tree_digest(
+            live
+        ),
+        "candidate_tree_digest": tree_digest(
+            cand
+        ),
+        "added": added,
+        "removed": removed,
+        "changed": changed,
+        "protected_changes": protected_changes,
+        "secret_changes": secret_changes,
+        "added_bytes": added_bytes,
+        "changed_bytes": changed_bytes,
+        "removed_bytes": removed_bytes,
+        "total_candidate_bytes": total_candidate_bytes,
+    }
 
 
-def security_check_changes(
-    changes: list[ChangeRecord],
-) -> list[str]:
+# ============================================================
+# REPORT
+# ============================================================
 
-    errors: list[str] = []
-
-    for c in changes:
-
-        if c.protected:
-
-            errors.append(
-                "Protected path cannot be "
-                "changed automatically: "
-                + c.path
-            )
-
-    return errors
-
-
-def create_proposal(
-    changes: list[ChangeRecord],
-    source_records: list[SourceRecord],
-    reason: str,
-    knowledge_summary: dict[str, Any],
+def make_report(
+    candidate: Path,
+    *,
+    candidate_type: str,
+    source_urls: Optional[
+        Sequence[str]
+    ] = None,
+    source_notes: Optional[
+        Sequence[str]
+    ] = None,
 ) -> Path:
 
-    report_id = (
-        datetime.now(
-            timezone.utc
-        ).strftime(
-            "%Y%m%dT%H%M%SZ"
-        )
-        + "-"
-        + hashlib.sha256(
-            os.urandom(16)
-        ).hexdigest()[:10]
+    validation = validate_candidate(
+        candidate,
+        candidate_type,
     )
 
-    report = UpdateReport(
-        report_id=report_id,
-        created_at=now(),
-        system_version=VERSION,
-        status="PROPOSED",
-        reason=reason,
-        source_records=[
-            asdict(s)
-            for s in source_records
-        ],
-        knowledge_summary=(
-            knowledge_summary
-        ),
-        changes=[
-            asdict(c)
-            for c in changes
-        ],
-        tests=[],
-        security=[
-            "External sources are treated "
-            "as data, never executable code.",
-
-            "Only HTTPS and an explicit "
-            "trusted-host allow-list are accepted.",
-
-            "Protected core files cannot "
-            "be replaced by an automatic "
-            "knowledge update.",
-
-            "No change is applied without "
-            "explicit approval.",
-
-            "Backup is created before "
-            "an approved transaction.",
-
-            "Rollback restores only files "
-            "changed by that transaction.",
-
-            "Downloaded archives are "
-            "path-validated before extraction.",
-        ],
-        approval_required=True,
+    comparison = compare_candidate(
+        candidate
     )
+
+    report_id = uuid.uuid4().hex
+
+    report = {
+        "schema": 1,
+        "report_id": report_id,
+        "created_at": utc_now(),
+        "updater_version": VERSION,
+        "candidate_type": candidate_type,
+
+        "candidate_tree_digest":
+            validation[
+                "tree_digest"
+            ],
+
+        "validation": validation,
+
+        "comparison": comparison,
+
+        "source_urls":
+            list(source_urls or []),
+
+        "source_notes":
+            list(source_notes or []),
+
+        "approval": {
+            "approved": False,
+            "approved_at": None,
+            "candidate_tree_digest": None,
+        },
+
+        "policy": {
+            "protected_files_are_never_auto_replaced":
+                True,
+
+            "secrets_are_never_imported":
+                True,
+
+            "scientific_source_is_data_only":
+                True,
+        },
+    }
 
     REPORT_DIR.mkdir(
         parents=True,
@@ -1045,316 +1069,1465 @@ def create_proposal(
         / f"{report_id}.json"
     )
 
-    json_dump(
+    atomic_write_json(
         path,
-        asdict(report),
+        report,
     )
 
     return path
 
 
+# ============================================================
+# APPROVAL
+# ============================================================
+
 def approve_report(
     report_path: Path,
-) -> None:
+) -> dict:
 
-    data = json.loads(
-        report_path.read_text(
-            encoding="utf-8"
-        )
+    report = load_json(
+        report_path
     )
 
-    if data.get("status") != "PROPOSED":
+    expected = report.get(
+        "candidate_tree_digest"
+    )
 
-        raise RuntimeError(
-            "Only a PROPOSED report "
-            "can be approved."
+    comparison = report.get(
+        "comparison",
+        {},
+    )
+
+    if not expected:
+        raise UpdateError(
+            "Report has no candidate digest"
         )
 
-    token = hashlib.sha256(
-        (
-            f"{data['report_id']}"
-            f"|{VERSION}"
-            f"|{data['created_at']}"
-        ).encode()
-    ).hexdigest()[:16]
+    if (
+        comparison.get(
+            "candidate_tree_digest"
+        )
+        != expected
+    ):
+        raise UpdateError(
+            "Report candidate digest is invalid"
+        )
 
-    data["approval_token"] = token
-    data["status"] = "APPROVED"
-    data["approved_at"] = now()
+    report["approval"] = {
+        "approved": True,
+        "approved_at": utc_now(),
+        "candidate_tree_digest": expected,
+    }
 
-    json_dump(
+    atomic_write_json(
         report_path,
-        data,
+        report,
     )
 
-    print(
-        f"APPROVAL TOKEN: {token}"
+    return report
+
+
+# ============================================================
+# LOCK
+# ============================================================
+
+def acquire_lock() -> None:
+
+    INTERNAL_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    print(
-        "The report is approved, "
-        "but no code is changed "
-        "by this command."
-    )
+    if LOCK_FILE.exists():
 
+        try:
+            info = load_json(
+                LOCK_FILE
+            )
 
-def apply_report(
-    report_path: Path,
-    candidate: Path,
-) -> None:
+        except Exception:
 
-    data = json.loads(
-        report_path.read_text(
-            encoding="utf-8"
-        )
-    )
+            info = {
+                "raw":
+                    LOCK_FILE.read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    )
+            }
 
-    if data.get("status") != "APPROVED":
-
-        raise RuntimeError(
-            "Report must be explicitly "
-            "approved first."
-        )
-
-    changes = [
-        ChangeRecord(**c)
-        for c in data.get(
-            "changes",
-            [],
-        )
-    ]
-
-    security_errors = (
-        security_check_changes(
-            changes
-        )
-    )
-
-    if security_errors:
-
-        raise RuntimeError(
-            "; ".join(
-                security_errors
+        raise UpdateError(
+            "Update lock exists: "
+            + json.dumps(
+                info,
+                ensure_ascii=False,
             )
         )
 
-    if not candidate.resolve().is_dir():
+    payload = {
+        "pid": os.getpid(),
+        "created_at": utc_now(),
+        "version": VERSION,
+    }
 
-        raise RuntimeError(
-            "Candidate directory "
-            "does not exist."
-        )
-
-    create_lock(
-        "apply",
-        {
-            "report":
-                str(report_path),
-            "candidate":
-                str(candidate),
-        },
+    fd = os.open(
+        str(LOCK_FILE),
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL,
+        0o600,
     )
-
-    backup = None
 
     try:
 
-        backup = create_backup(
-            "before approved knowledge update"
-        )
+        with os.fdopen(
+            fd,
+            "w",
+            encoding="utf-8",
+        ) as f:
 
-        results = validate_tree(
-            candidate
-        )
-
-        if not tests_pass(results):
-
-            raise RuntimeError(
-                "Candidate validation "
-                "failed; nothing was applied."
+            json.dump(
+                payload,
+                f,
+                indent=2,
             )
 
-        approved_paths = {
-            c.path
-            for c in changes
-        }
+            f.flush()
+            os.fsync(f.fileno())
 
-        cand = collect_tree(
-            candidate
-        )
+    except Exception:
 
-        for rp in sorted(
-            approved_paths
-        ):
+        try:
+            LOCK_FILE.unlink()
+        except OSError:
+            pass
 
-            dst = (
-                ROOT / rp
+        raise
+
+
+def release_lock() -> None:
+
+    try:
+        LOCK_FILE.unlink()
+
+    except FileNotFoundError:
+        pass
+
+
+# ============================================================
+# COPY CANDIDATE TO LIVE
+# ============================================================
+
+def copy_candidate_to_live(
+    candidate: Path,
+    *,
+    changed_paths: Sequence[str],
+    added_paths: Sequence[str],
+) -> List[str]:
+
+    touched: List[str] = []
+
+    for rel in sorted(
+        set(changed_paths)
+        | set(added_paths)
+    ):
+
+        if is_protected_rel(rel):
+
+            raise UpdateError(
+                "Protected file change blocked: "
+                + rel
             )
 
-            if rp not in cand:
+        if is_secret_rel(rel):
 
-                if (
-                    dst.exists()
-                    and dst.is_file()
-                ):
-                    dst.unlink()
+            raise UpdateError(
+                "Secret file change blocked: "
+                + rel
+            )
 
+        src = safe_resolve(
+            candidate / Path(rel),
+            candidate,
+        )
+
+        dst = safe_resolve(
+            LIVE_ROOT / Path(rel),
+            LIVE_ROOT,
+        )
+
+        if not src.is_file():
+
+            raise UpdateError(
+                "Candidate file missing: "
+                + rel
+            )
+
+        dst.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        fd, tmp = tempfile.mkstemp(
+            prefix=f".arya-{dst.name}-",
+            dir=str(dst.parent),
+        )
+
+        try:
+
+            with os.fdopen(
+                fd,
+                "wb",
+            ) as out, src.open("rb") as inp:
+
+                shutil.copyfileobj(
+                    inp,
+                    out,
+                )
+
+                out.flush()
+                os.fsync(out.fileno())
+
+            os.replace(
+                tmp,
+                dst,
+            )
+
+        finally:
+
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+        touched.append(rel)
+
+    return touched
+
+
+# ============================================================
+# REMOVE LIVE FILES
+# ============================================================
+
+def remove_live_files(
+    rel_paths: Sequence[str],
+) -> None:
+
+    for rel in rel_paths:
+
+        if is_protected_rel(rel):
+
+            raise UpdateError(
+                "Removal of protected file blocked: "
+                + rel
+            )
+
+        if is_secret_rel(rel):
+
+            raise UpdateError(
+                "Removal of secret file blocked: "
+                + rel
+            )
+
+        dst = safe_resolve(
+            LIVE_ROOT / Path(rel),
+            LIVE_ROOT,
+        )
+
+        if dst.exists():
+
+            if not dst.is_file():
+
+                raise UpdateError(
+                    "Cannot remove non-file: "
+                    + rel
+                )
+
+            dst.unlink()
+
+
+# ============================================================
+# RESTORE FROM BACKUP
+# ============================================================
+
+def restore_from_backup_for_paths(
+    backup_zip: Path,
+    paths: Sequence[str],
+) -> None:
+
+    if not backup_zip.is_file():
+
+        raise UpdateError(
+            f"Backup not found: {backup_zip}"
+        )
+
+    with zipfile.ZipFile(
+        backup_zip,
+        "r",
+    ) as z:
+
+        names = set(
+            z.namelist()
+        )
+
+        for rel in paths:
+
+            if rel not in names:
                 continue
 
-            src = (
-                candidate / rp
-            )
+            validate_zip_member(rel)
 
-            if is_update_protected(
-                dst
-            ):
+            if is_secret_rel(rel):
 
-                raise RuntimeError(
-                    f"Protected file blocked: {rp}"
+                raise UpdateError(
+                    "Refusing to restore secret file"
                 )
+
+            dst = safe_resolve(
+                LIVE_ROOT / Path(rel),
+                LIVE_ROOT,
+            )
 
             dst.parent.mkdir(
                 parents=True,
                 exist_ok=True,
             )
 
-            # Atomic replacement.
-            with src.open(
-                "rb"
-            ) as fsrc:
+            fd, tmp = tempfile.mkstemp(
+                prefix=".arya-restore-",
+                dir=str(dst.parent),
+            )
 
-                fd, tmp_name = (
-                    tempfile.mkstemp(
-                        prefix=".arya-update-",
-                        dir=str(
-                            dst.parent
-                        ),
+            try:
+
+                with os.fdopen(
+                    fd,
+                    "wb",
+                ) as out, z.open(
+                    rel,
+                    "r",
+                ) as src:
+
+                    shutil.copyfileobj(
+                        src,
+                        out,
                     )
+
+                    out.flush()
+                    os.fsync(out.fileno())
+
+                os.replace(
+                    tmp,
+                    dst,
                 )
 
+            finally:
+
                 try:
+                    os.unlink(tmp)
+                except FileNotFoundError:
+                    pass
 
-                    with os.fdopen(
-                        fd,
-                        "wb",
-                    ) as fdst:
 
-                        shutil.copyfileobj(
-                            fsrc,
-                            fdst,
-                        )
+# ============================================================
+# RUNTIME TEST
+# ============================================================
 
-                    os.replace(
-                        tmp_name,
-                        dst,
-                    )
+def run_runtime_test(
+    command: str,
+    cwd: Path,
+    timeout: int = DEFAULT_TIMEOUT,
+) -> Tuple[bool, str]:
 
-                finally:
+    if not command:
 
-                    try:
-                        os.unlink(
-                            tmp_name
-                        )
-                    except FileNotFoundError:
-                        pass
-
-        live_results = validate_tree(
-            ROOT
+        return (
+            True,
+            "SKIPPED: "
+            "ARYA_UPDATE_TEST_COMMAND is not configured",
         )
 
-        if not tests_pass(
-            live_results
-        ):
+    argv = command.split()
 
-            rollback_transaction(
-                data["changes"],
-                backup,
-            )
+    if not argv:
 
-            raise RuntimeError(
-                "Post-apply tests failed. "
-                "Automatic rollback completed."
-            )
-
-        data["status"] = "APPLIED"
-        data["applied_at"] = now()
-        data["backup"] = str(
-            backup
-        )
-        data["post_apply_tests"] = (
-            live_results
+        return (
+            True,
+            "SKIPPED: empty runtime command",
         )
 
-        json_dump(
-            report_path,
-            data,
+    try:
+
+        process = subprocess.run(
+            argv,
+            cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+            shell=False,
+        )
+
+        output = (
+            process.stdout[-12000:]
+            if process.stdout
+            else ""
+        )
+
+        return (
+            process.returncode == 0,
+            output,
         )
 
     except Exception as exc:
 
-        data["status"] = (
-            "FAILED_OR_ROLLED_BACK"
+        return (
+            False,
+            f"Runtime test exception: {exc}",
         )
 
-        data["failure"] = str(exc)
 
-        if backup:
+# ============================================================
+# APPLY
+# ============================================================
 
-            data["backup"] = str(
-                backup
+def apply_report(
+    report_path: Path,
+    candidate: Path,
+    *,
+    runtime_command:
+        str = DEFAULT_RUNTIME_TEST_COMMAND,
+) -> dict:
+
+    report = load_json(
+        report_path
+    )
+
+    if not report.get(
+        "approval",
+        {},
+    ).get(
+        "approved"
+    ):
+
+        raise UpdateError(
+            "Report has not been explicitly approved"
+        )
+
+    expected = report.get(
+        "candidate_tree_digest"
+    )
+
+    candidate_type = report.get(
+        "candidate_type",
+        "application",
+    )
+
+    validation = validate_candidate(
+        candidate,
+        candidate_type,
+    )
+
+    if (
+        validation["tree_digest"]
+        != expected
+    ):
+
+        raise UpdateError(
+            "Candidate changed after approval; "
+            "approval is invalid"
+        )
+
+    comparison = compare_candidate(
+        candidate
+    )
+
+    if (
+        comparison[
+            "candidate_tree_digest"
+        ]
+        != expected
+    ):
+
+        raise UpdateError(
+            "Candidate digest changed during verification"
+        )
+
+    if comparison[
+        "protected_changes"
+    ]:
+
+        raise UpdateError(
+            "Protected file changes are blocked: "
+            + ", ".join(
+                comparison[
+                    "protected_changes"
+                ]
+            )
+        )
+
+    if comparison[
+        "secret_changes"
+    ]:
+
+        raise UpdateError(
+            "Secret changes are blocked: "
+            + ", ".join(
+                comparison[
+                    "secret_changes"
+                ]
+            )
+        )
+
+    if candidate_type != "application":
+
+        raise UpdateError(
+            "This Apply path installs application "
+            "candidates only. Knowledge updates must "
+            "be imported as data through a separate workflow."
+        )
+
+    acquire_lock()
+
+    transaction_id = uuid.uuid4().hex
+
+    transaction_path = (
+        TRANSACTION_DIR
+        / f"{transaction_id}.json"
+    )
+
+    touched = sorted(
+        set(
+            comparison["added"]
+        )
+        |
+        set(
+            comparison["changed"]
+        )
+        |
+        set(
+            comparison["removed"]
+        )
+    )
+
+    backup = create_backup(
+        f"transaction-{transaction_id}"
+    )
+
+    transaction = {
+        "schema": 1,
+        "transaction_id": transaction_id,
+        "started_at": utc_now(),
+        "status": "backup_created",
+        "backup": str(backup),
+        "candidate_tree_digest": expected,
+        "touched": touched,
+    }
+
+    atomic_write_json(
+        transaction_path,
+        transaction,
+    )
+
+    try:
+
+        transaction["status"] = (
+            "applying"
+        )
+
+        atomic_write_json(
+            transaction_path,
+            transaction,
+        )
+
+        copy_candidate_to_live(
+            candidate,
+            changed_paths=
+                comparison["changed"],
+            added_paths=
+                comparison["added"],
+        )
+
+        remove_live_files(
+            comparison["removed"]
+        )
+
+        transaction[
+            "status"
+        ] = "post_apply_validation"
+
+        atomic_write_json(
+            transaction_path,
+            transaction,
+        )
+
+        post = tree_manifest(
+            LIVE_ROOT
+        )
+
+        for rel in (
+            set(
+                comparison["changed"]
+            )
+            |
+            set(
+                comparison["added"]
+            )
+        ):
+
+            if is_protected_rel(rel):
+                continue
+
+            if rel not in post:
+
+                raise UpdateError(
+                    "Post-apply file missing: "
+                    + rel
+                )
+
+            if (
+                post[rel]
+                != validation[
+                    "manifest"
+                ][rel]
+            ):
+
+                raise UpdateError(
+                    "Post-apply hash mismatch: "
+                    + rel
+                )
+
+        runtime_ok, runtime_output = (
+            run_runtime_test(
+                runtime_command,
+                LIVE_ROOT,
+            )
+        )
+
+        if not runtime_ok:
+
+            raise UpdateError(
+                "Runtime test failed:\n"
+                + runtime_output
             )
 
-        json_dump(
-            report_path,
-            data,
+        transaction[
+            "status"
+        ] = "completed"
+
+        transaction[
+            "completed_at"
+        ] = utc_now()
+
+        transaction[
+            "runtime_test"
+        ] = {
+            "ok": runtime_ok,
+            "output": runtime_output,
+        }
+
+        atomic_write_json(
+            transaction_path,
+            transaction,
         )
 
-        raise
+        return {
+            "ok": True,
+            "transaction_id":
+                transaction_id,
+            "backup":
+                str(backup),
+            "runtime_test":
+                runtime_ok,
+        }
+
+    except Exception as exc:
+
+        transaction[
+            "status"
+        ] = "rollback_started"
+
+        transaction[
+            "rollback_error"
+        ] = None
+
+        transaction[
+            "failure"
+        ] = str(exc)
+
+        atomic_write_json(
+            transaction_path,
+            transaction,
+        )
+
+        try:
+
+            # Restore ONLY paths touched by this transaction.
+            restore_from_backup_for_paths(
+                backup,
+                touched,
+            )
+
+            # Files that did not exist in the original backup
+            # were newly added by this transaction.
+            with zipfile.ZipFile(
+                backup,
+                "r",
+            ) as z:
+
+                backup_names = {
+                    name
+                    for name in z.namelist()
+                    if name
+                    != ".arya_backup_manifest.json"
+                }
+
+            for rel in touched:
+
+                if rel not in backup_names:
+
+                    path = safe_resolve(
+                        LIVE_ROOT / Path(rel),
+                        LIVE_ROOT,
+                    )
+
+                    if (
+                        path.exists()
+                        and path.is_file()
+                    ):
+
+                        path.unlink()
+
+            transaction[
+                "status"
+            ] = "rolled_back"
+
+            transaction[
+                "rolled_back_at"
+            ] = utc_now()
+
+            atomic_write_json(
+                transaction_path,
+                transaction,
+            )
+
+        except Exception as rollback_exc:
+
+            transaction[
+                "status"
+            ] = "rollback_failed"
+
+            transaction[
+                "rollback_error"
+            ] = str(
+                rollback_exc
+            )
+
+            atomic_write_json(
+                transaction_path,
+                transaction,
+            )
+
+            raise UpdateError(
+                "Update failed AND rollback failed: "
+                + str(rollback_exc)
+            ) from exc
+
+        raise UpdateError(
+            "Update failed; transaction rolled back: "
+            + str(exc)
+        ) from exc
 
     finally:
 
-        clear_lock()
+        release_lock()
 
 
-def status() -> None:
+# ============================================================
+# SCIENTIFIC SOURCE SECURITY
+# ============================================================
 
-    print(
-        f"ARYA Update Gateway {VERSION}"
+def source_allowed(
+    url: str,
+) -> bool:
+
+    parsed = urllib.parse.urlparse(
+        url
     )
 
-    print(
-        f"ROOT: {ROOT}"
+    if (
+        parsed.scheme.lower()
+        != "https"
+    ):
+        return False
+
+    host = (
+        parsed.hostname
+        or ""
+    ).lower().rstrip(".")
+
+    return any(
+        host == allowed
+        or host.endswith(
+            "." + allowed
+        )
+        for allowed
+        in ALLOWED_SOURCE_HOSTS
     )
 
-    print(
-        f"BACKUPS: {BACKUP_DIR}"
+
+def fetch_source(
+    url: str,
+    timeout: int = 20,
+) -> dict:
+
+    if not source_allowed(url):
+
+        raise UpdateError(
+            "Source host is not allow-listed: "
+            + url
+        )
+
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent":
+                "ARYA-AgriDoctor-Updater/3.1",
+            "Accept":
+                "text/html,application/json,text/plain,*/*",
+        },
+        method="GET",
     )
 
-    print(
-        f"REPORTS: {REPORT_DIR}"
+    with urllib.request.urlopen(
+        request,
+        timeout=timeout,
+    ) as response:
+
+        data = response.read(
+            2 * 1024 * 1024 + 1
+        )
+
+        if len(data) > (
+            2 * 1024 * 1024
+        ):
+
+            raise UpdateError(
+                "Source response too large"
+            )
+
+        content_type = (
+            response.headers.get(
+                "Content-Type",
+                "",
+            )
+        )
+
+        return {
+            "url": url,
+            "fetched_at": utc_now(),
+            "status": getattr(
+                response,
+                "status",
+                200,
+            ),
+            "content_type":
+                content_type,
+            "sha256":
+                hashlib.sha256(
+                    data
+                ).hexdigest(),
+            "bytes":
+                len(data),
+            "content":
+                data.decode(
+                    "utf-8",
+                    errors="replace",
+                ),
+        }
+
+
+# ============================================================
+# SCIENTIFIC KNOWLEDGE SCAN
+# ============================================================
+
+def knowledge_scan(
+    urls: Sequence[str],
+    notes: Sequence[str],
+) -> Path:
+    """
+    Collect scientific sources and create a review report.
+
+    IMPORTANT:
+    This function DOES NOT decide that new information is valid
+    scientific knowledge.
+
+    It DOES NOT modify executable code.
+
+    Human/AI review must determine:
+    - whether knowledge is actually new
+    - whether current knowledge already covers it
+    - whether sources conflict
+    - confidence
+    - whether persistent storage is necessary
+    - affected sections
+    - affected files
+    - estimated change size
+    """
+
+    sources = [
+        fetch_source(url)
+        for url in urls
+    ]
+
+    report_id = uuid.uuid4().hex
+
+    report = {
+        "schema": 1,
+
+        "report_id":
+            report_id,
+
+        "created_at":
+            utc_now(),
+
+        "kind":
+            "scientific_knowledge_review",
+
+        "status":
+            "REVIEW_REQUIRED",
+
+        "sources": [
+            {
+                "url":
+                    source["url"],
+
+                "fetched_at":
+                    source["fetched_at"],
+
+                "status":
+                    source["status"],
+
+                "content_type":
+                    source["content_type"],
+
+                "sha256":
+                    source["sha256"],
+
+                "bytes":
+                    source["bytes"],
+
+                "content_preview":
+                    source["content"][:4000],
+            }
+
+            for source in sources
+        ],
+
+        "review": {
+
+            "new_knowledge":
+                None,
+
+            "current_knowledge_covers_it":
+                None,
+
+            "conflicts":
+                None,
+
+            "confidence":
+                None,
+
+            "persistent_update_needed":
+                None,
+
+            "affected_sections":
+                [],
+
+            "affected_files":
+                [],
+
+            "estimated_change_bytes":
+                None,
+
+            "recommended_action":
+                "REVIEW_REQUIRED",
+        },
+
+        "notes":
+            list(notes),
+
+        "policy":
+            (
+                "External scientific content is DATA only "
+                "and cannot directly modify or execute ARYA code."
+            ),
+    }
+
+    REPORT_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
     )
 
-    print(
-        f"KNOWLEDGE: {KNOWLEDGE_DIR}"
+    path = (
+        REPORT_DIR
+        / f"knowledge-{report_id}.json"
     )
 
+    atomic_write_json(
+        path,
+        report,
+    )
+
+    return path
+
+
+# ============================================================
+# SAFE OFFLINE SELF TEST
+# ============================================================
+
+def self_test() -> dict:
+    """
+    Offline tests.
+
+    Does NOT modify LIVE_ROOT.
+    """
+
+    failures: List[str] = []
+
+    with tempfile.TemporaryDirectory(
+        prefix="arya-updater-test-"
+    ) as temp_dir:
+
+        sandbox = Path(temp_dir)
+
+        live = (
+            sandbox
+            / "live"
+        )
+
+        candidate = (
+            sandbox
+            / "candidate"
+        )
+
+        live.mkdir()
+        candidate.mkdir()
+
+        # ----------------------------------------
+        # LIVE PROJECT
+        # ----------------------------------------
+
+        (
+            live
+            / "backend"
+        ).mkdir()
+
+        (
+            live
+            / "backend"
+            / "main.py"
+        ).write_text(
+            "print('protected')\n",
+            encoding="utf-8",
+        )
+
+        (
+            live
+            / "app.py"
+        ).write_text(
+            "VALUE = 1\n",
+            encoding="utf-8",
+        )
+
+        # ----------------------------------------
+        # CANDIDATE
+        # ----------------------------------------
+
+        (
+            candidate
+            / "backend"
+        ).mkdir()
+
+        (
+            candidate
+            / "backend"
+            / "main.py"
+        ).write_text(
+            "print('DO NOT TOUCH')\n",
+            encoding="utf-8",
+        )
+
+        (
+            candidate
+            / "app.py"
+        ).write_text(
+            "VALUE = 2\n",
+            encoding="utf-8",
+        )
+
+        (
+            candidate
+            / "new.txt"
+        ).write_text(
+            "new\n",
+            encoding="utf-8",
+        )
+
+        # ----------------------------------------
+        # MANIFEST TEST
+        # ----------------------------------------
+
+        live_manifest = tree_manifest(
+            live
+        )
+
+        candidate_manifest = tree_manifest(
+            candidate
+        )
+
+        if (
+            "backend/main.py"
+            not in live_manifest
+        ):
+
+            failures.append(
+                "live manifest missed protected file"
+            )
+
+        if (
+            "backend/main.py"
+            not in candidate_manifest
+        ):
+
+            failures.append(
+                "candidate manifest missed protected file"
+            )
+
+        if (
+            "app.py"
+            not in candidate_manifest
+        ):
+
+            failures.append(
+                "candidate manifest missed app.py"
+            )
+
+        # ----------------------------------------
+        # PROTECTED PATH TEST
+        # ----------------------------------------
+
+        if not is_protected_rel(
+            "backend/main.py"
+        ):
+
+            failures.append(
+                "protected path detector failed"
+            )
+
+        if is_protected_rel(
+            "app.py"
+        ):
+
+            failures.append(
+                "false protected path"
+            )
+
+        # ----------------------------------------
+        # SOURCE TEST
+        # ----------------------------------------
+
+        if not source_allowed(
+            "https://fao.org/example"
+        ):
+
+            failures.append(
+                "allow-list failed"
+            )
+
+        if source_allowed(
+            "http://fao.org/example"
+        ):
+
+            failures.append(
+                "non-HTTPS source accepted"
+            )
+
+        if source_allowed(
+            "https://evil.example/fao.org"
+        ):
+
+            failures.append(
+                "untrusted source accepted"
+            )
+
+        # ----------------------------------------
+        # ZIP TRAVERSAL TEST
+        # ----------------------------------------
+
+        bad_zip = (
+            sandbox
+            / "bad.zip"
+        )
+
+        with zipfile.ZipFile(
+            bad_zip,
+            "w",
+        ) as z:
+
+            z.writestr(
+                "../escape.txt",
+                "bad",
+            )
+
+        try:
+
+            extract_zip_candidate(
+                bad_zip
+            )
+
+            failures.append(
+                "ZIP traversal was not rejected"
+            )
+
+        except UpdateError:
+            pass
+
+        # ----------------------------------------
+        # CANDIDATE ROOT ISOLATION TEST
+        # ----------------------------------------
+
+        if (
+            tree_digest(
+                live_manifest
+            )
+            ==
+            tree_digest(
+                candidate_manifest
+            )
+        ):
+
+            failures.append(
+                "candidate/live digest unexpectedly identical"
+            )
+
+        # ----------------------------------------
+        # SYMLINK TEST
+        # ----------------------------------------
+
+        symlink_supported = True
+
+        try:
+
+            symlink_path = (
+                candidate
+                / "bad_link"
+            )
+
+            symlink_path.symlink_to(
+                live / "app.py"
+            )
+
+            try:
+
+                list(
+                    iter_files(candidate)
+                )
+
+                failures.append(
+                    "candidate symlink was not rejected"
+                )
+
+            except UpdateError:
+                pass
+
+        except (
+            OSError,
+            NotImplementedError,
+        ):
+
+            symlink_supported = False
+
+        # ----------------------------------------
+        # PYTHON COMPILE TEST
+        # ----------------------------------------
+
+        (
+            candidate
+            / "valid.py"
+        ).write_text(
+            "VALUE = 123\n",
+            encoding="utf-8",
+        )
+
+        compile_errors = (
+            validate_python_tree(
+                candidate
+            )
+        )
+
+        if compile_errors:
+
+            failures.append(
+                "valid Python file failed compilation"
+            )
+
+    return {
+        "ok":
+            not failures,
+
+        "version":
+            VERSION,
+
+        "failures":
+            failures,
+    }
+
+
+# ============================================================
+# CLI COMMANDS
+# ============================================================
+
+def cmd_backup(
+    args: argparse.Namespace,
+) -> None:
+
     print(
-        "LOCK ACTIVE: "
-        + (
-            "YES"
-            if LOCK_FILE.exists()
-            else "NO"
+        create_backup(
+            args.label
         )
     )
 
 
-def main() -> int:
+def cmd_validate(
+    args: argparse.Namespace,
+) -> None:
+
+    print(
+        json.dumps(
+            validate_candidate(
+                Path(args.candidate),
+                args.type,
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def cmd_compare(
+    args: argparse.Namespace,
+) -> None:
+
+    print(
+        json.dumps(
+            compare_candidate(
+                Path(args.candidate)
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def cmd_report(
+    args: argparse.Namespace,
+) -> None:
+
+    path = make_report(
+        Path(args.candidate),
+        candidate_type=args.type,
+        source_urls=
+            args.source_url or [],
+        source_notes=
+            args.note or [],
+    )
+
+    print(path)
+
+
+def cmd_approve(
+    args: argparse.Namespace,
+) -> None:
+
+    print(
+        json.dumps(
+            approve_report(
+                Path(args.report)
+            ),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def cmd_apply(
+    args: argparse.Namespace,
+) -> None:
+
+    result = apply_report(
+        Path(args.report),
+        Path(args.candidate),
+        runtime_command=
+            args.runtime_command,
+    )
+
+    print(
+        json.dumps(
+            result,
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def cmd_knowledge_scan(
+    args: argparse.Namespace,
+) -> None:
+
+    print(
+        knowledge_scan(
+            args.url,
+            args.note or [],
+        )
+    )
+
+
+def cmd_self_test(
+    args: argparse.Namespace,
+) -> None:
+
+    print(
+        json.dumps(
+            self_test(),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+
+def cmd_version(
+    args: argparse.Namespace,
+) -> None:
+
+    print(VERSION)
+
+
+# ============================================================
+# ARGUMENT PARSER
+# ============================================================
+
+def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(
-        description=(
-            "ARYA secure knowledge "
-            "update gateway"
-        )
+        description=
+            "ARYA secure backup/update/validation system"
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=VERSION,
     )
 
     sub = parser.add_subparsers(
@@ -1362,259 +2535,239 @@ def main() -> int:
         required=True,
     )
 
-    sub.add_parser("status")
-    sub.add_parser("backup")
-    sub.add_parser("test")
+    # ----------------------------------------
+    # BACKUP
+    # ----------------------------------------
 
-    p_fetch = sub.add_parser(
-        "fetch"
+    command = sub.add_parser(
+        "backup"
     )
 
-    p_fetch.add_argument(
-        "url"
+    command.add_argument(
+        "--label",
+        default="manual",
     )
 
-    p_fetch.add_argument(
-        "--title",
-        default="",
+    command.set_defaults(
+        func=cmd_backup
     )
 
-    p_report = sub.add_parser(
+    # ----------------------------------------
+    # VALIDATE
+    # ----------------------------------------
+
+    command = sub.add_parser(
+        "validate"
+    )
+
+    command.add_argument(
+        "candidate"
+    )
+
+    command.add_argument(
+        "--type",
+        choices=[
+            "application",
+            "knowledge",
+        ],
+        default="application",
+    )
+
+    command.set_defaults(
+        func=cmd_validate
+    )
+
+    # ----------------------------------------
+    # COMPARE
+    # ----------------------------------------
+
+    command = sub.add_parser(
+        "compare"
+    )
+
+    command.add_argument(
+        "candidate"
+    )
+
+    command.set_defaults(
+        func=cmd_compare
+    )
+
+    # ----------------------------------------
+    # REPORT
+    # ----------------------------------------
+
+    command = sub.add_parser(
         "report"
     )
 
-    p_report.add_argument(
-        "--reason",
-        required=True,
+    command.add_argument(
+        "candidate"
     )
 
-    p_report.add_argument(
-        "--candidate",
-        required=True,
+    command.add_argument(
+        "--type",
+        choices=[
+            "application",
+            "knowledge",
+        ],
+        default="application",
     )
 
-    p_report.add_argument(
-        "--source",
+    command.add_argument(
+        "--source-url",
         action="append",
-        default=[],
     )
 
-    p_approve = sub.add_parser(
+    command.add_argument(
+        "--note",
+        action="append",
+    )
+
+    command.set_defaults(
+        func=cmd_report
+    )
+
+    # ----------------------------------------
+    # APPROVE
+    # ----------------------------------------
+
+    command = sub.add_parser(
         "approve"
     )
 
-    p_approve.add_argument(
-        "--report",
-        required=True,
+    command.add_argument(
+        "report"
     )
 
-    p_apply = sub.add_parser(
+    command.set_defaults(
+        func=cmd_approve
+    )
+
+    # ----------------------------------------
+    # APPLY
+    # ----------------------------------------
+
+    command = sub.add_parser(
         "apply"
     )
 
-    p_apply.add_argument(
-        "--report",
-        required=True,
+    command.add_argument(
+        "report"
     )
 
-    p_apply.add_argument(
-        "--candidate",
-        required=True,
+    command.add_argument(
+        "candidate"
     )
 
-    args = parser.parse_args()
+    command.add_argument(
+        "--runtime-command",
+        default=
+            DEFAULT_RUNTIME_TEST_COMMAND,
+    )
+
+    command.set_defaults(
+        func=cmd_apply
+    )
+
+    # ----------------------------------------
+    # KNOWLEDGE SCAN
+    # ----------------------------------------
+
+    command = sub.add_parser(
+        "knowledge-scan"
+    )
+
+    command.add_argument(
+        "url",
+        nargs="+",
+    )
+
+    command.add_argument(
+        "--note",
+        action="append",
+    )
+
+    command.set_defaults(
+        func=cmd_knowledge_scan
+    )
+
+    # ----------------------------------------
+    # SELF TEST
+    # ----------------------------------------
+
+    command = sub.add_parser(
+        "self-test"
+    )
+
+    command.set_defaults(
+        func=cmd_self_test
+    )
+
+    # ----------------------------------------
+    # VERSION
+    # ----------------------------------------
+
+    command = sub.add_parser(
+        "version"
+    )
+
+    command.set_defaults(
+        func=cmd_version
+    )
+
+    return parser
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main(
+    argv: Optional[
+        Sequence[str]
+    ] = None,
+) -> int:
+
+    parser = build_parser()
+
+    args = parser.parse_args(
+        argv
+    )
 
     try:
 
-        if args.command == "status":
+        args.func(args)
 
-            status()
-            return 0
+        return 0
 
-        if args.command == "backup":
+    except KeyboardInterrupt:
 
-            create_lock(
-                "backup",
-                {},
-            )
+        print(
+            "Interrupted.",
+            file=sys.stderr,
+        )
 
-            try:
+        return 130
 
-                print(
-                    create_backup(
-                        "manual backup"
-                    )
-                )
-
-            finally:
-
-                clear_lock()
-
-            return 0
-
-        if args.command == "test":
-
-            results = validate_tree(
-                ROOT
-            )
-
-            print(
-                json.dumps(
-                    results,
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-
-            return (
-                0
-                if tests_pass(results)
-                else 1
-            )
-
-        if args.command == "fetch":
-
-            record = fetch_source(
-                args.url,
-                args.title,
-            )
-
-            print(
-                json.dumps(
-                    asdict(record),
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            )
-
-            return 0
-
-        if args.command == "report":
-
-            candidate = Path(
-                args.candidate
-            ).resolve()
-
-            if not candidate.is_dir():
-
-                raise RuntimeError(
-                    "Candidate directory "
-                    "does not exist."
-                )
-
-            sources = [
-                fetch_source(u)
-                for u in args.source
-            ]
-
-            changes = compare_candidate(
-                candidate
-            )
-
-            errors = (
-                security_check_changes(
-                    changes
-                )
-            )
-
-            summary = {
-                "change_count":
-                    len(changes),
-
-                "added":
-                    sum(
-                        c.action == "added"
-                        for c in changes
-                    ),
-
-                "modified":
-                    sum(
-                        c.action == "modified"
-                        for c in changes
-                    ),
-
-                "deleted":
-                    sum(
-                        c.action == "deleted"
-                        for c in changes
-                    ),
-
-                "protected_blocked":
-                    len(errors),
-
-                "changed_bytes":
-                    sum(
-                        abs(
-                            c.new_size
-                            - c.old_size
-                        )
-                        for c in changes
-                    ),
-            }
-
-            path = create_proposal(
-                changes,
-                sources,
-                args.reason,
-                summary,
-            )
-
-            print(path)
-
-            if errors:
-
-                print(
-                    json.dumps(
-                        {
-                            "SECURITY_BLOCK":
-                                errors
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                )
-
-                return 2
-
-            return 0
-
-        if args.command == "approve":
-
-            approve_report(
-                Path(
-                    args.report
-                ).resolve()
-            )
-
-            return 0
-
-        if args.command == "apply":
-
-            apply_report(
-                Path(
-                    args.report
-                ).resolve(),
-                Path(
-                    args.candidate
-                ).resolve(),
-            )
-
-            print(
-                "UPDATE APPLIED AND VERIFIED."
-            )
-
-            return 0
-
-    except Exception as exc:
+    except UpdateError as exc:
 
         print(
             f"ERROR: {exc}",
             file=sys.stderr,
         )
 
-        return 1
+        return 2
 
-    return 1
+    except Exception as exc:
+
+        print(
+            "UNEXPECTED ERROR: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+        return 3
 
 
 if __name__ == "__main__":
