@@ -1,19 +1,9 @@
 """
 ARYA AgriDoctor
-Analysis Engine Adapter
+Advanced Analysis Engine Adapter
+Version: 2.0.0
 
 رابط امن بین Backend و موتور تحلیل تخصصی ARYA.
-
-وظایف:
-- نرمال‌سازی ورودی‌های مختلف
-- اتصال امن به arya_analysis_engine
-- جلوگیری از ارسال پارامترهای نامعتبر به موتور
-- مدیریت خطاهای Import
-- مدیریت خطاهای Runtime
-- مدیریت خروجی خالی
-- پشتیبانی از Dictionary و Pydantic Model
-- Health Check
-- Local Self Test
 """
 
 from __future__ import annotations
@@ -22,40 +12,19 @@ from typing import Any, Dict, Optional
 import traceback
 
 
-# ============================================================
-# ENGINE IMPORT
-# ============================================================
-
+# ------------------------------------------------------------
+# Import compatibility
+# ------------------------------------------------------------
 try:
-    # حالت معمول اجرای Backend به صورت package
     from .arya_analysis_engine import analyze_agriculture
-
 except ImportError:
-    try:
-        # حالت اجرای مستقیم / تست محلی
-        from arya_analysis_engine import analyze_agriculture
-
-    except Exception as exc:
-        analyze_agriculture = None
-        _ENGINE_IMPORT_ERROR = str(exc)
-
-else:
-    _ENGINE_IMPORT_ERROR = None
+    from arya_analysis_engine import analyze_agriculture
 
 
-ENGINE_ID = "ARYA_ANALYSIS_ENGINE"
-ADAPTER_ID = "arya_analysis_adapter"
-
-
-# ============================================================
-# SAFE HELPERS
-# ============================================================
-
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
 def _safe_text(value: Any) -> str:
-    """
-    تبدیل امن مقدار به متن.
-    """
-
     if value is None:
         return ""
 
@@ -64,21 +33,46 @@ def _safe_text(value: Any) -> str:
 
     try:
         return str(value).strip()
-
     except Exception:
         return ""
+
+
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+
+    if isinstance(value, dict):
+        return dict(value)
+
+    if hasattr(value, "model_dump"):
+        try:
+            result = value.model_dump()
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+
+    if hasattr(value, "dict"):
+        try:
+            result = value.dict()
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            pass
+
+    if hasattr(value, "__dict__"):
+        try:
+            return dict(value.__dict__)
+        except Exception:
+            pass
+
+    return {}
 
 
 def _first_value(
     data: Dict[str, Any],
     *keys: str,
 ) -> Any:
-    """
-    اولین مقدار معتبر را از بین کلیدهای داده‌شده پیدا می‌کند.
-    """
-
-    if not isinstance(data, dict):
-        return None
 
     for key in keys:
 
@@ -98,124 +92,60 @@ def _first_value(
     return None
 
 
-def _model_to_dict(value: Any) -> Any:
-    """
-    تبدیل Pydantic v2 / v1 به Dictionary.
-    """
-
-    if value is None:
-        return None
-
-    if isinstance(value, dict):
-        return dict(value)
-
-    if hasattr(value, "model_dump"):
-
-        try:
-            return value.model_dump()
-
-        except Exception:
-            pass
-
-    if hasattr(value, "dict"):
-
-        try:
-            return value.dict()
-
-        except Exception:
-            pass
-
-    return value
-
-
-def _as_dict(value: Any) -> Dict[str, Any]:
-    """
-    تبدیل مقدار به Dictionary بدون از بین بردن اطلاعات.
-    """
-
-    if value is None:
-        return {}
-
-    value = _model_to_dict(value)
-
-    if isinstance(value, dict):
-        return dict(value)
-
-    return {
-        "value": value
-    }
-
-
-# ============================================================
-# CONTEXT NORMALIZATION
-# ============================================================
-
+# ------------------------------------------------------------
+# Context normalization
+# ------------------------------------------------------------
 def _normalize_context(
-    context: Optional[Dict[str, Any]],
+    context: Any,
 ) -> Dict[str, Any]:
-    """
-    تبدیل ورودی‌های مختلف برنامه به ساختار استاندارد.
-    """
 
-    if not isinstance(context, dict):
-        context = {}
+    data = _as_dict(context)
 
-    # --------------------------------------------------------
-    # CROP
-    # --------------------------------------------------------
+    normalized: Dict[str, Any] = {}
 
-    crop = _first_value(
-        context,
+    normalized["crop"] = _first_value(
+        data,
         "crop",
         "crop_name",
-        "product",
-        "cultivation",
-    )
-
-    # --------------------------------------------------------
-    # PLANT / TREE
-    # --------------------------------------------------------
-
-    plant = _first_value(
-        context,
         "plant",
         "plant_name",
         "tree",
         "tree_name",
+        "product",
+        "cultivation",
     )
 
-    # --------------------------------------------------------
-    # SYMPTOMS
-    # --------------------------------------------------------
+    normalized["plant"] = _first_value(
+        data,
+        "plant",
+        "plant_name",
+        "tree",
+        "tree_name",
+        "crop",
+        "crop_name",
+    )
 
-    symptoms = _first_value(
-        context,
+    normalized["symptoms"] = _first_value(
+        data,
         "symptoms",
         "symptom",
         "problem",
         "problems",
         "disease_symptoms",
         "signs",
+        "observations",
     )
 
-    # --------------------------------------------------------
-    # SOIL
-    # --------------------------------------------------------
-
-    soil = _first_value(
-        context,
+    normalized["soil"] = _first_value(
+        data,
         "soil",
         "soil_type",
         "soil_data",
         "soil_info",
     )
 
-    # --------------------------------------------------------
-    # WATER
-    # --------------------------------------------------------
-
-    water = _first_value(
-        context,
+    normalized["water"] = _first_value(
+        data,
         "water",
         "water_source",
         "irrigation",
@@ -223,24 +153,16 @@ def _normalize_context(
         "water_data",
     )
 
-    # --------------------------------------------------------
-    # WEATHER
-    # --------------------------------------------------------
-
-    weather = _first_value(
-        context,
+    normalized["weather"] = _first_value(
+        data,
         "weather",
         "weather_data",
         "climate",
         "climate_data",
     )
 
-    # --------------------------------------------------------
-    # LOCATION
-    # --------------------------------------------------------
-
-    location = _first_value(
-        context,
+    normalized["location"] = _first_value(
+        data,
         "location",
         "location_data",
         "gps",
@@ -252,12 +174,8 @@ def _normalize_context(
         "country",
     )
 
-    # --------------------------------------------------------
-    # LAB
-    # --------------------------------------------------------
-
-    lab = _first_value(
-        context,
+    normalized["lab"] = _first_value(
+        data,
         "lab",
         "lab_test",
         "lab_tests",
@@ -267,12 +185,8 @@ def _normalize_context(
         "laboratory",
     )
 
-    # --------------------------------------------------------
-    # IMAGE
-    # --------------------------------------------------------
-
-    image_description = _first_value(
-        context,
+    normalized["image_description"] = _first_value(
+        data,
         "image_description",
         "image_analysis",
         "image_result",
@@ -280,23 +194,24 @@ def _normalize_context(
         "vision_result",
     )
 
-    # --------------------------------------------------------
-    # LANGUAGE
-    # --------------------------------------------------------
+    normalized["user_question"] = _first_value(
+        data,
+        "user_question",
+        "question",
+        "prompt",
+        "query",
+        "message",
+    )
 
-    language = _first_value(
-        context,
+    normalized["language"] = _first_value(
+        data,
         "language",
         "lang",
         "user_language",
     )
 
-    # --------------------------------------------------------
-    # ADDITIONAL INFORMATION
-    # --------------------------------------------------------
-
-    additional_information = _first_value(
-        context,
+    normalized["additional_information"] = _first_value(
+        data,
         "additional_information",
         "additional_info",
         "extra",
@@ -304,391 +219,135 @@ def _normalize_context(
         "description",
     )
 
-    return {
-        "crop": crop,
-        "plant": plant,
-        "symptoms": symptoms,
+    normalized["raw_context"] = data
 
-        "soil": _as_dict(soil),
-        "water": _as_dict(water),
-        "weather": _as_dict(weather),
-        "location": _as_dict(location),
-        "lab": _as_dict(lab),
-
-        "image_description": (
-            _safe_text(image_description)
-            if image_description is not None
-            else None
-        ),
-
-        "language": (
-            _safe_text(language)
-            or "fa"
-        ),
-
-        "additional_information": additional_information,
-
-        "raw_context": dict(context),
-    }
+    return normalized
 
 
-# ============================================================
-# ENGINE HEALTH
-# ============================================================
-
-def health_check() -> Dict[str, Any]:
-    """
-    بررسی در دسترس بودن موتور تحلیل.
-    """
-
-    try:
-
-        if analyze_agriculture is None:
-
-            return {
-                "ok": False,
-                "engine": ENGINE_ID,
-                "adapter": ADAPTER_ID,
-                "status": "engine_import_error",
-                "error": _ENGINE_IMPORT_ERROR,
-            }
-
-        if not callable(analyze_agriculture):
-
-            return {
-                "ok": False,
-                "engine": ENGINE_ID,
-                "adapter": ADAPTER_ID,
-                "status": "engine_not_callable",
-                "error": (
-                    "analyze_agriculture قابل فراخوانی نیست."
-                ),
-            }
-
-        return {
-            "ok": True,
-            "engine": ENGINE_ID,
-            "adapter": ADAPTER_ID,
-            "status": "available",
-        }
-
-    except Exception as exc:
-
-        return {
-            "ok": False,
-            "engine": ENGINE_ID,
-            "adapter": ADAPTER_ID,
-            "status": "health_check_error",
-            "error": str(exc),
-            "trace": traceback.format_exc(),
-        }
-
-
-# ============================================================
-# MAIN ANALYSIS
-# ============================================================
-
+# ------------------------------------------------------------
+# Main analysis function
+# ------------------------------------------------------------
 def run_analysis(
     prompt: str = "",
     context: Optional[Dict[str, Any]] = None,
     language: str = "fa",
 ) -> Dict[str, Any]:
-    """
-    اجرای موتور تحلیل تخصصی ARYA.
-
-    نکته بسیار مهم:
-    language و additional_information مستقیماً به موتور
-    ارسال نمی‌شوند.
-
-    آنها داخل extra_data قرار می‌گیرند.
-
-    فقط پارامترهای پشتیبانی‌شده توسط موتور ارسال می‌شوند.
-    """
-
-    # --------------------------------------------------------
-    # ENGINE CHECK
-    # --------------------------------------------------------
-
-    if analyze_agriculture is None:
-
-        return {
-            "ok": False,
-            "engine": ENGINE_ID,
-            "adapter": ADAPTER_ID,
-            "status": "engine_import_error",
-            "error": _ENGINE_IMPORT_ERROR,
-        }
 
     try:
 
-        # ----------------------------------------------------
-        # NORMALIZE
-        # ----------------------------------------------------
-
         normalized = _normalize_context(context)
 
-        # ----------------------------------------------------
-        # LANGUAGE
-        # ----------------------------------------------------
+        prompt_text = _safe_text(prompt)
 
-        selected_language = (
+        user_question = (
+            normalized.get("user_question")
+            or prompt_text
+            or None
+        )
+
+        effective_language = (
             _safe_text(language)
-            or _safe_text(
-                normalized.get("language")
-            )
+            or normalized.get("language")
             or "fa"
         )
 
-        # ----------------------------------------------------
-        # USER QUESTION
-        # ----------------------------------------------------
-
-        user_question = _safe_text(prompt)
-
-        # ----------------------------------------------------
-        # EXTRA DATA
-        # ----------------------------------------------------
-
-        extra_data: Dict[str, Any] = {
-            "language": selected_language,
+        extra_data = {
+            "language": effective_language,
+            "additional_information": (
+                normalized.get(
+                    "additional_information"
+                )
+            ),
             "raw_context": normalized.get(
                 "raw_context",
                 {},
             ),
         }
 
-        additional_information = (
-            normalized.get(
-                "additional_information"
-            )
-        )
-
-        if additional_information is not None:
-
-            extra_data[
-                "additional_information"
-            ] = additional_information
-
-        # ----------------------------------------------------
-        # ENGINE CALL
-        #
-        # اینجا فقط پارامترهای مجاز موتور ارسال می‌شوند.
-        # ----------------------------------------------------
-
+        # IMPORTANT:
+        # فقط پارامترهایی که موتور واقعی پشتیبانی می‌کند
+        # مستقیماً ارسال می‌شوند.
         result = analyze_agriculture(
-
-            crop=normalized.get(
-                "crop"
-            ),
-
-            plant=normalized.get(
-                "plant"
-            ),
-
-            symptoms=normalized.get(
-                "symptoms"
-            ),
-
-            soil=normalized.get(
-                "soil"
-            ),
-
-            water=normalized.get(
-                "water"
-            ),
-
-            weather=normalized.get(
-                "weather"
-            ),
-
-            location=normalized.get(
-                "location"
-            ),
-
-            lab=normalized.get(
-                "lab"
-            ),
-
+            crop=normalized.get("crop"),
+            plant=normalized.get("plant"),
+            symptoms=normalized.get("symptoms"),
+            soil=normalized.get("soil"),
+            water=normalized.get("water"),
+            weather=normalized.get("weather"),
+            location=normalized.get("location"),
+            lab=normalized.get("lab"),
             image_description=normalized.get(
                 "image_description"
             ),
-
-            user_question=(
-                user_question
-                if user_question
-                else None
-            ),
-
+            user_question=user_question,
             extra_data=extra_data,
         )
 
-        # ----------------------------------------------------
-        # EMPTY RESULT
-        # ----------------------------------------------------
-
         if result is None:
-
             return {
                 "ok": False,
-                "engine": ENGINE_ID,
-                "adapter": ADAPTER_ID,
+                "engine": "ARYA_ANALYSIS_ENGINE",
                 "status": "empty_result",
                 "error": (
-                    "موتور تحلیل نتیجه‌ای "
-                    "برنگرداند."
+                    "موتور تحلیل نتیجه‌ای برنگرداند."
                 ),
             }
 
-        # ----------------------------------------------------
-        # DICT RESULT
-        # ----------------------------------------------------
+        if not isinstance(result, dict):
+            return {
+                "ok": True,
+                "engine": "ARYA_ANALYSIS_ENGINE",
+                "status": "success",
+                "result": result,
+            }
 
-        if isinstance(result, dict):
+        output = dict(result)
 
-            output = dict(result)
+        output["ok"] = True
 
-            output.setdefault(
-                "engine_id",
-                ENGINE_ID,
-            )
+        output.setdefault(
+            "adapter",
+            {
+                "name": "ARYA Analysis Adapter",
+                "version": "2.0.0",
+            },
+        )
 
-            output.setdefault(
-                "adapter",
-                ADAPTER_ID,
-            )
-
-            output.setdefault(
-                "adapter_status",
-                "success",
-            )
-
-            output["ok"] = True
-
-            return output
-
-        # ----------------------------------------------------
-        # NON-DICT RESULT
-        # ----------------------------------------------------
-
-        return {
-            "ok": True,
-            "engine": ENGINE_ID,
-            "adapter": ADAPTER_ID,
-            "adapter_status": "success",
-            "status": "ok",
-            "result": result,
-        }
-
-    # --------------------------------------------------------
-    # SIGNATURE ERROR
-    # --------------------------------------------------------
+        return output
 
     except TypeError as exc:
 
         return {
             "ok": False,
-            "engine": ENGINE_ID,
-            "adapter": ADAPTER_ID,
+            "engine": "ARYA_ANALYSIS_ENGINE",
             "status": "engine_signature_error",
             "error": str(exc),
             "message": (
-                "پارامترهای ارسال‌شده با "
-                "امضای موتور تحلیل مطابقت ندارند."
+                "امضای موتور تحلیل با Adapter سازگار نیست."
             ),
         }
-
-    # --------------------------------------------------------
-    # RUNTIME ERROR
-    # --------------------------------------------------------
 
     except Exception as exc:
 
         return {
             "ok": False,
-            "engine": ENGINE_ID,
-            "adapter": ADAPTER_ID,
-            "status": "engine_runtime_error",
+            "engine": "ARYA_ANALYSIS_ENGINE",
+            "status": "error",
             "error": str(exc),
             "trace": traceback.format_exc(),
         }
 
 
-# ============================================================
-# REQUEST ADAPTER
-# ============================================================
-
+# ------------------------------------------------------------
+# Request adapter
+# ------------------------------------------------------------
 def analyze_request(
     request: Any,
 ) -> Dict[str, Any]:
-    """
-    تبدیل درخواست API به ورودی استاندارد موتور.
-    """
 
     try:
 
-        # ----------------------------------------------------
-        # DICT
-        # ----------------------------------------------------
-
-        if isinstance(request, dict):
-
-            data = dict(request)
-
-        # ----------------------------------------------------
-        # PYDANTIC V2
-        # ----------------------------------------------------
-
-        elif hasattr(
-            request,
-            "model_dump",
-        ):
-
-            data = request.model_dump()
-
-        # ----------------------------------------------------
-        # PYDANTIC V1
-        # ----------------------------------------------------
-
-        elif hasattr(
-            request,
-            "dict",
-        ):
-
-            data = request.dict()
-
-        # ----------------------------------------------------
-        # GENERIC OBJECT
-        # ----------------------------------------------------
-
-        elif hasattr(
-            request,
-            "__dict__",
-        ):
-
-            data = dict(
-                request.__dict__
-            )
-
-        # ----------------------------------------------------
-        # INVALID
-        # ----------------------------------------------------
-
-        else:
-
-            return {
-                "ok": False,
-                "engine": ENGINE_ID,
-                "adapter": ADAPTER_ID,
-                "status": "invalid_request",
-                "error": (
-                    "ساختار درخواست "
-                    "قابل شناسایی نیست."
-                ),
-            }
-
-        # ----------------------------------------------------
-        # PROMPT
-        # ----------------------------------------------------
+        data = _as_dict(request)
 
         prompt = _first_value(
             data,
@@ -696,226 +355,161 @@ def analyze_request(
             "question",
             "query",
             "message",
-            "text",
-            "description",
+            "user_question",
         )
 
-        # ----------------------------------------------------
-        # LANGUAGE
-        # ----------------------------------------------------
-
-        language = (
-            _first_value(
-                data,
-                "language",
-                "lang",
-                "user_language",
-            )
-            or "fa"
-        )
-
-        # ----------------------------------------------------
-        # EXISTING CONTEXT
-        # ----------------------------------------------------
-
-        existing_context = data.get(
-            "context"
-        )
-
-        if isinstance(
-            existing_context,
-            dict,
-        ):
-
-            context = dict(
-                existing_context
-            )
-
-        else:
-
-            context = {}
-
-        # ----------------------------------------------------
-        # COPY OTHER FIELDS
-        #
-        # هیچ اطلاعات اضافی حذف نمی‌شود.
-        # ----------------------------------------------------
-
-        reserved = {
-            "context",
-            "prompt",
-            "question",
-            "query",
-            "message",
-            "text",
+        language = _first_value(
+            data,
             "language",
             "lang",
             "user_language",
-        }
+        ) or "fa"
 
-        for key, value in data.items():
+        context = _first_value(
+            data,
+            "context",
+            "data",
+            "payload",
+            "analysis_context",
+        )
 
-            if key in reserved:
-                continue
-
-            if key not in context:
-
-                context[key] = value
-
-        # ----------------------------------------------------
-        # RUN
-        # ----------------------------------------------------
+        if not isinstance(context, dict):
+            context = dict(data)
 
         return run_analysis(
-
-            prompt=_safe_text(
-                prompt
-            ),
-
+            prompt=_safe_text(prompt),
             context=context,
-
-            language=(
-                _safe_text(
-                    language
-                )
-                or "fa"
-            ),
+            language=_safe_text(language) or "fa",
         )
 
     except Exception as exc:
 
         return {
             "ok": False,
-            "engine": ENGINE_ID,
-            "adapter": ADAPTER_ID,
-            "status": "adapter_error",
+            "engine": "ARYA_ANALYSIS_ENGINE",
+            "status": "request_adapter_error",
             "error": str(exc),
             "trace": traceback.format_exc(),
         }
 
 
-# ============================================================
-# COMPATIBILITY ALIASES
-# ============================================================
+# ------------------------------------------------------------
+# Health check
+# ------------------------------------------------------------
+def health_check() -> Dict[str, Any]:
 
+    try:
+
+        result = analyze_agriculture(
+            crop="گندم",
+            symptoms=[
+                "زرد شدن برگ",
+                "پژمردگی",
+            ],
+            soil={
+                "type": "رسی",
+                "ph": 7.5,
+            },
+            water={
+                "source": "آبیاری",
+            },
+            weather={
+                "temperature": 25,
+                "humidity": 50,
+            },
+            location={
+                "region": "کرمانشاه",
+            },
+            lab={},
+            image_description=None,
+            user_question="بررسی اولیه",
+            extra_data={
+                "language": "fa",
+            },
+        )
+
+        if not isinstance(result, dict):
+            return {
+                "ok": False,
+                "status": "invalid_engine_result",
+            }
+
+        return {
+            "ok": True,
+            "status": "healthy",
+            "engine": result.get(
+                "engine",
+                {},
+            ),
+            "result_status": result.get(
+                "status"
+            ),
+        }
+
+    except Exception as exc:
+
+        return {
+            "ok": False,
+            "status": "unhealthy",
+            "error": str(exc),
+            "trace": traceback.format_exc(),
+        }
+
+
+# ------------------------------------------------------------
+# Compatibility aliases
+# ------------------------------------------------------------
 analyze = run_analysis
-analysis = run_analysis
+
+analyze_agriculture_request = analyze_request
 
 
-# ============================================================
-# LOCAL SELF TEST
-# ============================================================
-
+# ------------------------------------------------------------
+# Local test
+# ------------------------------------------------------------
 if __name__ == "__main__":
 
     import json
 
-    print("=" * 60)
-    print("ARYA ANALYSIS ADAPTER SELF TEST")
-    print("=" * 60)
-
-    # --------------------------------------------------------
-    # TEST 1: HEALTH
-    # --------------------------------------------------------
-
-    health = health_check()
-
-    print("\n[TEST 1] ENGINE HEALTH")
-
     print(
         json.dumps(
-            health,
+            health_check(),
             ensure_ascii=False,
             indent=2,
-            default=str,
         )
-    )
-
-    # --------------------------------------------------------
-    # اگر موتور Import نشده باشد، تست را متوقف می‌کنیم.
-    # --------------------------------------------------------
-
-    if not health.get("ok"):
-
-        print(
-            "\nSELF TEST STOPPED:"
-            " engine unavailable."
-        )
-
-        raise SystemExit(1)
-
-    # --------------------------------------------------------
-    # TEST 2: BASIC REQUEST
-    # --------------------------------------------------------
-
-    test_request = {
-
-        "prompt": (
-            "برگ‌های گیاه زرد شده و "
-            "پژمرده است."
-        ),
-
-        "language": "fa",
-
-        "crop": "گندم",
-
-        "symptoms": [
-            "زرد شدن برگ",
-            "پژمردگی",
-        ],
-
-        "soil": {
-            "type": "رسی",
-            "ph": 7.8,
-        },
-
-        "weather": {
-            "temperature": 31,
-            "humidity": 25,
-        },
-
-        "water": {
-            "irrigation": "متوسط",
-        },
-
-        "location": {
-            "region": "کرمانشاه",
-        },
-    }
-
-    print(
-        "\n[TEST 2] ANALYSIS REQUEST"
-    )
-
-    result = analyze_request(
-        test_request
     )
 
     print(
         json.dumps(
-            result,
+            run_analysis(
+                prompt=(
+                    "برگ‌های گندم زرد شده و "
+                    "گیاه پژمرده است."
+                ),
+                context={
+                    "crop": "گندم",
+                    "symptoms": [
+                        "زرد شدن برگ",
+                        "پژمردگی",
+                    ],
+                    "soil": {
+                        "type": "رسی",
+                        "ph": 7.8,
+                    },
+                    "water": {
+                        "source": "چاه",
+                    },
+                    "weather": {
+                        "temperature": 31,
+                        "humidity": 25,
+                    },
+                    "location": {
+                        "region": "کرمانشاه",
+                    },
+                },
+                language="fa",
+            ),
             ensure_ascii=False,
             indent=2,
-            default=str,
         )
     )
-
-    # --------------------------------------------------------
-    # TEST 3: FINAL STATUS
-    # --------------------------------------------------------
-
-    print("\n" + "=" * 60)
-
-    if result.get("ok"):
-
-        print(
-            "SELF TEST RESULT: PASS"
-        )
-
-    else:
-
-        print(
-            "SELF TEST RESULT: FAIL"
-        )
-
-    print("=" * 60)
