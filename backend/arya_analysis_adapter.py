@@ -2,21 +2,7 @@
 ARYA AgriDoctor
 Analysis Engine Adapter
 
-این فایل رابط بین برنامه و موتور تحلیل علمی ARYA است.
-
-موتور اصلی:
-    backend/arya_analysis_engine.py
-
-وظیفه این فایل:
-    - دریافت درخواست تحلیل از برنامه
-    - تبدیل اطلاعات ورودی به ساختار مورد نیاز موتور
-    - اجرای موتور تحلیل
-    - برگرداندن نتیجه به صورت JSON-serializable
-    - پشتیبانی از ورودی‌های متنوع برنامه
-    - جلوگیری از خراب شدن برنامه در صورت ناقص بودن بعضی اطلاعات
-
-نکته:
-    این فایل مستقل است و برای اتصال مستقیم به main.py طراحی شده است.
+رابط بین Backend و موتور تحلیل تخصصی ARYA
 """
 
 from __future__ import annotations
@@ -28,11 +14,10 @@ from .arya_analysis_engine import analyze_agriculture
 
 
 # ============================================================
-# Helpers
+# HELPERS
 # ============================================================
 
 def _safe_text(value: Any) -> str:
-    """تبدیل مقدار ورودی به متن امن."""
     if value is None:
         return ""
 
@@ -45,28 +30,36 @@ def _safe_text(value: Any) -> str:
         return ""
 
 
-def _first_value(data: Dict[str, Any], *keys: str) -> Any:
+def _first_value(
+    data: Dict[str, Any],
+    *keys: str,
+) -> Any:
     """
-    اولین مقدار موجود و غیرخالی را از بین کلیدهای مختلف برمی‌گرداند.
+    اولین مقدار معتبر را از بین کلیدهای داده‌شده برمی‌گرداند.
     """
+
     for key in keys:
-        if key in data:
-            value = data.get(key)
+        if key not in data:
+            continue
 
-            if value is None:
-                continue
+        value = data.get(key)
 
-            if isinstance(value, str) and not value.strip():
-                continue
+        if value is None:
+            continue
 
-            return value
+        if isinstance(value, str) and not value.strip():
+            continue
+
+        return value
 
     return None
 
 
-def _normalize_context(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _normalize_context(
+    context: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
     """
-    اطلاعات خام برنامه را به ساختار استاندارد موتور تحلیل تبدیل می‌کند.
+    تبدیل ورودی‌های متنوع برنامه به ساختار استاندارد موتور.
     """
 
     if not isinstance(context, dict):
@@ -130,7 +123,7 @@ def _normalize_context(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
     # --------------------------------------------------------
-    # هوا / آب‌وهوا
+    # آب و هوا
     # --------------------------------------------------------
 
     normalized["weather"] = _first_value(
@@ -159,7 +152,7 @@ def _normalize_context(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
     # --------------------------------------------------------
-    # آزمایش خاک / آزمایشگاه
+    # آزمایشگاه
     # --------------------------------------------------------
 
     normalized["lab"] = _first_value(
@@ -188,6 +181,8 @@ def _normalize_context(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
     # --------------------------------------------------------
     # زبان
+    # فقط در Adapter نگهداری می‌شود.
+    # موتور فعلی مستقیماً language نمی‌گیرد.
     # --------------------------------------------------------
 
     normalized["language"] = _first_value(
@@ -211,17 +206,17 @@ def _normalize_context(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     )
 
     # --------------------------------------------------------
-    # همه داده‌های اصلی را نیز حفظ می‌کنیم
-    # تا اطلاعاتی که موتور در آینده نیاز دارد از بین نرود.
+    # اطلاعات خام
+    # برای توسعه‌های بعدی حفظ می‌شود.
     # --------------------------------------------------------
 
-    normalized["raw_context"] = context
+    normalized["raw_context"] = dict(context)
 
     return normalized
 
 
 # ============================================================
-# Main Adapter
+# MAIN ANALYSIS
 # ============================================================
 
 def run_analysis(
@@ -230,35 +225,55 @@ def run_analysis(
     language: str = "fa",
 ) -> Dict[str, Any]:
     """
-    اجرای موتور تحلیل کشاورزی.
-
-    پارامترها:
-        prompt:
-            توضیح آزاد کاربر.
-
-        context:
-            اطلاعات ساختاریافته گیاه، علائم، خاک، آب، هوا،
-            موقعیت، آزمایشگاه و غیره.
-
-        language:
-            زبان خروجی.
-
-    خروجی:
-        دیکشنری قابل تبدیل به JSON.
+    اجرای موتور تحلیل تخصصی ARYA.
     """
 
     try:
         normalized = _normalize_context(context)
 
-        # اگر زبان جداگانه ارسال شده باشد، اولویت با آن است.
-        if language:
-            normalized["language"] = language
+        # ----------------------------------------------------
+        # زبان
+        # ----------------------------------------------------
 
-        # متن سؤال کاربر نیز حفظ می‌شود.
-        normalized["prompt"] = _safe_text(prompt)
+        selected_language = (
+            _safe_text(language)
+            or _safe_text(normalized.get("language"))
+            or "fa"
+        )
+
+        # ----------------------------------------------------
+        # سؤال کاربر
+        # ----------------------------------------------------
+
+        user_question = _safe_text(prompt)
+
+        # ----------------------------------------------------
+        # اطلاعات اضافی
+        # ----------------------------------------------------
+
+        extra_data: Dict[str, Any] = {}
+
+        additional_information = normalized.get(
+            "additional_information"
+        )
+
+        if additional_information:
+            extra_data["additional_information"] = (
+                additional_information
+            )
+
+        extra_data["language"] = selected_language
+        extra_data["raw_context"] = normalized.get(
+            "raw_context",
+            {},
+        )
 
         # ----------------------------------------------------
         # اجرای موتور واقعی
+        #
+        # نکته مهم:
+        # فقط پارامترهایی ارسال می‌شوند که موتور واقعی
+        # arya_analysis_engine.py قبول می‌کند.
         # ----------------------------------------------------
 
         result = analyze_agriculture(
@@ -269,15 +284,15 @@ def run_analysis(
             weather=normalized.get("weather"),
             location=normalized.get("location"),
             lab=normalized.get("lab"),
-            image_description=normalized.get("image_description"),
-            language=normalized.get("language", "fa"),
-            additional_information=normalized.get(
-                "additional_information"
+            image_description=normalized.get(
+                "image_description"
             ),
+            user_question=user_question,
+            extra_data=extra_data,
         )
 
         # ----------------------------------------------------
-        # اطمینان از JSON-serializable بودن پاسخ
+        # نتیجه خالی
         # ----------------------------------------------------
 
         if result is None:
@@ -285,10 +300,17 @@ def run_analysis(
                 "ok": False,
                 "engine": "ARYA_ANALYSIS_ENGINE",
                 "status": "error",
-                "error": "موتور تحلیل نتیجه‌ای برنگرداند.",
+                "error": (
+                    "موتور تحلیل نتیجه‌ای برنگرداند."
+                ),
             }
 
+        # ----------------------------------------------------
+        # نتیجه استاندارد Dictionary
+        # ----------------------------------------------------
+
         if isinstance(result, dict):
+
             output = dict(result)
 
             output.setdefault(
@@ -298,25 +320,25 @@ def run_analysis(
 
             output.setdefault(
                 "status",
-                "success",
+                "ok",
             )
 
             output["ok"] = True
 
             return output
 
-        # اگر موتور در آینده نوع دیگری برگرداند
+        # ----------------------------------------------------
+        # پشتیبانی از خروجی غیر Dictionary
+        # ----------------------------------------------------
+
         return {
             "ok": True,
             "engine": "ARYA_ANALYSIS_ENGINE",
-            "status": "success",
+            "status": "ok",
             "result": result,
         }
 
     except TypeError as exc:
-        """
-        این بخش مخصوص ناسازگاری احتمالی امضای تابع موتور است.
-        """
 
         return {
             "ok": False,
@@ -324,12 +346,13 @@ def run_analysis(
             "status": "engine_signature_error",
             "error": str(exc),
             "message": (
-                "موتور تحلیل فراخوانی شد اما ساختار ورودی "
-                "با نسخه فعلی موتور مطابقت ندارد."
+                "امضای ورودی موتور تحلیل با Adapter "
+                "مطابقت ندارد."
             ),
         }
 
     except Exception as exc:
+
         return {
             "ok": False,
             "engine": "ARYA_ANALYSIS_ENGINE",
@@ -340,33 +363,42 @@ def run_analysis(
 
 
 # ============================================================
-# Request Adapter
+# REQUEST ADAPTER
 # ============================================================
 
-def analyze_request(request: Any) -> Dict[str, Any]:
+def analyze_request(
+    request: Any,
+) -> Dict[str, Any]:
     """
-    دریافت مستقیم یک Request-like object یا dictionary.
-
-    این تابع برای اتصال آسان به API و برنامه اصلی طراحی شده است.
+    دریافت مستقیم Dictionary، Pydantic Model یا Object.
     """
 
     try:
+
         # ----------------------------------------------------
         # Dictionary
         # ----------------------------------------------------
 
         if isinstance(request, dict):
-            data = request
+            data = dict(request)
 
         # ----------------------------------------------------
-        # Pydantic / object
+        # Pydantic v2
         # ----------------------------------------------------
 
         elif hasattr(request, "model_dump"):
             data = request.model_dump()
 
+        # ----------------------------------------------------
+        # Pydantic v1
+        # ----------------------------------------------------
+
         elif hasattr(request, "dict"):
             data = request.dict()
+
+        # ----------------------------------------------------
+        # Object
+        # ----------------------------------------------------
 
         elif hasattr(request, "__dict__"):
             data = dict(request.__dict__)
@@ -375,7 +407,7 @@ def analyze_request(request: Any) -> Dict[str, Any]:
             data = {}
 
         # ----------------------------------------------------
-        # اطلاعات پایه
+        # سؤال
         # ----------------------------------------------------
 
         prompt = _first_value(
@@ -388,15 +420,22 @@ def analyze_request(request: Any) -> Dict[str, Any]:
             "description",
         )
 
-        language = _first_value(
-            data,
-            "language",
-            "lang",
-            "user_language",
-        ) or "fa"
+        # ----------------------------------------------------
+        # زبان
+        # ----------------------------------------------------
+
+        language = (
+            _first_value(
+                data,
+                "language",
+                "lang",
+                "user_language",
+            )
+            or "fa"
+        )
 
         # ----------------------------------------------------
-        # context
+        # Context
         # ----------------------------------------------------
 
         context = data.get("context")
@@ -404,23 +443,36 @@ def analyze_request(request: Any) -> Dict[str, Any]:
         if not isinstance(context, dict):
             context = {}
 
-        # اطلاعات سطح اصلی درخواست نیز وارد context می‌شوند.
+        else:
+            context = dict(context)
+
+        # ----------------------------------------------------
+        # انتقال سایر اطلاعات سطح درخواست به context
+        # ----------------------------------------------------
+
+        ignored_keys = {
+            "context",
+            "prompt",
+            "question",
+            "query",
+            "message",
+            "text",
+            "language",
+            "lang",
+            "user_language",
+        }
+
         for key, value in data.items():
-            if key in {
-                "context",
-                "prompt",
-                "question",
-                "query",
-                "message",
-                "text",
-                "language",
-                "lang",
-                "user_language",
-            }:
+
+            if key in ignored_keys:
                 continue
 
             if key not in context:
                 context[key] = value
+
+        # ----------------------------------------------------
+        # اجرای تحلیل
+        # ----------------------------------------------------
 
         return run_analysis(
             prompt=_safe_text(prompt),
@@ -429,6 +481,7 @@ def analyze_request(request: Any) -> Dict[str, Any]:
         )
 
     except Exception as exc:
+
         return {
             "ok": False,
             "engine": "ARYA_ANALYSIS_ENGINE",
@@ -439,16 +492,18 @@ def analyze_request(request: Any) -> Dict[str, Any]:
 
 
 # ============================================================
-# Health Check
+# HEALTH CHECK
 # ============================================================
 
 def health_check() -> Dict[str, Any]:
     """
-    بررسی ساده قابل دسترس بودن موتور تحلیل.
+    بررسی دسترسی موتور تحلیل.
     """
 
     try:
+
         if callable(analyze_agriculture):
+
             return {
                 "ok": True,
                 "engine": "ARYA_ANALYSIS_ENGINE",
@@ -462,6 +517,7 @@ def health_check() -> Dict[str, Any]:
         }
 
     except Exception as exc:
+
         return {
             "ok": False,
             "engine": "ARYA_ANALYSIS_ENGINE",
@@ -471,9 +527,8 @@ def health_check() -> Dict[str, Any]:
 
 
 # ============================================================
-# Public aliases
+# PUBLIC ALIASES
 # ============================================================
 
-# برای سازگاری با بخش‌های مختلف برنامه
 analyze = run_analysis
 analysis = run_analysis
