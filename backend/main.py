@@ -3381,19 +3381,78 @@ def ai_analyze(
             "daily AI limit reached",
         )
 
+    # ========================================================
+    # ARYA SPECIALIST ANALYSIS ENGINE
+    # ========================================================
+    specialist_result = analyze_request(
+        {
+            "prompt": x.prompt,
+            "language": x.language,
+            "context": x.context,
+        }
+    )
+
+    # --------------------------------------------------------
+    # Preserve the original user context and add the
+    # specialist agricultural analysis.
+    # --------------------------------------------------------
+    enhanced_context = {}
+
+    if isinstance(
+        x.context,
+        dict,
+    ):
+        enhanced_context.update(
+            x.context
+        )
+
+    enhanced_context[
+        "arya_specialist_analysis"
+    ] = specialist_result
+
+    # ========================================================
+    # EXISTING AI PROVIDER
+    # ========================================================
     result = openai_chat(
         x.prompt,
-        x.context,
+        enhanced_context,
         x.language,
     )
 
+    # ========================================================
+    # EXISTING LOCAL FALLBACK
+    # ========================================================
     if result is None:
         result = local_ai_fallback(
             x.prompt,
-            x.context,
+            enhanced_context,
             x.language,
         )
 
+    # --------------------------------------------------------
+    # Safety: make sure result is always a dictionary.
+    # --------------------------------------------------------
+    if not isinstance(
+        result,
+        dict,
+    ):
+        result = {
+            "provider": "arya_backend",
+            "verified": False,
+            "text": str(result),
+        }
+
+    # ========================================================
+    # Attach specialist analysis without destroying the
+    # existing provider response.
+    # ========================================================
+    result[
+        "arya_specialist_analysis"
+    ] = specialist_result
+
+    # ========================================================
+    # Token accounting
+    # ========================================================
     tokens = int(
         result.get(
             "usage",
@@ -3417,6 +3476,9 @@ def ai_analyze(
         tokens,
     )
 
+    # ========================================================
+    # Database record
+    # ========================================================
     request_id = q(
         """
         INSERT INTO ai_requests(
@@ -3435,7 +3497,7 @@ def ai_analyze(
             user["id"],
             x.prompt,
             x.language,
-            jdump(x.context),
+            jdump(enhanced_context),
             jdump(result),
             result.get(
                 "provider",
@@ -3453,6 +3515,9 @@ def ai_analyze(
         ),
     )
 
+    # ========================================================
+    # Audit
+    # ========================================================
     audit(
         user["id"],
         "ai_analyze",
@@ -3460,6 +3525,9 @@ def ai_analyze(
         request_id,
     )
 
+    # ========================================================
+    # Final response
+    # ========================================================
     return {
         "id": request_id,
         **result,
