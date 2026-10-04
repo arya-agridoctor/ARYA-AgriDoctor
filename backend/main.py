@@ -24,6 +24,16 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, EmailStr
+try:
+    from arya_analysis_adapter import (
+        analyze_request,
+        health_check,
+    )
+except ImportError:
+    from .arya_analysis_adapter import (
+        analyze_request,
+        health_check,
+    )
 
 
 # ============================================================
