@@ -719,9 +719,6 @@ async def ai_analyze_compat(
             "application/json",
     }
 
-    # مهم:
-    # توکن کاربر موبایل باید تا Backend
-    # منتقل شود.
     auth = request.headers.get(
         "Authorization"
     )
@@ -1123,6 +1120,62 @@ async def arya_analyze(
     methods=["POST"],
 )
 async def direct_ai_analyze(
+    request: Request,
+):
+
+    return await ai_analyze_compat(
+        request
+    )
+
+
+# ============================================================
+# LEGACY MOBILE AI COMPATIBILITY
+# ============================================================
+
+@app.api_route(
+    "/ai/ask",
+    methods=["POST"],
+)
+async def legacy_ai_ask(
+    request: Request,
+):
+
+    return await ai_analyze_compat(
+        request
+    )
+
+
+@app.api_route(
+    "/ask",
+    methods=["POST"],
+)
+async def legacy_ask(
+    request: Request,
+):
+
+    return await ai_analyze_compat(
+        request
+    )
+
+
+@app.api_route(
+    "/analyze",
+    methods=["POST"],
+)
+async def legacy_analyze(
+    request: Request,
+):
+
+    return await ai_analyze_compat(
+        request
+    )
+
+
+@app.api_route(
+    "/agri/analyze",
+    methods=["POST"],
+)
+async def legacy_agri_analyze(
     request: Request,
 ):
 
