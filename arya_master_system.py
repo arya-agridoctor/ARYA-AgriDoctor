@@ -1,17 +1,3 @@
-"""
-ARYA AgriDoctor — MASTER GATEWAY
-Version: 3.0.0
-
-Central gateway for the real ARYA AgriDoctor backend.
-
-Rules:
-- backend/main.py is NOT modified by this file.
-- Real backend routes are used.
-- No speculative AI/weather/location routes.
-- Generic proxy keeps future backend routes accessible.
-- Compatibility routes are provided for existing ARYA clients.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -28,35 +14,30 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
-
-# ===============================================================
-# CONFIG
-# ===============================================================
-
 APP_NAME = "ARYA AgriDoctor MASTER GATEWAY"
-APP_VERSION = "3.0.0"
+APP_VERSION = "2.0.0"
 
 BACKEND_URL = os.getenv(
     "ARYA_BACKEND_URL",
-    "http://127.0.0.1:8000",
+    "http://127.0.0.1:8000"
 ).rstrip("/")
 
 HOST = os.getenv(
     "ARYA_MASTER_HOST",
-    "0.0.0.0",
+    "0.0.0.0"
 )
 
 PORT = int(
     os.getenv(
         "ARYA_MASTER_PORT",
-        "8030",
+        "8030"
     )
 )
 
 TIMEOUT = float(
     os.getenv(
         "ARYA_MASTER_TIMEOUT",
-        "30",
+        "30"
     )
 )
 
@@ -65,33 +46,33 @@ RETRIES = max(
     int(
         os.getenv(
             "ARYA_MASTER_RETRIES",
-            "2",
+            "2"
         )
-    ),
+    )
 )
 
 MAX_REQUEST_BYTES = int(
     os.getenv(
         "ARYA_MASTER_MAX_REQUEST_BYTES",
-        str(8 * 1024 * 1024),
+        str(8 * 1024 * 1024)
     )
 )
 
 MAX_RESPONSE_BYTES = int(
     os.getenv(
         "ARYA_MASTER_MAX_RESPONSE_BYTES",
-        str(16 * 1024 * 1024),
+        str(16 * 1024 * 1024)
     )
 )
 
-CIRCUIT_FAILURE_THRESHOLD = max(
+CIRCUIT_THRESHOLD = max(
     1,
     int(
         os.getenv(
             "ARYA_MASTER_CIRCUIT_FAILURE_THRESHOLD",
-            "3",
+            "3"
         )
-    ),
+    )
 )
 
 CIRCUIT_COOLDOWN = max(
@@ -99,110 +80,81 @@ CIRCUIT_COOLDOWN = max(
     float(
         os.getenv(
             "ARYA_MASTER_CIRCUIT_COOLDOWN_SECONDS",
-            "30",
+            "30"
         )
-    ),
+    )
 )
 
 INTERNAL_SECRET = os.getenv(
     "ARYA_INTERNAL_GATEWAY_SECRET",
-    "",
+    ""
 )
 
-REQUIRE_SIGNATURE = (
-    os.getenv(
-        "ARYA_MASTER_REQUIRE_INTERNAL_SIGNATURE",
-        "false",
-    ).lower()
-    in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-)
+REQUIRE_SIGNATURE = os.getenv(
+    "ARYA_MASTER_REQUIRE_INTERNAL_SIGNATURE",
+    "false"
+).lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 OPENAPI_CACHE_SECONDS = max(
     1.0,
     float(
         os.getenv(
             "ARYA_MASTER_OPENAPI_CACHE_SECONDS",
-            "15",
+            "15"
         )
-    ),
+    )
 )
-
-CORS_ORIGINS = [
-    item.strip()
-    for item in os.getenv(
-        "ARYA_MASTER_CORS",
-        "*",
-    ).split(",")
-    if item.strip()
-]
-
-
-# ===============================================================
-# FASTAPI
-# ===============================================================
 
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description=(
         "Single gateway for the real "
-        "ARYA AgriDoctor backend."
+        "ARYA AgriDoctor backend"
     ),
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGINS,
-    allow_credentials=(
-        CORS_ORIGINS != ["*"]
-    ),
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ===============================================================
-# STATE
-# ===============================================================
-
 class Circuit:
 
-    def __init__(self) -> None:
+    def __init__(self):
         self.failures = 0
         self.opened_at = 0.0
 
 
-backend_circuit = Circuit()
+circuit = Circuit()
 
 stats = defaultdict(int)
 
 last_error: Optional[str] = None
 
-_openapi_cache: dict[str, Any] = {}
+_openapi: dict[str, Any] = {}
 
-_openapi_cached_at = 0.0
-
-
-# ===============================================================
-# BASIC HELPERS
-# ===============================================================
-
-def backend_url(
-    path: str,
-) -> str:
-
-    if not path.startswith("/"):
-        path = "/" + path
-
-    return BACKEND_URL + path
+_openapi_at = 0.0
 
 
-def clean_headers(
+def make_url(path: str) -> str:
+    return BACKEND_URL + (
+        path
+        if path.startswith("/")
+        else "/" + path
+    )
+
+
+def safe_headers(
     headers: httpx.Headers,
 ) -> dict[str, str]:
 
@@ -216,80 +168,45 @@ def clean_headers(
     }
 
     return {
-        key: value
-        for key, value in headers.items()
-        if key.lower() not in excluded
+        k: v
+        for k, v in headers.items()
+        if k.lower() not in excluded
     }
 
 
-def safe_json_response(
-    response: httpx.Response,
-) -> JSONResponse:
+def is_open() -> bool:
 
-    try:
-        data = response.json()
-    except Exception:
-        data = {
-            "ok": response.is_success,
-            "status_code":
-                response.status_code,
-            "text":
-                response.text,
-        }
-
-    return JSONResponse(
-        content=data,
-        status_code=response.status_code,
-    )
-
-
-# ===============================================================
-# CIRCUIT BREAKER
-# ===============================================================
-
-def circuit_open() -> bool:
-
-    if not backend_circuit.opened_at:
+    if not circuit.opened_at:
         return False
 
     if (
-        time.time()
-        - backend_circuit.opened_at
+        time.time() - circuit.opened_at
         >= CIRCUIT_COOLDOWN
     ):
-        backend_circuit.failures = 0
-        backend_circuit.opened_at = 0.0
+        circuit.failures = 0
+        circuit.opened_at = 0.0
         return False
 
     return True
 
 
-def circuit_success() -> None:
+def mark_success() -> None:
 
-    backend_circuit.failures = 0
-    backend_circuit.opened_at = 0.0
+    circuit.failures = 0
+    circuit.opened_at = 0.0
 
 
-def circuit_failure(
-    error: str,
-) -> None:
+def mark_failure(error: str) -> None:
 
     global last_error
 
     last_error = str(error)
 
-    backend_circuit.failures += 1
+    circuit.failures += 1
 
-    if (
-        backend_circuit.failures
-        >= CIRCUIT_FAILURE_THRESHOLD
-    ):
-        backend_circuit.opened_at = time.time()
+    if circuit.failures >= CIRCUIT_THRESHOLD:
+        circuit.opened_at = time.time()
 
-
-# ===============================================================
-# HMAC
-# ===============================================================
 
 def make_signature(
     method: str,
@@ -300,17 +217,17 @@ def make_signature(
     if not INTERNAL_SECRET:
         return ""
 
-    message = (
-        method.upper().encode("utf-8")
+    msg = (
+        method.upper().encode()
         + b"\n"
-        + path.encode("utf-8")
+        + path.encode()
         + b"\n"
         + body
     )
 
     return hmac.new(
-        INTERNAL_SECRET.encode("utf-8"),
-        message,
+        INTERNAL_SECRET.encode(),
+        msg,
         hashlib.sha256,
     ).hexdigest()
 
@@ -334,84 +251,61 @@ def verify_signature(
         body,
     )
 
-    return (
-        bool(received)
-        and hmac.compare_digest(
-            received,
-            expected,
-        )
+    return bool(received) and hmac.compare_digest(
+        received,
+        expected,
     )
 
 
-# ===============================================================
-# RAW BACKEND REQUEST
-# ===============================================================
-
-async def raw_backend_call(
+async def call_backend(
     method: str,
     path: str,
     *,
     body: bytes = b"",
-    query: Optional[
-        list[tuple[str, str]]
-    ] = None,
-    headers: Optional[
-        dict[str, str]
-    ] = None,
-    retry: bool = True,
+    query=None,
+    headers=None,
+    retry=True,
 ) -> httpx.Response:
 
-    if circuit_open():
+    if is_open():
         raise HTTPException(
-            status_code=503,
-            detail={
+            503,
+            {
                 "ok": False,
-                "error":
-                    "backend_circuit_open",
+                "error": "backend_circuit_open",
             },
         )
 
     if len(body) > MAX_REQUEST_BYTES:
         raise HTTPException(
-            status_code=413,
-            detail={
+            413,
+            {
                 "ok": False,
-                "error":
-                    "request_too_large",
+                "error": "request_too_large",
             },
         )
 
     method = method.upper()
 
-    retryable_methods = {
-        "GET",
-        "HEAD",
-        "OPTIONS",
-    }
-
     attempts = (
         RETRIES + 1
-        if (
-            retry
-            and method
-            in retryable_methods
-        )
+        if retry
+        and method in {
+            "GET",
+            "HEAD",
+            "OPTIONS",
+        }
         else 1
     )
 
-    target = backend_url(path)
-
-    request_headers = dict(
-        headers or {}
-    )
+    req_headers = dict(headers or {})
 
     if INTERNAL_SECRET:
-
-        request_headers[
+        req_headers[
             "X-ARYA-Gateway"
         ] = "ARYA-MASTER"
 
-        request_headers[
+        req_headers[
             "X-ARYA-Signature"
         ] = make_signature(
             method,
@@ -419,9 +313,7 @@ async def raw_backend_call(
             body,
         )
 
-    last_exc: Optional[
-        Exception
-    ] = None
+    last_exc = None
 
     for attempt in range(attempts):
 
@@ -430,63 +322,50 @@ async def raw_backend_call(
             async with httpx.AsyncClient(
                 timeout=TIMEOUT,
                 follow_redirects=False,
-                limits=httpx.Limits(
-                    max_connections=50,
-                    max_keepalive_connections=20,
-                ),
             ) as client:
 
                 response = await client.request(
-                    method=method,
-                    url=target,
+                    method,
+                    make_url(path),
                     content=body,
                     params=query,
-                    headers=request_headers,
+                    headers=req_headers,
                 )
 
             if (
                 len(response.content)
                 > MAX_RESPONSE_BYTES
             ):
-
-                circuit_failure(
-                    "backend_response_too_large"
+                mark_failure(
+                    "response_too_large"
                 )
 
                 raise HTTPException(
-                    status_code=502,
-                    detail={
+                    502,
+                    {
                         "ok": False,
                         "error":
                             "backend_response_too_large",
                     },
                 )
 
-            if (
-                response.status_code
-                in {
-                    502,
-                    503,
-                    504,
-                }
-                and attempt + 1 < attempts
-            ):
+            if response.status_code >= 500:
 
-                await asyncio.sleep(
-                    0.35 * (attempt + 1)
+                mark_failure(
+                    f"backend_http_"
+                    f"{response.status_code}"
                 )
 
-                continue
+                if attempt + 1 < attempts:
 
-            if response.status_code < 500:
-                circuit_success()
-            else:
-                circuit_failure(
-                    "backend_http_"
-                    + str(
-                        response.status_code
+                    await asyncio.sleep(
+                        0.35 * (attempt + 1)
                     )
-                )
+
+                    continue
+
+            else:
+                mark_success()
 
             return response
 
@@ -496,66 +375,47 @@ async def raw_backend_call(
         except (
             httpx.TimeoutException,
             httpx.NetworkError,
-            httpx.ConnectError,
         ) as exc:
 
             last_exc = exc
 
-            circuit_failure(
-                str(exc)
-            )
+            mark_failure(str(exc))
 
-            if (
-                attempt + 1
-                < attempts
-            ):
+            if attempt + 1 < attempts:
 
                 await asyncio.sleep(
                     0.35 * (attempt + 1)
                 )
 
-                continue
-
     raise HTTPException(
-        status_code=502,
-        detail={
+        502,
+        {
             "ok": False,
-            "error":
-                "backend_unreachable",
-            "message":
-                str(
-                    last_exc
-                    or "unknown error"
-                ),
+            "error": "backend_unreachable",
+            "message": str(
+                last_exc or "unknown error"
+            ),
         },
     )
 
 
-# ===============================================================
-# JSON BACKEND REQUEST
-# ===============================================================
-
-async def backend_json(
+async def json_backend(
     method: str,
     path: str,
-    *,
-    body: Any = None,
-    query: Optional[
-        list[tuple[str, str]]
-    ] = None,
+    payload: Any = None,
+    query=None,
 ) -> Any:
 
-    raw = b""
+    body = b""
 
     headers = {
-        "Accept":
-            "application/json",
+        "Accept": "application/json",
     }
 
-    if body is not None:
+    if payload is not None:
 
-        raw = json.dumps(
-            body,
+        body = json.dumps(
+            payload,
             ensure_ascii=False,
         ).encode("utf-8")
 
@@ -563,17 +423,19 @@ async def backend_json(
             "Content-Type"
         ] = "application/json"
 
-    response = await raw_backend_call(
+    response = await call_backend(
         method,
         path,
-        body=raw,
+        body=body,
         query=query,
         headers=headers,
     )
 
     try:
         return response.json()
+
     except Exception:
+
         return {
             "status_code":
                 response.status_code,
@@ -582,92 +444,29 @@ async def backend_json(
         }
 
 
-# ===============================================================
-# GENERIC PROXY
-# ===============================================================
-
-async def proxy_request(
-    request: Request,
-    path: str,
-) -> Response:
-
-    body = await request.body()
-
-    if (
-        REQUIRE_SIGNATURE
-        and request.url.path.startswith(
-            "/internal/"
-        )
-        and not verify_signature(
-            request,
-            body,
-        )
-    ):
-
-        return JSONResponse(
-            status_code=401,
-            content={
-                "ok": False,
-                "error":
-                    "invalid_internal_signature",
-            },
-        )
-
-    query = [
-        (key, value)
-        for key, value
-        in request.query_params.multi_items()
-    ]
-
-    response = await raw_backend_call(
-        request.method,
-        path,
-        body=body,
-        query=query,
-        headers=clean_headers(
-            request.headers
-        ),
-    )
-
-    response_headers = clean_headers(
-        response.headers
-    )
-
-    return Response(
-        content=response.content,
-        status_code=response.status_code,
-        headers=response_headers,
-    )
-
-
-# ===============================================================
-# OPENAPI DISCOVERY
-# ===============================================================
-
 async def load_openapi(
-    force: bool = False,
+    force=False,
 ) -> dict[str, Any]:
 
-    global _openapi_cache
-    global _openapi_cached_at
+    global _openapi
+    global _openapi_at
 
     if (
-        not force
-        and _openapi_cache
+        _openapi
+        and not force
         and (
             time.time()
-            - _openapi_cached_at
+            - _openapi_at
             < OPENAPI_CACHE_SECONDS
         )
     ):
-        return _openapi_cache
+        return _openapi
 
     try:
 
-        response = await raw_backend_call(
+        response = await call_backend(
             "GET",
             "/openapi.json",
-            retry=True,
         )
 
         if response.status_code == 200:
@@ -676,124 +475,384 @@ async def load_openapi(
 
             if isinstance(data, dict):
 
-                _openapi_cache = data
+                _openapi = data
 
-                _openapi_cached_at = (
-                    time.time()
-                )
-
-                return data
+                _openapi_at = time.time()
 
     except Exception:
         pass
 
-    return _openapi_cache
+    return _openapi
 
 
 def route_exists(
-    openapi: dict[str, Any],
+    spec: dict[str, Any],
     path: str,
     method: str,
 ) -> bool:
 
     item = (
-        openapi
+        spec
         .get("paths", {})
         .get(path)
     )
 
-    if not isinstance(
-        item,
-        dict,
-    ):
-        return False
-
     return (
-        method.lower()
-        in item
+        isinstance(item, dict)
+        and method.lower() in item
     )
 
 
-# ===============================================================
-# QUERY HELPERS
-# ===============================================================
+async def choose(
+    candidates: list[str],
+    method: str,
+) -> Optional[str]:
 
-def query_pairs(
-    request: Request,
-) -> list[tuple[str, str]]:
+    spec = await load_openapi()
 
-    return [
-        (key, value)
-        for key, value
-        in request.query_params.multi_items()
-    ]
+    for path in candidates:
 
+        if route_exists(
+            spec,
+            path,
+            method,
+        ):
+            return path
 
-def query_dict(
-    request: Request,
-) -> dict[str, str]:
+    if not spec:
+        return (
+            candidates[0]
+            if candidates
+            else None
+        )
 
-    result: dict[str, str] = {}
-
-    for key, value in (
-        request.query_params.multi_items()
-    ):
-        result[key] = value
-
-    return result
+    return None
 
 
-async def json_payload(
-    request: Request,
+# ============================================================
+# NEW: LEGACY / MOBILE AI PAYLOAD NORMALIZER
+# ============================================================
+
+def normalize_ai_payload(
+    payload: Any,
 ) -> dict[str, Any]:
+
+    """
+    Convert legacy/mobile AI payloads
+    to the current /ai/analyze contract.
+
+    Existing fields are preserved inside
+    context so no information is discarded.
+    """
+
+    if not isinstance(payload, dict):
+
+        payload = {
+            "prompt": str(
+                payload or ""
+            )
+        }
+
+    prompt = (
+        payload.get("prompt")
+        or payload.get("question")
+        or payload.get("query")
+        or payload.get("message")
+        or payload.get("text")
+        or ""
+    )
+
+    language = (
+        payload.get("language")
+        or payload.get("lang")
+        or "fa"
+    )
+
+    context = payload.get("context")
+
+    if not isinstance(context, dict):
+        context = {}
+
+    mapping = {
+
+        "crop":
+            "crop",
+
+        "crop_name":
+            "crop",
+
+        "product":
+            "crop",
+
+        "plant":
+            "plant",
+
+        "tree":
+            "plant",
+
+        "species":
+            "plant",
+
+        "symptoms":
+            "symptoms",
+
+        "symptom":
+            "symptoms",
+
+        "soil":
+            "soil",
+
+        "soil_data":
+            "soil",
+
+        "water":
+            "water",
+
+        "water_data":
+            "water",
+
+        "weather":
+            "weather",
+
+        "location":
+            "location",
+
+        "lab":
+            "lab",
+
+        "image":
+            "image_description",
+
+        "image_description":
+            "image_description",
+
+        "additional_information":
+            "additional_information",
+
+        "extra_data":
+            "extra_data",
+    }
+
+    for src, dst in mapping.items():
+
+        if (
+            src in payload
+            and payload[src] is not None
+            and dst not in context
+        ):
+
+            context[dst] = payload[src]
+
+    control = {
+        "prompt",
+        "question",
+        "query",
+        "message",
+        "text",
+        "language",
+        "lang",
+        "context",
+    }
+
+    for key, value in payload.items():
+
+        if (
+            key not in control
+            and key not in context
+        ):
+
+            context[key] = value
+
+    return {
+        "prompt": str(prompt),
+        "language": str(language),
+        "context": context,
+    }
+
+
+async def ai_analyze_compat(
+    request: Request,
+) -> Response:
 
     body = await request.body()
 
-    if not body:
-        return query_dict(request)
+    if len(body) > MAX_REQUEST_BYTES:
 
-    try:
-        value = json.loads(
-            body.decode("utf-8")
+        return JSONResponse(
+            413,
+            {
+                "ok": False,
+                "error":
+                    "request_too_large",
+            },
         )
 
-        if isinstance(value, dict):
-            return value
+    try:
 
-        return {
-            "value": value,
-        }
+        payload = (
+            json.loads(
+                body.decode("utf-8")
+            )
+            if body
+            else {}
+        )
 
     except Exception:
 
-        return query_dict(request)
+        payload = {
+            "text":
+                body.decode(
+                    "utf-8",
+                    errors="replace",
+                )
+        }
+
+    normalized = normalize_ai_payload(
+        payload
+    )
+
+    headers = {
+        "Accept":
+            "application/json",
+
+        "Content-Type":
+            "application/json",
+    }
+
+    # مهم:
+    # توکن کاربر موبایل باید تا Backend
+    # منتقل شود.
+    auth = request.headers.get(
+        "Authorization"
+    )
+
+    if auth:
+        headers[
+            "Authorization"
+        ] = auth
+
+    response = await call_backend(
+        "POST",
+        "/ai/analyze",
+        body=json.dumps(
+            normalized,
+            ensure_ascii=False,
+        ).encode("utf-8"),
+        headers=headers,
+        retry=False,
+    )
+
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=safe_headers(
+            response.headers
+        ),
+        media_type=response.headers.get(
+            "content-type"
+        ),
+    )
 
 
-# ===============================================================
-# ROOT
-# ===============================================================
+async def compat(
+    request: Request,
+    candidates: list[str],
+) -> Response:
+
+    body = await request.body()
+
+    if len(body) > MAX_REQUEST_BYTES:
+
+        return JSONResponse(
+            413,
+            {
+                "ok": False,
+                "error":
+                    "request_too_large",
+            },
+        )
+
+    try:
+
+        payload = (
+            json.loads(
+                body.decode("utf-8")
+            )
+            if body
+            else {
+                k: v
+                for k, v
+                in request.query_params.multi_items()
+            }
+        )
+
+    except Exception:
+
+        payload = {
+            "raw":
+                body.decode(
+                    "utf-8",
+                    errors="replace",
+                )
+        }
+
+    method = request.method.upper()
+
+    target_method = (
+        "POST"
+        if method == "GET"
+        else method
+    )
+
+    target = await choose(
+        candidates,
+        target_method,
+    )
+
+    if not target:
+
+        return JSONResponse(
+            404,
+            {
+                "ok": False,
+                "error":
+                    "compatible_backend_route_not_found",
+                "candidates":
+                    candidates,
+            },
+        )
+
+    if target_method == "GET":
+
+        data = await json_backend(
+            "GET",
+            target,
+            query=list(
+                request.query_params.multi_items()
+            ),
+        )
+
+    else:
+
+        data = await json_backend(
+            target_method,
+            target,
+            payload,
+        )
+
+    return JSONResponse(data)
+
 
 @app.get("/")
 async def root():
 
     return {
-        "service":
-            APP_NAME,
-
-        "version":
-            APP_VERSION,
-
-        "status":
-            "running",
-
-        "backend":
-            BACKEND_URL,
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "status": "running",
+        "backend": BACKEND_URL,
     }
 
-
-# ===============================================================
-# HEALTH
-# ===============================================================
 
 @app.get("/health")
 async def health():
@@ -802,40 +861,27 @@ async def health():
 
     try:
 
-        response = await raw_backend_call(
+        r = await call_backend(
             "GET",
             "/health",
-            retry=True,
-        )
-
-        healthy = (
-            200
-            <= response.status_code
-            < 300
         )
 
         return {
             "ok":
-                healthy,
+                200 <= r.status_code < 300,
 
             "master":
                 "ok",
 
-            "backend": {
-                "ok":
-                    healthy,
-
-                "status_code":
-                    response.status_code,
-            },
+            "backend_status":
+                r.status_code,
 
             "latency_ms":
                 round(
                     (
                         time.perf_counter()
                         - started
-                    )
-                    * 1000,
+                    ) * 1000,
                     2,
                 ),
         }
@@ -844,40 +890,30 @@ async def health():
 
         return {
             "ok": False,
-            "master": "ok",
+
+            "master":
+                "ok",
+
             "backend": {
                 "ok": False,
                 "error": str(exc),
             },
+
             "latency_ms":
                 round(
                     (
                         time.perf_counter()
                         - started
-                    )
-                    * 1000,
+                    ) * 1000,
                     2,
                 ),
         }
 
 
-# ===============================================================
-# STATUS
-# ===============================================================
-
 @app.get("/status")
 async def status():
 
-    openapi = await load_openapi()
-
-    paths = (
-        openapi.get(
-            "paths",
-            {},
-        )
-        if openapi
-        else {}
-    )
+    spec = await load_openapi()
 
     return {
         "ok": True,
@@ -891,468 +927,228 @@ async def status():
         "backend":
             BACKEND_URL,
 
-        "backend_circuit_open":
-            circuit_open(),
+        "circuit_open":
+            is_open(),
 
-        "backend_failures":
-            backend_circuit.failures,
+        "failures":
+            circuit.failures,
 
         "last_error":
             last_error,
 
         "route_count":
-            len(paths),
+            len(
+                spec.get(
+                    "paths",
+                    {},
+                )
+            ),
 
-        "request_count":
+        "requests":
             dict(stats),
     }
 
 
-# ===============================================================
-# SYSTEM MAP
-# ===============================================================
-
 @app.get("/system-map")
 async def system_map():
 
-    openapi = await load_openapi()
+    spec = await load_openapi()
 
     return {
-        "name":
+        "ok": True,
+
+        "master":
             APP_NAME,
-
-        "version":
-            APP_VERSION,
-
-        "architecture": {
-
-            "client":
-                "ARYA Android / Windows",
-
-            "master":
-                "arya_master_system.py",
-
-            "backend":
-                "backend/main.py",
-
-            "ai":
-                "/ai/analyze",
-
-            "recommendations":
-                "/recommendations",
-
-            "weather": [
-                "/weather/current",
-                "/weather/forecast",
-                "/weather/observation",
-            ],
-
-            "location": [
-                "/location",
-                "/location/reverse",
-            ],
-
-            "storage":
-                "backend SQLite",
-        },
 
         "backend":
             BACKEND_URL,
 
-        "routes":
+        "backend_routes":
             sorted(
-                openapi.get(
+                spec.get(
                     "paths",
                     {},
                 ).keys()
-            )
-            if openapi
-            else [],
+            ),
     }
 
-
-# ===============================================================
-# BACKEND ROUTES
-# ===============================================================
 
 @app.get("/backend-routes")
 async def backend_routes():
 
-    openapi = await load_openapi()
+    spec = await load_openapi()
 
-    paths = (
-        openapi.get(
-            "paths",
-            {},
-        )
-        if openapi
-        else {}
+    paths = spec.get(
+        "paths",
+        {},
     )
 
     return {
         "ok":
-            bool(openapi),
+            bool(spec),
 
         "count":
             len(paths),
 
         "routes": {
-            path:
+            p:
                 sorted(
-                    [
-                        method.upper()
-                        for method in methods
-                        if method.lower()
-                        in {
-                            "get",
-                            "post",
-                            "put",
-                            "patch",
-                            "delete",
-                            "options",
-                            "head",
-                        }
-                    ]
+                    m.upper()
+                    for m in v
+                    if m.lower()
+                    in {
+                        "get",
+                        "post",
+                        "put",
+                        "patch",
+                        "delete",
+                        "options",
+                        "head",
+                    }
                 )
 
-            for path, methods
-            in paths.items()
+            for p, v in paths.items()
 
-            if isinstance(
-                methods,
-                dict,
-            )
+            if isinstance(v, dict)
         },
     }
 
 
-@app.post(
-    "/backend-routes/refresh"
-)
-async def refresh_backend_routes():
+@app.post("/backend-routes/refresh")
+async def refresh_routes():
 
-    openapi = await load_openapi(
-        force=True
-    )
+    spec = await load_openapi(True)
 
     return {
         "ok":
-            bool(openapi),
+            bool(spec),
 
         "count":
-            (
-                len(
-                    openapi.get(
-                        "paths",
-                        {},
-                    )
+            len(
+                spec.get(
+                    "paths",
+                    {},
                 )
-                if openapi
-                else 0
             ),
     }
 
 
-# ===============================================================
-# REAL WEATHER COMPATIBILITY ROUTES
-# ===============================================================
-
-@app.get(
-    "/arya/weather/current"
-)
-async def arya_weather_current(
-    request: Request,
-):
-
-    stats[
-        "/arya/weather/current"
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/weather/current",
-    )
-
-
-@app.get(
-    "/arya/weather/forecast"
-)
-async def arya_weather_forecast(
-    request: Request,
-):
-
-    stats[
-        "/arya/weather/forecast"
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/weather/forecast",
-    )
-
-
-@app.post(
-    "/arya/weather/observation"
-)
-async def arya_weather_observation(
-    request: Request,
-):
-
-    stats[
-        "/arya/weather/observation"
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/weather/observation",
-    )
-
-
-# ===============================================================
-# WEATHER LEGACY ROUTE
-# ===============================================================
-
 @app.api_route(
     "/arya/weather",
-    methods=[
-        "GET",
-        "POST",
-    ],
+    methods=["GET", "POST"],
 )
 async def arya_weather(
     request: Request,
 ):
 
-    """
-    Compatibility endpoint.
-
-    GET:
-        forwards to /weather/current
-
-    POST:
-        forwards to /weather/observation
-    """
-
-    stats[
-        "/arya/weather"
-    ] += 1
-
-    if request.method.upper() == "GET":
-
-        return await proxy_request(
-            request,
-            "/weather/current",
-        )
-
-    return await proxy_request(
+    return await compat(
         request,
-        "/weather/observation",
+        ["/weather"],
     )
 
-
-# ===============================================================
-# REAL LOCATION COMPATIBILITY ROUTES
-# ===============================================================
-
-@app.post(
-    "/arya/location"
-)
-async def arya_location(
-    request: Request,
-):
-
-    stats[
-        "/arya/location"
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/location",
-    )
-
-
-@app.get(
-    "/arya/location/reverse"
-)
-async def arya_location_reverse(
-    request: Request,
-):
-
-    stats[
-        "/arya/location/reverse"
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/location/reverse",
-    )
-
-
-# ===============================================================
-# LOCATION LEGACY ROUTES
-# ===============================================================
 
 @app.api_route(
     "/arya/geocode",
-    methods=[
-        "GET",
-        "POST",
-    ],
+    methods=["GET", "POST"],
 )
 async def arya_geocode(
     request: Request,
 ):
 
-    stats[
-        "/arya/geocode"
-    ] += 1
-
-    if request.method.upper() == "GET":
-
-        return await proxy_request(
-            request,
-            "/location/reverse",
-        )
-
-    return await proxy_request(
+    return await compat(
         request,
-        "/location",
+        ["/location/resolve"],
     )
 
 
 @app.api_route(
     "/arya/location/resolve",
-    methods=[
-        "GET",
-        "POST",
-    ],
+    methods=["GET", "POST"],
 )
-async def arya_location_resolve(
+async def arya_location(
     request: Request,
 ):
 
-    stats[
-        "/arya/location/resolve"
-    ] += 1
-
-    if request.method.upper() == "GET":
-
-        return await proxy_request(
-            request,
-            "/location/reverse",
-        )
-
-    return await proxy_request(
+    return await compat(
         request,
-        "/location",
+        ["/location/resolve"],
     )
 
 
-# ===============================================================
-# REAL AI COMPATIBILITY ROUTES
-# ===============================================================
+# ============================================================
+# REAL SPECIALIST AI ROUTES
+# ============================================================
 
 @app.api_route(
     "/arya/doctor",
-    methods=[
-        "POST",
-    ],
+    methods=["POST"],
 )
 async def arya_doctor(
     request: Request,
 ):
 
-    stats[
-        "/arya/doctor"
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/ai/analyze",
+    return await ai_analyze_compat(
+        request
     )
 
 
 @app.api_route(
     "/arya/diagnose",
-    methods=[
-        "POST",
-    ],
+    methods=["POST"],
 )
 async def arya_diagnose(
     request: Request,
 ):
 
-    stats[
-        "/arya/diagnose"
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/ai/analyze",
+    return await ai_analyze_compat(
+        request
     )
 
 
 @app.api_route(
     "/arya/analyze",
-    methods=[
-        "POST",
-    ],
+    methods=["POST"],
 )
 async def arya_analyze(
     request: Request,
 ):
 
-    stats[
-        "/arya/analyze"
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/ai/analyze",
+    return await ai_analyze_compat(
+        request
     )
 
 
-# ===============================================================
-# REAL RECOMMENDATION COMPATIBILITY
-# ===============================================================
+@app.api_route(
+    "/ai/analyze",
+    methods=["POST"],
+)
+async def direct_ai_analyze(
+    request: Request,
+):
 
-@app.post(
-    "/arya/recommend"
+    return await ai_analyze_compat(
+        request
+    )
+
+
+@app.api_route(
+    "/arya/recommend",
+    methods=["GET", "POST"],
 )
 async def arya_recommend(
     request: Request,
 ):
 
-    stats[
-        "/arya/recommend"
-    ] += 1
-
-    return await proxy_request(
+    return await compat(
         request,
-        "/recommendations",
+        [
+            "/recommend",
+            "/agri/recommend",
+            "/ai/ask",
+            "/ask",
+        ],
     )
 
-
-@app.post(
-    "/arya/recommendations"
-)
-async def arya_recommendations(
-    request: Request,
-):
-
-    stats[
-        "/arya/recommendations"
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/recommendations",
-    )
-
-
-# ===============================================================
-# REAL BACKEND DIRECT ROUTE ALIASES
-# ===============================================================
 
 @app.api_route(
     "/api/{path:path}",
@@ -1371,15 +1167,13 @@ async def api_proxy(
     request: Request,
 ):
 
-    target = "/" + path
-
     stats[
-        "/api/" + path
+        f"/api/{path}"
     ] += 1
 
-    return await proxy_request(
+    return await passthrough(
         request,
-        target,
+        "/" + path,
     )
 
 
@@ -1400,21 +1194,15 @@ async def backend_proxy(
     request: Request,
 ):
 
-    target = "/" + path
-
     stats[
-        "/backend/" + path
+        f"/backend/{path}"
     ] += 1
 
-    return await proxy_request(
+    return await passthrough(
         request,
-        target,
+        "/" + path,
     )
 
-
-# ===============================================================
-# INTERNAL PROXY
-# ===============================================================
 
 @app.api_route(
     "/internal/{path:path}",
@@ -1433,184 +1221,309 @@ async def internal_proxy(
     request: Request,
 ):
 
+    body = await request.body()
+
+    if (
+        REQUIRE_SIGNATURE
+        and not verify_signature(
+            request,
+            body,
+        )
+    ):
+
+        return JSONResponse(
+            401,
+            {
+                "ok": False,
+                "error":
+                    "invalid_internal_signature",
+            },
+        )
+
     stats[
-        "/internal/" + path
+        f"/internal/{path}"
     ] += 1
 
-    return await proxy_request(
+    return await passthrough(
+        request,
+        "/" + path,
+        body=body,
+    )
+
+
+async def passthrough(
+    request: Request,
+    path: str,
+    body: Optional[bytes] = None,
+) -> Response:
+
+    if body is None:
+        body = await request.body()
+
+    response = await call_backend(
+        request.method,
+        path,
+        body=body,
+        query=list(
+            request.query_params.multi_items()
+        ),
+        headers=safe_headers(
+            request.headers
+        ),
+        retry=request.method
+        in {
+            "GET",
+            "HEAD",
+            "OPTIONS",
+        },
+    )
+
+    headers = safe_headers(
+        response.headers
+    )
+
+    media_type = response.headers.get(
+        "content-type"
+    )
+
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=headers,
+        media_type=media_type,
+    )
+
+
+@app.get("/services")
+async def services():
+
+    spec = await load_openapi()
+
+    return {
+        "ok": True,
+        "backend":
+            BACKEND_URL,
+        "routes":
+            sorted(
+                spec.get(
+                    "paths",
+                    {},
+                ).keys()
+            ),
+    }
+
+
+@app.get("/providers")
+async def providers():
+
+    return {
+        "ok": True,
+
+        "providers": {
+            "open_meteo_weather":
+                "backend:/weather",
+
+            "open_meteo_geocoding":
+                "backend:/location/resolve",
+        },
+    }
+
+
+@app.api_route(
+    "/weather",
+    methods=["GET"],
+)
+async def weather_get_compat(
+    request: Request,
+):
+
+    return await compat(
+        request,
+        ["/weather"],
+    )
+
+
+@app.api_route(
+    "/location/resolve",
+    methods=["GET"],
+)
+async def location_get_compat(
+    request: Request,
+):
+
+    return await compat(
+        request,
+        ["/location/resolve"],
+    )
+
+
+@app.api_route(
+    "/service/{path:path}",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+        "HEAD",
+    ],
+)
+async def service_compat(
+    path: str,
+    request: Request,
+):
+
+    return await passthrough(
         request,
         "/" + path,
     )
 
 
-# ===============================================================
-# COMMON DIRECT BACKEND ALIASES
-# ===============================================================
-
 @app.api_route(
-    "/arya/auth/{path:path}",
-    methods=[
-        "GET",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-        "OPTIONS",
-        "HEAD",
-    ],
+    "/orchestrate",
+    methods=["POST"],
 )
-async def arya_auth_proxy(
-    path: str,
+async def orchestrate(
     request: Request,
 ):
 
-    stats[
-        "/arya/auth/" + path
-    ] += 1
+    body = await request.body()
 
-    return await proxy_request(
-        request,
-        "/auth/" + path,
+    try:
+
+        payload = (
+            json.loads(
+                body.decode("utf-8")
+            )
+            if body
+            else {}
+        )
+
+    except Exception:
+
+        payload = {}
+
+    action = (
+        payload.get("action", "")
+        if isinstance(
+            payload,
+            dict,
+        )
+        else ""
     )
 
+    data = (
+        payload.get("data", {})
+        if isinstance(
+            payload,
+            dict,
+        )
+        else {}
+    )
 
-@app.api_route(
-    "/arya/farms/{path:path}",
-    methods=[
-        "GET",
+    candidates = {
+
+        "doctor":
+            ["/ai/analyze"],
+
+        "full_diagnosis":
+            ["/ai/analyze"],
+
+        "complete_diagnosis":
+            ["/ai/analyze"],
+
+        "weather":
+            ["/weather"],
+
+        "location":
+            ["/location/resolve"],
+
+        "analyze":
+            ["/ai/analyze"],
+
+        "recommend":
+            [
+                "/recommend",
+                "/agri/recommend",
+                "/ai/ask",
+                "/ask",
+            ],
+
+    }.get(action)
+
+    if not candidates:
+
+        return JSONResponse(
+            404,
+            {
+                "ok": False,
+                "error":
+                    "unknown_action",
+                "action":
+                    action,
+            },
+        )
+
+    target = await choose(
+        candidates,
         "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-        "OPTIONS",
-        "HEAD",
-    ],
-)
-async def arya_farms_proxy(
-    path: str,
-    request: Request,
-):
+    )
 
-    stats[
-        "/arya/farms/" + path
-    ] += 1
+    if not target:
 
-    return await proxy_request(
-        request,
-        "/farms/" + path,
+        return JSONResponse(
+            404,
+            {
+                "ok": False,
+                "error":
+                    "backend_route_not_found",
+                "candidates":
+                    candidates,
+            },
+        )
+
+    return JSONResponse(
+        await json_backend(
+            "POST",
+            target,
+            data,
+        )
     )
 
 
-@app.api_route(
-    "/arya/lands/{path:path}",
-    methods=[
-        "GET",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-        "OPTIONS",
-        "HEAD",
-    ],
-)
-async def arya_lands_proxy(
-    path: str,
-    request: Request,
-):
-
-    stats[
-        "/arya/lands/" + path
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/lands/" + path,
-    )
-
-
-@app.api_route(
-    "/arya/crops/{path:path}",
-    methods=[
-        "GET",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-        "OPTIONS",
-        "HEAD",
-    ],
-)
-async def arya_crops_proxy(
-    path: str,
-    request: Request,
-):
-
-    stats[
-        "/arya/crops/" + path
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/crops/" + path,
-    )
-
-
-@app.api_route(
-    "/arya/media/{path:path}",
-    methods=[
-        "GET",
-        "POST",
-        "PUT",
-        "PATCH",
-        "DELETE",
-        "OPTIONS",
-        "HEAD",
-    ],
-)
-async def arya_media_proxy(
-    path: str,
-    request: Request,
-):
-
-    stats[
-        "/arya/media/" + path
-    ] += 1
-
-    return await proxy_request(
-        request,
-        "/media/" + path,
-    )
-
-
-# ===============================================================
-# STARTUP
-# ===============================================================
-
-@app.on_event(
-    "startup"
-)
+@app.on_event("startup")
 async def startup():
 
-    await load_openapi(
-        force=True
+    await load_openapi(True)
+
+
+# ============================================================
+# FINAL FALLBACK
+# ============================================================
+
+@app.api_route(
+    "/{path:path}",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+        "HEAD",
+    ],
+)
+async def final_backend_fallback(
+    path: str,
+    request: Request,
+):
+
+    return await passthrough(
+        request,
+        "/" + path,
     )
 
-
-# ===============================================================
-# SHUTDOWN
-# ===============================================================
-
-@app.on_event(
-    "shutdown"
-)
-async def shutdown():
-
-    _openapi_cache.clear()
-
-
-# ===============================================================
-# LOCAL RUN
-# ===============================================================
 
 if __name__ == "__main__":
 
