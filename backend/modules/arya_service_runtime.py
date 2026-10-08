@@ -14,10 +14,10 @@ Purpose:
 - Automatic-update scheduler management.
 - Provider infrastructure management.
 - Android / Windows / server deployment support.
-- No modification of backend/main.py.
+- Preserve existing service implementations.
+- Do not modify backend/main.py.
 
-This file manages existing ARYA services.
-It does not replace their implementation.
+This module is a runtime/orchestration layer only.
 """
 
 from __future__ import annotations
@@ -29,10 +29,11 @@ import sys
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 
@@ -41,7 +42,7 @@ from fastapi.responses import JSONResponse
 # ============================================================
 
 APP_NAME = "ARYA Service Runtime"
-APP_VERSION = "1.1.0"
+APP_VERSION = "2.0.0"
 
 HOST = os.getenv(
     "ARYA_RUNTIME_HOST",
@@ -74,6 +75,13 @@ START_TIMEOUT = float(
     )
 )
 
+STOP_TIMEOUT = float(
+    os.getenv(
+        "ARYA_RUNTIME_STOP_TIMEOUT",
+        "10",
+    )
+)
+
 RESTART_DELAY = float(
     os.getenv(
         "ARYA_RUNTIME_RESTART_DELAY",
@@ -96,6 +104,55 @@ AUTO_RESTART = (
     in {"1", "true", "yes", "on"}
 )
 
+# Runtime management authentication.
+# Empty = compatibility mode for existing local deployments.
+RUNTIME_SECRET = os.getenv(
+    "ARYA_RUNTIME_SECRET",
+    "",
+).strip()
+
+# backend directory.
+# This avoids depending on the directory from which uvicorn was launched.
+BASE_DIR = Path(
+    __file__
+).resolve().parents[1]
+
+
+# ============================================================
+# Environment helpers
+# ============================================================
+
+def env_port(
+    name: str,
+    default: int,
+) -> int:
+    try:
+        return int(
+            os.getenv(
+                name,
+                str(default),
+            )
+        )
+    except (TypeError, ValueError):
+        return default
+
+
+def env_bool(
+    name: str,
+    default: bool = False,
+) -> bool:
+    value = os.getenv(
+        name,
+        str(default),
+    ).strip().lower()
+
+    return value in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
 
 # ============================================================
 # Service Definition
@@ -114,6 +171,7 @@ class ServiceDefinition:
     environment: Dict[str, str] = field(
         default_factory=dict
     )
+    startup_order: int = 100
 
 
 @dataclass
@@ -128,21 +186,37 @@ class ServiceProcess:
 
 
 # ============================================================
-# Environment helpers
-# ============================================================
-
-def env_port(
-    name: str,
-    default: int,
-) -> int:
-    try:
-        return int(os.getenv(name, str(default)))
-    except ValueError:
-        return default
-
-
-# ============================================================
 # Service Registry
+# ============================================================
+#
+# IMPORTANT:
+# These defaults are reconciled with the current ARYA modules.
+#
+# 8000  main.py
+# 8001  vision
+# 8002  voice_language
+# 8003  agri_engine
+# 8010  orchestrator
+# 8011  data_update
+# 8013  commerce
+# 8014  owner_manager
+# 8015  owner_integration
+# 8016  owner_runtime_gateway
+# 8017  orchestrator/runtime bridge
+# 8019  owner_provider_control
+# 8020  internal security
+# 8021  client gateway
+# 8022  main bridge
+# 8023  unified API
+# 8024  this runtime
+# 8025  central/scheduler conflict is handled by env override
+# 8027  final integration
+# 8028  client runtime bridge
+# 8030  master/final deployment conflict is handled by env override
+# 8095  external providers
+# 8096  owner manager legacy/alternate
+#
+# No existing service implementation is changed here.
 # ============================================================
 
 SERVICES: List[ServiceDefinition] = [
@@ -161,6 +235,7 @@ SERVICES: List[ServiceDefinition] = [
             8000,
         ),
         critical=True,
+        startup_order=10,
     ),
 
     ServiceDefinition(
@@ -173,6 +248,7 @@ SERVICES: List[ServiceDefinition] = [
             8001,
         ),
         critical=True,
+        startup_order=20,
     ),
 
     ServiceDefinition(
@@ -185,6 +261,7 @@ SERVICES: List[ServiceDefinition] = [
             8002,
         ),
         critical=False,
+        startup_order=20,
     ),
 
     ServiceDefinition(
@@ -197,6 +274,7 @@ SERVICES: List[ServiceDefinition] = [
             8003,
         ),
         critical=True,
+        startup_order=20,
     ),
 
     ServiceDefinition(
@@ -206,9 +284,10 @@ SERVICES: List[ServiceDefinition] = [
         host="127.0.0.1",
         port=env_port(
             "ARYA_COMMERCE_SECURITY_PORT",
-            8004,
+            8013,
         ),
         critical=True,
+        startup_order=20,
     ),
 
     ServiceDefinition(
@@ -218,9 +297,10 @@ SERVICES: List[ServiceDefinition] = [
         host="127.0.0.1",
         port=env_port(
             "ARYA_EXTERNAL_PROVIDERS_PORT",
-            8005,
+            8095,
         ),
         critical=False,
+        startup_order=30,
     ),
 
     # --------------------------------------------------------
@@ -237,6 +317,7 @@ SERVICES: List[ServiceDefinition] = [
             8010,
         ),
         critical=True,
+        startup_order=40,
     ),
 
     ServiceDefinition(
@@ -246,9 +327,10 @@ SERVICES: List[ServiceDefinition] = [
         host="127.0.0.1",
         port=env_port(
             "ARYA_OWNER_MANAGER_PORT",
-            8014,
+            8096,
         ),
         critical=True,
+        startup_order=40,
     ),
 
     ServiceDefinition(
@@ -261,6 +343,7 @@ SERVICES: List[ServiceDefinition] = [
             8015,
         ),
         critical=True,
+        startup_order=40,
     ),
 
     ServiceDefinition(
@@ -273,6 +356,7 @@ SERVICES: List[ServiceDefinition] = [
             8016,
         ),
         critical=True,
+        startup_order=50,
     ),
 
     ServiceDefinition(
@@ -285,10 +369,11 @@ SERVICES: List[ServiceDefinition] = [
             8017,
         ),
         critical=False,
+        startup_order=50,
     ),
 
     # --------------------------------------------------------
-    # Runtime / Provider Bridges
+    # Provider / Owner Bridges
     # --------------------------------------------------------
 
     ServiceDefinition(
@@ -301,6 +386,7 @@ SERVICES: List[ServiceDefinition] = [
             8018,
         ),
         critical=False,
+        startup_order=50,
     ),
 
     ServiceDefinition(
@@ -313,6 +399,7 @@ SERVICES: List[ServiceDefinition] = [
             8019,
         ),
         critical=True,
+        startup_order=50,
     ),
 
     ServiceDefinition(
@@ -325,6 +412,7 @@ SERVICES: List[ServiceDefinition] = [
             8020,
         ),
         critical=True,
+        startup_order=50,
     ),
 
     # --------------------------------------------------------
@@ -334,13 +422,14 @@ SERVICES: List[ServiceDefinition] = [
     ServiceDefinition(
         service_id="client_api_gateway",
         name="ARYA Client API Gateway",
-        module="modules.client_api_gateway:app",
+        module="modules.arya_client_api_gateway:app",
         host="127.0.0.1",
         port=env_port(
             "ARYA_CLIENT_API_GATEWAY_PORT",
             8021,
         ),
         critical=True,
+        startup_order=60,
     ),
 
     ServiceDefinition(
@@ -353,6 +442,7 @@ SERVICES: List[ServiceDefinition] = [
             8022,
         ),
         critical=True,
+        startup_order=60,
     ),
 
     ServiceDefinition(
@@ -365,14 +455,15 @@ SERVICES: List[ServiceDefinition] = [
             8023,
         ),
         critical=True,
+        startup_order=70,
     ),
 
     # --------------------------------------------------------
-    # Runtime manager itself is 8024
+    # Runtime manager itself = 8024
     # --------------------------------------------------------
 
     # --------------------------------------------------------
-    # Automatic Update Scheduler
+    # Configuration / Update Infrastructure
     # --------------------------------------------------------
 
     ServiceDefinition(
@@ -385,11 +476,8 @@ SERVICES: List[ServiceDefinition] = [
             8025,
         ),
         critical=False,
+        startup_order=80,
     ),
-
-    # --------------------------------------------------------
-    # Global Data Update
-    # --------------------------------------------------------
 
     ServiceDefinition(
         service_id="data_update",
@@ -398,9 +486,40 @@ SERVICES: List[ServiceDefinition] = [
         host="127.0.0.1",
         port=env_port(
             "ARYA_DATA_UPDATE_PORT",
-            8026,
+            8011,
         ),
         critical=False,
+        startup_order=80,
+    ),
+
+    # --------------------------------------------------------
+    # New integration layer
+    # --------------------------------------------------------
+
+    ServiceDefinition(
+        service_id="arya_final_integration",
+        name="ARYA Final Integration",
+        module="modules.arya_final_integration:app",
+        host="127.0.0.1",
+        port=env_port(
+            "ARYA_FINAL_INTEGRATION_PORT",
+            8027,
+        ),
+        critical=True,
+        startup_order=90,
+    ),
+
+    ServiceDefinition(
+        service_id="arya_client_runtime_bridge",
+        name="ARYA Client Runtime Bridge",
+        module="modules.arya_client_runtime_bridge:app",
+        host="127.0.0.1",
+        port=env_port(
+            "ARYA_CLIENT_RUNTIME_BRIDGE_PORT",
+            8028,
+        ),
+        critical=False,
+        startup_order=90,
     ),
 ]
 
@@ -459,6 +578,7 @@ def serialize_process(
         "health": service_url(definition),
         "enabled": definition.enabled,
         "critical": definition.critical,
+        "startup_order": definition.startup_order,
         "state": runtime.state,
         "pid": pid,
         "started_at": runtime.started_at,
@@ -471,15 +591,62 @@ def serialize_process(
 def get_definition(
     service_id: str,
 ) -> ServiceDefinition:
-    if service_id not in RUNTIME:
+
+    runtime = RUNTIME.get(
+        service_id
+    )
+
+    if runtime is None:
         raise HTTPException(
             status_code=404,
             detail="Service not found",
         )
 
-    return RUNTIME[
-        service_id
-    ].definition
+    return runtime.definition
+
+
+def process_alive(
+    runtime: ServiceProcess,
+) -> bool:
+
+    return (
+        runtime.process is not None
+        and runtime.process.poll() is None
+    )
+
+
+# ============================================================
+# Runtime Authentication
+# ============================================================
+
+def verify_runtime_request(
+    request: Request,
+) -> None:
+    """
+    Protect runtime-control endpoints when a secret
+    has been configured.
+
+    Empty secret preserves local compatibility.
+    """
+
+    if not RUNTIME_SECRET:
+        return
+
+    provided = (
+        request.headers.get(
+            "X-ARYA-Runtime-Secret"
+        )
+        or request.headers.get(
+            "X-ARYA-Internal-Secret"
+        )
+        or ""
+    )
+
+    if provided != RUNTIME_SECRET:
+        raise HTTPException(
+            status_code=401,
+            detail="Runtime authentication required",
+        )
 
 
 # ============================================================
@@ -513,11 +680,9 @@ class ServiceManager:
                     detail="Service is disabled",
                 )
 
-            if (
-                runtime.process is not None
-                and runtime.process.poll() is None
-            ):
+            if process_alive(runtime):
                 runtime.state = "running"
+
                 return serialize_process(
                     runtime
                 )
@@ -534,6 +699,7 @@ class ServiceManager:
                 definition.host,
                 "--port",
                 str(definition.port),
+                "--no-access-log",
             ]
 
             environment = os.environ.copy()
@@ -541,18 +707,46 @@ class ServiceManager:
                 definition.environment
             )
 
+            # Make backend imports deterministic.
+            python_path = environment.get(
+                "PYTHONPATH",
+                "",
+            )
+
+            backend_path = str(
+                BASE_DIR
+            )
+
+            if python_path:
+                if backend_path not in python_path.split(
+                    os.pathsep
+                ):
+                    environment["PYTHONPATH"] = (
+                        backend_path
+                        + os.pathsep
+                        + python_path
+                    )
+            else:
+                environment["PYTHONPATH"] = (
+                    backend_path
+                )
+
             try:
                 process = subprocess.Popen(
                     command,
-                    cwd=os.getcwd(),
+                    cwd=str(BASE_DIR),
                     env=environment,
+                    stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    start_new_session=True,
                 )
 
             except Exception as exc:
                 runtime.state = "failed"
-                runtime.last_error = str(exc)
+                runtime.last_error = str(
+                    exc
+                )
 
                 raise HTTPException(
                     status_code=500,
@@ -571,11 +765,14 @@ class ServiceManager:
             service_id
         )
 
-        if not healthy:
-            if automatic:
-                runtime.state = "degraded"
-            else:
-                runtime.state = "degraded"
+        if healthy:
+            runtime.state = "healthy"
+
+        elif process_alive(runtime):
+            runtime.state = "degraded"
+
+        else:
+            runtime.state = "failed"
 
         return serialize_process(
             runtime
@@ -598,6 +795,7 @@ class ServiceManager:
 
             if runtime.process is None:
                 runtime.state = "stopped"
+
                 return serialize_process(
                     runtime
                 )
@@ -612,17 +810,19 @@ class ServiceManager:
 
                     await asyncio.to_thread(
                         process.wait,
-                        timeout=10,
+                        timeout=STOP_TIMEOUT,
                     )
 
                 except subprocess.TimeoutExpired:
-                    process.kill()
 
                     try:
+                        process.kill()
+
                         await asyncio.to_thread(
                             process.wait,
                             timeout=5,
                         )
+
                     except Exception:
                         pass
 
@@ -675,29 +875,29 @@ class ServiceManager:
             + START_TIMEOUT
         )
 
-        while time.time() < deadline:
+        async with httpx.AsyncClient(
+            timeout=HEALTH_TIMEOUT,
+            follow_redirects=False,
+        ) as client:
 
-            if (
-                runtime.process is not None
-                and runtime.process.poll()
-                is not None
-            ):
-                runtime.state = "failed"
+            while time.time() < deadline:
 
-                runtime.last_error = (
-                    "Process exited during startup"
-                )
+                if (
+                    runtime.process is not None
+                    and runtime.process.poll()
+                    is not None
+                ):
+                    runtime.state = "failed"
 
-                runtime.process = None
+                    runtime.last_error = (
+                        "Process exited during startup"
+                    )
 
-                return False
+                    runtime.process = None
 
-            try:
-                async with httpx.AsyncClient(
-                    timeout=HEALTH_TIMEOUT,
-                    follow_redirects=False,
-                ) as client:
+                    return False
 
+                try:
                     response = await client.get(
                         service_url(
                             definition
@@ -708,15 +908,12 @@ class ServiceManager:
                         runtime.state = "healthy"
                         return True
 
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-            await asyncio.sleep(1)
+                await asyncio.sleep(1)
 
-        if (
-            runtime.process is not None
-            and runtime.process.poll() is None
-        ):
+        if process_alive(runtime):
             runtime.state = "degraded"
         else:
             runtime.state = "failed"
@@ -736,9 +933,8 @@ class ServiceManager:
             service_id
         ]
 
-        process_alive = (
-            runtime.process is not None
-            and runtime.process.poll() is None
+        alive = process_alive(
+            runtime
         )
 
         api_healthy = False
@@ -764,13 +960,15 @@ class ServiceManager:
                     response.status_code < 500
                 )
 
-        except Exception:
-            api_healthy = False
+        except Exception as exc:
+            runtime.last_error = (
+                str(exc)
+            )
 
         if api_healthy:
             runtime.state = "healthy"
 
-        elif process_alive:
+        elif alive:
             runtime.state = "degraded"
 
         else:
@@ -780,17 +978,9 @@ class ServiceManager:
             runtime
         )
 
-        result["process_alive"] = (
-            process_alive
-        )
-
-        result["api_healthy"] = (
-            api_healthy
-        )
-
-        result["response_status"] = (
-            response_status
-        )
+        result["process_alive"] = alive
+        result["api_healthy"] = api_healthy
+        result["response_status"] = response_status
 
         return result
 
@@ -800,7 +990,17 @@ class ServiceManager:
 
         results = []
 
-        for service_id in RUNTIME:
+        for service in sorted(
+            SERVICES,
+            key=lambda item: (
+                item.startup_order,
+                item.service_id,
+            ),
+        ):
+
+            service_id = (
+                service.service_id
+            )
 
             try:
                 result = await self.health(
@@ -812,6 +1012,7 @@ class ServiceManager:
                     "id": service_id,
                     "state": "error",
                     "error": str(exc),
+                    "critical": service.critical,
                 }
 
             results.append(result)
@@ -821,47 +1022,60 @@ class ServiceManager:
     async def stop_all(
         self,
     ):
-        service_ids = list(
-            RUNTIME.keys()
-        )
 
-        for service_id in reversed(
-            service_ids
-        ):
+        service_ids = [
+            service.service_id
+            for service in sorted(
+                SERVICES,
+                key=lambda item: (
+                    item.startup_order,
+                    item.service_id,
+                ),
+                reverse=True,
+            )
+        ]
+
+        for service_id in service_ids:
+
             try:
                 await self.stop(
                     service_id
                 )
+
             except Exception:
                 pass
 
     async def start_all(
         self,
     ):
-        """
-        Start services in registry order.
-
-        Core services start first.
-        Integration and runtime services follow.
-        """
 
         results = []
 
-        for service_id in RUNTIME:
+        ordered = sorted(
+            SERVICES,
+            key=lambda item: (
+                item.startup_order,
+                item.service_id,
+            ),
+        )
 
-            runtime = RUNTIME[
-                service_id
-            ]
+        for definition in ordered:
 
-            if not runtime.definition.enabled:
+            if not definition.enabled:
                 continue
+
+            service_id = (
+                definition.service_id
+            )
 
             try:
                 result = await self.start(
                     service_id
                 )
 
-                results.append(result)
+                results.append(
+                    result
+                )
 
             except Exception as exc:
 
@@ -869,12 +1083,12 @@ class ServiceManager:
                     "id": service_id,
                     "state": "failed",
                     "error": str(exc),
-                    "critical": (
-                        runtime.definition.critical
-                    ),
+                    "critical": definition.critical,
                 }
 
-                results.append(result)
+                results.append(
+                    result
+                )
 
         return results
 
@@ -980,6 +1194,12 @@ async def root():
         "services": len(SERVICES),
         "auto_restart": AUTO_RESTART,
         "runtime_port": PORT,
+        "backend_directory": str(
+            BASE_DIR
+        ),
+        "runtime_authentication": bool(
+            RUNTIME_SECRET
+        ),
         "timestamp": timestamp(),
     }
 
@@ -1094,7 +1314,12 @@ async def service_details(
 )
 async def start_service(
     service_id: str,
+    request: Request,
 ):
+
+    verify_runtime_request(
+        request
+    )
 
     return await SERVICE_MANAGER.start(
         service_id
@@ -1110,7 +1335,12 @@ async def start_service(
 )
 async def stop_service(
     service_id: str,
+    request: Request,
 ):
+
+    verify_runtime_request(
+        request
+    )
 
     return await SERVICE_MANAGER.stop(
         service_id
@@ -1126,7 +1356,12 @@ async def stop_service(
 )
 async def restart_service(
     service_id: str,
+    request: Request,
 ):
+
+    verify_runtime_request(
+        request
+    )
 
     return await SERVICE_MANAGER.restart(
         service_id
@@ -1140,7 +1375,13 @@ async def restart_service(
 @app.post(
     "/runtime/start-all"
 )
-async def start_all():
+async def start_all(
+    request: Request,
+):
+
+    verify_runtime_request(
+        request
+    )
 
     return {
         "status": "started",
@@ -1158,7 +1399,13 @@ async def start_all():
 @app.post(
     "/runtime/stop-all"
 )
-async def stop_all():
+async def stop_all(
+    request: Request,
+):
+
+    verify_runtime_request(
+        request
+    )
 
     await SERVICE_MANAGER.stop_all()
 
@@ -1175,7 +1422,13 @@ async def stop_all():
 @app.post(
     "/runtime/restart-all"
 )
-async def restart_all():
+async def restart_all(
+    request: Request,
+):
+
+    verify_runtime_request(
+        request
+    )
 
     await SERVICE_MANAGER.stop_all()
 
@@ -1241,6 +1494,10 @@ async def system_map():
         ],
 
         "entrypoint": (
+            "arya_final_integration"
+        ),
+
+        "unified_api": (
             "arya_unified_api"
         ),
 
@@ -1286,10 +1543,18 @@ async def system_map():
             "owner_manager",
             "owner_integration",
             "owner_provider_control",
+            "owner_runtime_gateway",
         ],
 
         "security": [
             "internal_service_security",
+        ],
+
+        "integration": [
+            "arya_final_integration",
+            "arya_client_runtime_bridge",
+            "arya_main_api_bridge",
+            "arya_unified_api",
         ],
 
         "runtime_services": [
@@ -1298,9 +1563,15 @@ async def system_map():
                 "port": service.port,
                 "critical": service.critical,
                 "enabled": service.enabled,
+                "startup_order": service.startup_order,
             }
             for service in SERVICES
         ],
+
+        "main_py": {
+            "modified": False,
+            "managed_as": "main_api",
+        },
 
         "timestamp": timestamp(),
     }
@@ -1322,13 +1593,80 @@ async def runtime_contract():
 
         "runtime_services": {
             "runtime_manager": PORT,
-            "auto_update_scheduler": env_port(
+
+            "main_api": env_port(
+                "ARYA_MAIN_API_PORT",
+                8000,
+            ),
+
+            "vision": env_port(
+                "ARYA_VISION_PORT",
+                8001,
+            ),
+
+            "voice_language": env_port(
+                "ARYA_VOICE_LANGUAGE_PORT",
+                8002,
+            ),
+
+            "agri_engine": env_port(
+                "ARYA_AGRI_ENGINE_PORT",
+                8003,
+            ),
+
+            "commerce_security": env_port(
+                "ARYA_COMMERCE_SECURITY_PORT",
+                8013,
+            ),
+
+            "external_providers": env_port(
+                "ARYA_EXTERNAL_PROVIDERS_PORT",
+                8095,
+            ),
+
+            "orchestrator": env_port(
+                "ARYA_ORCHESTRATOR_PORT",
+                8010,
+            ),
+
+            "owner_runtime_gateway": env_port(
+                "ARYA_OWNER_RUNTIME_GATEWAY_PORT",
+                8016,
+            ),
+
+            "client_api_gateway": env_port(
+                "ARYA_CLIENT_API_GATEWAY_PORT",
+                8021,
+            ),
+
+            "arya_main_api_bridge": env_port(
+                "ARYA_MAIN_API_BRIDGE_PORT",
+                8022,
+            ),
+
+            "arya_unified_api": env_port(
+                "ARYA_UNIFIED_API_PORT",
+                8023,
+            ),
+
+            "data_update": env_port(
+                "ARYA_DATA_UPDATE_PORT",
+                8011,
+            ),
+
+            "arya_auto_update_scheduler": env_port(
                 "ARYA_AUTO_UPDATE_PORT",
                 8025,
             ),
-            "data_update": env_port(
-                "ARYA_DATA_UPDATE_PORT",
-                8026,
+
+            "arya_final_integration": env_port(
+                "ARYA_FINAL_INTEGRATION_PORT",
+                8027,
+            ),
+
+            "arya_client_runtime_bridge": env_port(
+                "ARYA_CLIENT_RUNTIME_BRIDGE_PORT",
+                8028,
             ),
         },
 
@@ -1366,10 +1704,52 @@ async def runtime_contract():
             ),
         },
 
+        "security": {
+            "runtime_secret_configured": bool(
+                RUNTIME_SECRET
+            ),
+            "header": (
+                "X-ARYA-Runtime-Secret"
+            ),
+        },
+
         "main_py": {
             "modified": False,
             "managed_as": "main_api",
         },
+    }
+
+
+# ============================================================
+# Service Discovery
+# ============================================================
+
+@app.get(
+    "/runtime/discovery"
+)
+async def runtime_discovery():
+
+    return {
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "services": [
+            {
+                "id": service.service_id,
+                "name": service.name,
+                "module": service.module,
+                "url": (
+                    f"http://{service.host}:"
+                    f"{service.port}"
+                ),
+                "health": service_url(
+                    service
+                ),
+                "enabled": service.enabled,
+                "critical": service.critical,
+            }
+            for service in SERVICES
+        ],
+        "timestamp": timestamp(),
     }
 
 
@@ -1419,7 +1799,7 @@ async def on_startup():
     Exception
 )
 async def generic_exception_handler(
-    request,
+    request: Request,
     exc: Exception,
 ):
 
