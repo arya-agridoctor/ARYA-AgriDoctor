@@ -1,20 +1,21 @@
 """
 ARYA AgriDoctor
-OWNER Provider Control v1.0.0
+OWNER Provider Control
+Version: 2.0.0
 
 Purpose:
 - OWNER-controlled provider management
 - Enable / disable providers
 - Update provider metadata
 - Configure provider priority
-- Configure provider type
 - Maintain provider history
 - Maintain audit records
-- Keep secrets out of API responses
+- Keep provider secrets out of API responses
 - Provide runtime provider selection
-- No modification to existing ARYA files
+- Support internal runtime authentication
+- Preserve existing provider-control capabilities
 
-This module is intentionally independent from:
+This module does not modify:
     main.py
     owner_manager.py
     owner_integration.py
@@ -25,6 +26,8 @@ This module is intentionally independent from:
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -33,7 +36,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Query
 from pydantic import BaseModel, Field
 
 
@@ -42,7 +45,7 @@ from pydantic import BaseModel, Field
 # ============================================================
 
 APP_NAME = "ARYA OWNER Provider Control"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 
 HOST = os.getenv(
     "ARYA_OWNER_PROVIDER_CONTROL_HOST",
@@ -71,6 +74,11 @@ OWNER_SECRET = os.getenv(
     "",
 )
 
+INTERNAL_SECRET = os.getenv(
+    "ARYA_INTERNAL_GATEWAY_SECRET",
+    "",
+).strip()
+
 SESSION_TTL = int(
     os.getenv(
         "ARYA_OWNER_PROVIDER_SESSION_TTL",
@@ -78,21 +86,46 @@ SESSION_TTL = int(
     )
 )
 
-INTERNAL_SECRET = os.getenv(
-    "ARYA_INTERNAL_GATEWAY_SECRET",
-    "",
+MAX_AUDIT_LIMIT = int(
+    os.getenv(
+        "ARYA_OWNER_PROVIDER_MAX_AUDIT",
+        "500",
+    )
+)
+
+LOG_LEVEL = os.getenv(
+    "ARYA_OWNER_PROVIDER_LOG_LEVEL",
+    "INFO",
+).upper()
+
+
+logging.basicConfig(
+    level=getattr(
+        logging,
+        LOG_LEVEL,
+        logging.INFO,
+    ),
+    format=(
+        "%(asctime)s | %(levelname)s | "
+        "%(name)s | %(message)s"
+    ),
+)
+
+logger = logging.getLogger(
+    "arya.owner_provider_control"
 )
 
 
 # ============================================================
-# FastAPI
+# Application
 # ============================================================
 
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description=(
-        "Secure OWNER provider control layer for ARYA AgriDoctor."
+        "OWNER provider control layer for "
+        "ARYA AgriDoctor."
     ),
 )
 
@@ -106,14 +139,22 @@ def db() -> sqlite3.Connection:
         DATABASE,
         timeout=30,
     )
+
     connection.row_factory = sqlite3.Row
+
+    connection.execute(
+        "PRAGMA foreign_keys = ON"
+    )
+
     return connection
 
 
 def init_db() -> None:
+
     connection = db()
 
     try:
+
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS providers (
@@ -172,11 +213,17 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_provider_priority
             ON providers(priority);
 
+            CREATE INDEX IF NOT EXISTS idx_provider_type
+            ON providers(provider_type);
+
             CREATE INDEX IF NOT EXISTS idx_provider_versions_provider
             ON provider_versions(provider_id);
 
             CREATE INDEX IF NOT EXISTS idx_provider_sessions_token
             ON provider_sessions(token_hash);
+
+            CREATE INDEX IF NOT EXISTS idx_provider_audit_provider
+            ON provider_audit_logs(provider_id);
             """
         )
 
@@ -194,18 +241,22 @@ init_db()
 # ============================================================
 
 def now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
-def hash_token(token: str) -> str:
+def hash_token(
+    token: str,
+) -> str:
     return hashlib.sha256(
         token.encode("utf-8")
     ).hexdigest()
 
 
-def json_dumps(value: Any) -> str:
-    import json
-
+def json_dumps(
+    value: Any,
+) -> str:
     return json.dumps(
         value,
         ensure_ascii=False,
@@ -213,29 +264,42 @@ def json_dumps(value: Any) -> str:
     )
 
 
-def json_loads(value: Optional[str]) -> Any:
-    import json
+def json_loads(
+    value: Optional[str],
+) -> Any:
 
     if not value:
         return {}
 
     try:
         return json.loads(value)
+
     except Exception:
         return {}
 
 
-def clean_provider(row: sqlite3.Row) -> Dict[str, Any]:
+def clean_provider(
+    row: sqlite3.Row,
+) -> Dict[str, Any]:
+
     data = dict(row)
 
-    data.pop("secret_ref", None)
+    # Never expose provider secret references
+    # through normal provider APIs.
+    data.pop(
+        "secret_ref",
+        None,
+    )
 
     data["enabled"] = bool(
         data.get("enabled", 0)
     )
 
     data["capabilities"] = json_loads(
-        data.pop("capabilities_json", None)
+        data.pop(
+            "capabilities_json",
+            None,
+        )
     )
 
     return data
@@ -253,15 +317,37 @@ def provider_snapshot(
         "secret_ref": row["secret_ref"],
         "enabled": bool(row["enabled"]),
         "priority": row["priority"],
-        "timeout_seconds": row["timeout_seconds"],
-        "retry_count": row["retry_count"],
-        "description": row["description"],
+        "timeout_seconds": row[
+            "timeout_seconds"
+        ],
+        "retry_count": row[
+            "retry_count"
+        ],
+        "description": row[
+            "description"
+        ],
         "region": row["region"],
         "capabilities": json_loads(
             row["capabilities_json"]
         ),
         "version": row["version"],
     }
+
+
+def safe_provider_snapshot(
+    row: sqlite3.Row,
+) -> Dict[str, Any]:
+
+    snapshot = provider_snapshot(
+        row
+    )
+
+    snapshot.pop(
+        "secret_ref",
+        None,
+    )
+
+    return snapshot
 
 
 # ============================================================
@@ -281,6 +367,7 @@ def create_session(
     connection = db()
 
     try:
+
         connection.execute(
             """
             INSERT INTO provider_sessions (
@@ -345,6 +432,7 @@ def verify_session(
     connection = db()
 
     try:
+
         row = connection.execute(
             """
             SELECT *
@@ -366,15 +454,18 @@ def verify_session(
             detail="Invalid or revoked session",
         )
 
-    if int(row["expires_at"]) < int(
+    if int(row["expires_at"]) <= int(
         time.time()
     ):
+
         raise HTTPException(
             status_code=401,
             detail="Session expired",
         )
 
-    return str(row["owner_email"])
+    return str(
+        row["owner_email"]
+    )
 
 
 def verify_owner_credentials(
@@ -382,7 +473,10 @@ def verify_owner_credentials(
     secret: str,
 ) -> bool:
 
-    if not OWNER_EMAIL or not OWNER_SECRET:
+    if not OWNER_EMAIL:
+        return False
+
+    if not OWNER_SECRET:
         return False
 
     return (
@@ -397,13 +491,51 @@ def verify_owner_credentials(
     )
 
 
+def verify_internal_secret(
+    value: Optional[str],
+) -> None:
+
+    if not INTERNAL_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Internal authentication "
+                "is not configured"
+            ),
+        )
+
+    if not value:
+        raise HTTPException(
+            status_code=401,
+            detail="Internal authentication required",
+        )
+
+    if not secrets.compare_digest(
+        value,
+        INTERNAL_SECRET,
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid internal secret",
+        )
+
+
 # ============================================================
 # Models
 # ============================================================
 
 class OwnerLoginRequest(BaseModel):
-    email: str
-    secret: str
+    email: str = Field(
+        ...,
+        min_length=3,
+        max_length=320,
+    )
+
+    secret: str = Field(
+        ...,
+        min_length=1,
+        max_length=1000,
+    )
 
 
 class ProviderCreateRequest(BaseModel):
@@ -425,9 +557,15 @@ class ProviderCreateRequest(BaseModel):
         max_length=100,
     )
 
-    base_url: Optional[str] = None
+    base_url: Optional[str] = Field(
+        None,
+        max_length=2000,
+    )
 
-    secret_ref: Optional[str] = None
+    secret_ref: Optional[str] = Field(
+        None,
+        max_length=500,
+    )
 
     enabled: bool = True
 
@@ -449,9 +587,15 @@ class ProviderCreateRequest(BaseModel):
         le=10,
     )
 
-    description: Optional[str] = None
+    description: Optional[str] = Field(
+        None,
+        max_length=2000,
+    )
 
-    region: Optional[str] = None
+    region: Optional[str] = Field(
+        None,
+        max_length=200,
+    )
 
     capabilities: Dict[str, Any] = Field(
         default_factory=dict
@@ -459,33 +603,66 @@ class ProviderCreateRequest(BaseModel):
 
 
 class ProviderUpdateRequest(BaseModel):
-    name: Optional[str] = None
-    provider_type: Optional[str] = None
-    base_url: Optional[str] = None
-    secret_ref: Optional[str] = None
+    name: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=200,
+    )
+
+    provider_type: Optional[str] = Field(
+        None,
+        min_length=1,
+        max_length=100,
+    )
+
+    base_url: Optional[str] = Field(
+        None,
+        max_length=2000,
+    )
+
+    secret_ref: Optional[str] = Field(
+        None,
+        max_length=500,
+    )
+
     enabled: Optional[bool] = None
+
     priority: Optional[int] = Field(
         None,
         ge=0,
         le=100000,
     )
+
     timeout_seconds: Optional[float] = Field(
         None,
         gt=0,
         le=300,
     )
+
     retry_count: Optional[int] = Field(
         None,
         ge=0,
         le=10,
     )
-    description: Optional[str] = None
-    region: Optional[str] = None
+
+    description: Optional[str] = Field(
+        None,
+        max_length=2000,
+    )
+
+    region: Optional[str] = Field(
+        None,
+        max_length=200,
+    )
+
     capabilities: Optional[
         Dict[str, Any]
     ] = None
 
-    reason: Optional[str] = None
+    reason: Optional[str] = Field(
+        None,
+        max_length=1000,
+    )
 
 
 class ProviderPriorityRequest(BaseModel):
@@ -495,12 +672,9 @@ class ProviderPriorityRequest(BaseModel):
         le=100000,
     )
 
-    reason: Optional[str] = None
-
-
-class ProviderTestRequest(BaseModel):
-    payload: Dict[str, Any] = Field(
-        default_factory=dict
+    reason: Optional[str] = Field(
+        None,
+        max_length=1000,
     )
 
 
@@ -515,9 +689,26 @@ def audit(
     details: Dict[str, Any],
 ) -> None:
 
+    # Never write raw provider secrets
+    # into audit records.
+    sanitized = dict(details)
+
+    for key in (
+        "secret",
+        "secret_ref",
+        "access_token",
+        "token",
+        "password",
+    ):
+        sanitized.pop(
+            key,
+            None,
+        )
+
     connection = db()
 
     try:
+
         connection.execute(
             """
             INSERT INTO provider_audit_logs (
@@ -535,7 +726,7 @@ def audit(
                 event_type,
                 provider_id,
                 actor,
-                json_dumps(details),
+                json_dumps(sanitized),
                 now_iso(),
             ),
         )
@@ -557,6 +748,7 @@ def get_provider(
     connection = db()
 
     try:
+
         row = connection.execute(
             """
             SELECT *
@@ -579,11 +771,12 @@ def get_provider(
 
 
 # ============================================================
-# Root / Health
+# Root
 # ============================================================
 
 @app.get("/")
 async def root():
+
     return {
         "service": APP_NAME,
         "version": APP_VERSION,
@@ -593,13 +786,22 @@ async def root():
     }
 
 
+# ============================================================
+# Health
+# ============================================================
+
 @app.get("/health")
 async def health():
+
     connection = db()
 
     try:
+
         total = connection.execute(
-            "SELECT COUNT(*) AS count FROM providers"
+            """
+            SELECT COUNT(*) AS count
+            FROM providers
+            """
         ).fetchone()["count"]
 
         enabled = connection.execute(
@@ -615,9 +817,16 @@ async def health():
 
     return {
         "service": APP_NAME,
+        "version": APP_VERSION,
         "status": "healthy",
         "providers_total": total,
         "providers_enabled": enabled,
+        "internal_auth_configured": bool(
+            INTERNAL_SECRET
+        ),
+        "owner_auth_configured": bool(
+            OWNER_EMAIL and OWNER_SECRET
+        ),
     }
 
 
@@ -634,19 +843,22 @@ async def owner_login(
         request.email,
         request.secret,
     ):
+
         raise HTTPException(
             status_code=401,
             detail="Invalid OWNER credentials",
         )
 
+    email = request.email.strip().lower()
+
     session = create_session(
-        request.email.strip().lower()
+        email
     )
 
     audit(
         "owner_login",
         None,
-        request.email.strip().lower(),
+        email,
         {},
     )
 
@@ -655,6 +867,10 @@ async def owner_login(
         **session,
     }
 
+
+# ============================================================
+# OWNER Logout
+# ============================================================
 
 @app.post("/owner/logout")
 async def owner_logout(
@@ -672,6 +888,7 @@ async def owner_logout(
     connection = db()
 
     try:
+
         connection.execute(
             """
             UPDATE provider_sessions
@@ -699,7 +916,7 @@ async def owner_logout(
 
 
 # ============================================================
-# Provider Create
+# Create Provider
 # ============================================================
 
 @app.post("/owner/providers")
@@ -714,11 +931,20 @@ async def create_provider(
         authorization
     )
 
-    provider_id = request.provider_id.strip()
+    provider_id = (
+        request.provider_id.strip()
+    )
+
+    if not provider_id:
+        raise HTTPException(
+            status_code=400,
+            detail="provider_id cannot be empty",
+        )
 
     connection = db()
 
     try:
+
         existing = connection.execute(
             """
             SELECT id
@@ -780,8 +1006,6 @@ async def create_provider(
             ),
         )
 
-        connection.commit()
-
         row = connection.execute(
             """
             SELECT *
@@ -790,6 +1014,34 @@ async def create_provider(
             """,
             (provider_id,),
         ).fetchone()
+
+        connection.execute(
+            """
+            INSERT INTO provider_versions (
+                provider_id,
+                version,
+                snapshot_json,
+                changed_at,
+                changed_by,
+                change_reason
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                provider_id,
+                1,
+                json_dumps(
+                    safe_provider_snapshot(
+                        row
+                    )
+                ),
+                timestamp,
+                actor,
+                "initial creation",
+            ),
+        )
+
+        connection.commit()
 
     finally:
         connection.close()
@@ -800,6 +1052,9 @@ async def create_provider(
         actor,
         {
             "version": 1,
+            "enabled": request.enabled,
+            "priority": request.priority,
+            "provider_type": request.provider_type,
         },
     )
 
@@ -810,7 +1065,7 @@ async def create_provider(
 
 
 # ============================================================
-# Provider List
+# OWNER Provider List
 # ============================================================
 
 @app.get("/owner/providers")
@@ -828,7 +1083,9 @@ async def list_providers(
     connection = db()
 
     try:
+
         if include_disabled:
+
             rows = connection.execute(
                 """
                 SELECT *
@@ -836,7 +1093,9 @@ async def list_providers(
                 ORDER BY priority ASC, id ASC
                 """
             ).fetchall()
+
         else:
+
             rows = connection.execute(
                 """
                 SELECT *
@@ -860,23 +1119,41 @@ async def list_providers(
 
 
 # ============================================================
-# Public runtime provider selection
+# Runtime Provider List
 # ============================================================
 
 @app.get("/runtime/providers")
-async def runtime_providers():
+async def runtime_providers(
+    provider_type: Optional[str] = None,
+):
 
     connection = db()
 
     try:
-        rows = connection.execute(
-            """
-            SELECT *
-            FROM providers
-            WHERE enabled = 1
-            ORDER BY priority ASC, id ASC
-            """
-        ).fetchall()
+
+        if provider_type:
+
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM providers
+                WHERE enabled = 1
+                  AND provider_type = ?
+                ORDER BY priority ASC, id ASC
+                """,
+                (provider_type,),
+            ).fetchall()
+
+        else:
+
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM providers
+                WHERE enabled = 1
+                ORDER BY priority ASC, id ASC
+                """
+            ).fetchall()
 
     finally:
         connection.close()
@@ -891,7 +1168,7 @@ async def runtime_providers():
 
 
 # ============================================================
-# Get provider
+# Provider Details
 # ============================================================
 
 @app.get(
@@ -919,7 +1196,7 @@ async def provider_details(
 
 
 # ============================================================
-# Update provider
+# Update Provider
 # ============================================================
 
 @app.patch(
@@ -941,8 +1218,8 @@ async def update_provider(
         provider_id
     )
 
-    old_snapshot = provider_snapshot(
-        old_row
+    old_version = int(
+        old_row["version"]
     )
 
     updates: Dict[str, Any] = {}
@@ -997,7 +1274,9 @@ async def update_provider(
 
     if request.capabilities is not None:
         updates["capabilities_json"] = (
-            json_dumps(request.capabilities)
+            json_dumps(
+                request.capabilities
+            )
         )
 
     if not updates:
@@ -1006,28 +1285,30 @@ async def update_provider(
             detail="No changes supplied",
         )
 
-    new_version = int(
-        old_row["version"]
-    ) + 1
+    new_version = old_version + 1
+    timestamp = now_iso()
 
     updates["version"] = new_version
-    updates["updated_at"] = now_iso()
+    updates["updated_at"] = timestamp
 
     if (
         "enabled" in updates
         and updates["enabled"] == 0
     ):
-        updates["disabled_at"] = now_iso()
 
-    if (
+        updates["disabled_at"] = timestamp
+
+    elif (
         "enabled" in updates
         and updates["enabled"] == 1
     ):
+
         updates["disabled_at"] = None
 
     connection = db()
 
     try:
+
         assignments = ", ".join(
             f"{key} = ?"
             for key in updates
@@ -1037,7 +1318,9 @@ async def update_provider(
             updates.values()
         )
 
-        values.append(provider_id)
+        values.append(
+            provider_id
+        )
 
         connection.execute(
             f"""
@@ -1073,11 +1356,11 @@ async def update_provider(
                 provider_id,
                 new_version,
                 json_dumps(
-                    provider_snapshot(
+                    safe_provider_snapshot(
                         new_row
                     )
                 ),
-                now_iso(),
+                timestamp,
                 actor,
                 request.reason,
             ),
@@ -1094,12 +1377,16 @@ async def update_provider(
         actor,
         {
             "version": new_version,
-            "changed_fields": list(
-                updates.keys()
-            ),
-            "previous_version": old_snapshot.get(
-                "version"
-            ),
+            "previous_version": old_version,
+            "changed_fields": [
+                key
+                for key in updates
+                if key
+                not in {
+                    "updated_at",
+                    "version",
+                }
+            ],
             "reason": request.reason,
         },
     )
@@ -1113,7 +1400,7 @@ async def update_provider(
 
 
 # ============================================================
-# Enable
+# Enable Provider
 # ============================================================
 
 @app.post(
@@ -1143,6 +1430,7 @@ async def enable_provider(
     connection = db()
 
     try:
+
         connection.execute(
             """
             UPDATE providers
@@ -1170,7 +1458,7 @@ async def enable_provider(
         provider_id,
         actor,
         {
-            "version": version
+            "version": version,
         },
     )
 
@@ -1182,7 +1470,7 @@ async def enable_provider(
 
 
 # ============================================================
-# Disable
+# Disable Provider
 # ============================================================
 
 @app.post(
@@ -1212,6 +1500,7 @@ async def disable_provider(
     connection = db()
 
     try:
+
         connection.execute(
             """
             UPDATE providers
@@ -1240,7 +1529,7 @@ async def disable_provider(
         provider_id,
         actor,
         {
-            "version": version
+            "version": version,
         },
     )
 
@@ -1278,9 +1567,12 @@ async def set_priority(
         row["version"]
     ) + 1
 
+    timestamp = now_iso()
+
     connection = db()
 
     try:
+
         connection.execute(
             """
             UPDATE providers
@@ -1293,7 +1585,7 @@ async def set_priority(
             (
                 request.priority,
                 version,
-                now_iso(),
+                timestamp,
                 provider_id,
             ),
         )
@@ -1323,7 +1615,7 @@ async def set_priority(
 
 
 # ============================================================
-# Provider history
+# Provider History
 # ============================================================
 
 @app.get(
@@ -1347,6 +1639,7 @@ async def provider_history(
     connection = db()
 
     try:
+
         rows = connection.execute(
             """
             SELECT
@@ -1372,6 +1665,20 @@ async def provider_history(
     ] = []
 
     for row in rows:
+
+        snapshot = json_loads(
+            row["snapshot_json"]
+        )
+
+        if isinstance(
+            snapshot,
+            dict,
+        ):
+            snapshot.pop(
+                "secret_ref",
+                None,
+            )
+
         history.append(
             {
                 "id": row["id"],
@@ -1381,9 +1688,7 @@ async def provider_history(
                 "version": row[
                     "version"
                 ],
-                "snapshot": json_loads(
-                    row["snapshot_json"]
-                ),
+                "snapshot": snapshot,
                 "changed_at": row[
                     "changed_at"
                 ],
@@ -1405,7 +1710,7 @@ async def provider_history(
 
 
 # ============================================================
-# Provider capabilities
+# Provider Capabilities
 # ============================================================
 
 @app.get(
@@ -1416,6 +1721,7 @@ async def provider_capabilities():
     connection = db()
 
     try:
+
         rows = connection.execute(
             """
             SELECT
@@ -1423,10 +1729,11 @@ async def provider_capabilities():
                 name,
                 provider_type,
                 priority,
+                region,
                 capabilities_json
             FROM providers
             WHERE enabled = 1
-            ORDER BY priority ASC
+            ORDER BY priority ASC, id ASC
             """
         ).fetchall()
 
@@ -1436,6 +1743,7 @@ async def provider_capabilities():
     result = []
 
     for row in rows:
+
         result.append(
             {
                 "provider_id": row[
@@ -1447,6 +1755,9 @@ async def provider_capabilities():
                 ],
                 "priority": row[
                     "priority"
+                ],
+                "region": row[
+                    "region"
                 ],
                 "capabilities": json_loads(
                     row[
@@ -1463,7 +1774,7 @@ async def provider_capabilities():
 
 
 # ============================================================
-# Select best enabled provider
+# Select Best Provider
 # ============================================================
 
 @app.get(
@@ -1473,9 +1784,18 @@ async def select_provider(
     provider_type: str,
 ):
 
+    provider_type = provider_type.strip()
+
+    if not provider_type:
+        raise HTTPException(
+            status_code=400,
+            detail="provider_type is required",
+        )
+
     connection = db()
 
     try:
+
         row = connection.execute(
             """
             SELECT *
@@ -1492,6 +1812,7 @@ async def select_provider(
         connection.close()
 
     if not row:
+
         raise HTTPException(
             status_code=404,
             detail={
@@ -1501,12 +1822,14 @@ async def select_provider(
         )
 
     return {
-        "provider": clean_provider(row)
+        "provider": clean_provider(
+            row
+        )
     }
 
 
 # ============================================================
-# Audit logs
+# Audit Logs
 # ============================================================
 
 @app.get("/owner/audit")
@@ -1514,21 +1837,26 @@ async def audit_logs(
     authorization: Optional[str] = Header(
         default=None
     ),
-    limit: int = 100,
+    limit: int = Query(
+        100,
+        ge=1,
+        le=500,
+    ),
 ):
 
     actor = verify_session(
         authorization
     )
 
-    limit = max(
-        1,
-        min(limit, 500),
+    limit = min(
+        limit,
+        MAX_AUDIT_LIMIT,
     )
 
     connection = db()
 
     try:
+
         rows = connection.execute(
             """
             SELECT *
@@ -1570,7 +1898,7 @@ async def audit_logs(
 
 
 # ============================================================
-# Session cleanup
+# Session Cleanup
 # ============================================================
 
 @app.post("/owner/sessions/cleanup")
@@ -1584,15 +1912,18 @@ async def cleanup_sessions(
         authorization
     )
 
-    now = int(time.time())
+    now = int(
+        time.time()
+    )
 
     connection = db()
 
     try:
+
         cursor = connection.execute(
             """
             DELETE FROM provider_sessions
-            WHERE expires_at < ?
+            WHERE expires_at <= ?
                OR revoked = 1
             """,
             (now,),
@@ -1610,7 +1941,7 @@ async def cleanup_sessions(
         None,
         actor,
         {
-            "deleted": deleted
+            "deleted": deleted,
         },
     )
 
@@ -1621,36 +1952,44 @@ async def cleanup_sessions(
 
 
 # ============================================================
-# Internal provider registry snapshot
+# Internal Provider Registry
 # ============================================================
 
-@app.get("/internal/provider-registry")
+@app.get(
+    "/internal/provider-registry"
+)
 async def internal_provider_registry(
     x_arya_internal_secret: Optional[str] = Header(
         default=None
     ),
+    authorization: Optional[str] = Header(
+        default=None
+    ),
 ):
 
-    if INTERNAL_SECRET:
+    supplied_secret = (
+        x_arya_internal_secret
+    )
 
-        if not x_arya_internal_secret:
-            raise HTTPException(
-                status_code=401,
-                detail="Internal authentication required",
-            )
+    if (
+        not supplied_secret
+        and authorization
+        and authorization.lower().startswith(
+            "bearer "
+        )
+    ):
+        supplied_secret = (
+            authorization[7:].strip()
+        )
 
-        if not secrets.compare_digest(
-            x_arya_internal_secret,
-            INTERNAL_SECRET,
-        ):
-            raise HTTPException(
-                status_code=403,
-                detail="Invalid internal secret",
-            )
+    verify_internal_secret(
+        supplied_secret
+    )
 
     connection = db()
 
     try:
+
         rows = connection.execute(
             """
             SELECT *
@@ -1673,7 +2012,7 @@ async def internal_provider_registry(
 
 
 # ============================================================
-# System status
+# Owner Status
 # ============================================================
 
 @app.get("/owner/status")
@@ -1690,6 +2029,7 @@ async def owner_status(
     connection = db()
 
     try:
+
         total = connection.execute(
             """
             SELECT COUNT(*)
@@ -1723,6 +2063,20 @@ async def owner_status(
             (int(time.time()),),
         ).fetchone()[0]
 
+        versions = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM provider_versions
+            """
+        ).fetchone()[0]
+
+        audits = connection.execute(
+            """
+            SELECT COUNT(*)
+            FROM provider_audit_logs
+            """
+        ).fetchone()[0]
+
     finally:
         connection.close()
 
@@ -1733,20 +2087,89 @@ async def owner_status(
         "providers_total": total,
         "providers_enabled": enabled,
         "providers_disabled": disabled,
+        "provider_versions": versions,
+        "audit_events": audits,
         "active_owner_sessions": sessions,
         "status": "operational",
     }
 
 
 # ============================================================
-# Application entry point
+# System Map
+# ============================================================
+
+@app.get("/system-map")
+async def system_map():
+
+    return {
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "port": PORT,
+        "database": DATABASE,
+        "runtime": {
+            "provider_list": (
+                "/runtime/providers"
+            ),
+            "provider_select": (
+                "/runtime/providers/select/{provider_type}"
+            ),
+            "capabilities": (
+                "/runtime/providers/capabilities"
+            ),
+        },
+        "owner": {
+            "login": "/owner/login",
+            "providers": "/owner/providers",
+            "audit": "/owner/audit",
+            "status": "/owner/status",
+        },
+        "internal": {
+            "provider_registry": (
+                "/internal/provider-registry"
+            ),
+        },
+    }
+
+
+# ============================================================
+# Startup
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+
+    logger.info(
+        "%s v%s started on %s:%s",
+        APP_NAME,
+        APP_VERSION,
+        HOST,
+        PORT,
+    )
+
+    logger.info(
+        "OWNER authentication configured: %s",
+        bool(
+            OWNER_EMAIL
+            and OWNER_SECRET
+        ),
+    )
+
+    logger.info(
+        "Internal authentication configured: %s",
+        bool(INTERNAL_SECRET),
+    )
+
+
+# ============================================================
+# Standalone execution
 # ============================================================
 
 if __name__ == "__main__":
+
     import uvicorn
 
     uvicorn.run(
-        "owner_provider_control:app",
+        app,
         host=HOST,
         port=PORT,
         reload=False,
