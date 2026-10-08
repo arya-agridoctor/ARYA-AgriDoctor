@@ -1,16 +1,16 @@
 """
 ARYA AgriDoctor
 Orchestrator Runtime Bridge
-Version: 1.0.0
+Version: 2.0.0
 
 Purpose:
 - Connect ARYA Orchestrator to OWNER Runtime Gateway.
 - Keep orchestrator.py untouched.
 - Route unified ARYA requests through OWNER-controlled runtime.
-- Preserve existing orchestrator request model and action semantics.
-- Provide a stable API for Android / Windows clients.
-- Support agricultural diagnosis, analysis, recommendation,
-  vision, voice, payment, weather, geocoding and data updates.
+- Preserve existing action semantics.
+- Provide stable Android / Windows API routes.
+- Support agriculture, diagnosis, recommendation, vision,
+  voice, payment, weather, geocoding and data updates.
 """
 
 from __future__ import annotations
@@ -32,11 +32,11 @@ from pydantic import BaseModel, Field
 # ============================================================
 
 SERVICE_NAME = "ARYA Orchestrator Runtime Bridge"
-SERVICE_VERSION = "1.0.0"
+SERVICE_VERSION = "2.0.0"
 
 HOST = os.getenv(
     "ARYA_ORCHESTRATOR_BRIDGE_HOST",
-    "0.0.0.0",
+    "127.0.0.1",
 )
 
 PORT = int(
@@ -54,7 +54,7 @@ RUNTIME_GATEWAY_URL = os.getenv(
 INTERNAL_GATEWAY_SECRET = os.getenv(
     "ARYA_INTERNAL_GATEWAY_SECRET",
     "",
-)
+).strip()
 
 DEFAULT_TIMEOUT = float(
     os.getenv(
@@ -66,6 +66,13 @@ DEFAULT_TIMEOUT = float(
 MAX_RESPONSE_BYTES = int(
     os.getenv(
         "ARYA_BRIDGE_MAX_RESPONSE_BYTES",
+        str(20 * 1024 * 1024),
+    )
+)
+
+MAX_REQUEST_BYTES = int(
+    os.getenv(
+        "ARYA_BRIDGE_MAX_REQUEST_BYTES",
         str(20 * 1024 * 1024),
     )
 )
@@ -100,7 +107,7 @@ logger = logging.getLogger(
 app = FastAPI(
     title=SERVICE_NAME,
     description=(
-        "Final runtime bridge between the ARYA "
+        "Runtime bridge between the ARYA "
         "Orchestrator and OWNER Runtime Gateway."
     ),
     version=SERVICE_VERSION,
@@ -117,6 +124,8 @@ class OrchestrationRequest(BaseModel):
         min_length=1,
         max_length=100,
     )
+
+    request_id: Optional[str] = None
 
     user_id: Optional[int] = None
     device_id: Optional[str] = None
@@ -163,7 +172,16 @@ def utc_now() -> str:
     ).isoformat()
 
 
-def create_request_id() -> str:
+def create_request_id(
+    supplied: Optional[str] = None,
+) -> str:
+
+    if supplied:
+        value = supplied.strip()
+
+        if value:
+            return value[:128]
+
     return str(uuid.uuid4())
 
 
@@ -207,6 +225,7 @@ def build_payload(
 
 def internal_headers(
     authorization: Optional[str] = None,
+    request_id: Optional[str] = None,
 ) -> Dict[str, str]:
 
     headers = {
@@ -218,6 +237,9 @@ def internal_headers(
         ),
     }
 
+    if request_id:
+        headers["X-ARYA-Request-ID"] = request_id
+
     if authorization:
         headers["Authorization"] = authorization
 
@@ -226,7 +248,41 @@ def internal_headers(
             f"Bearer {INTERNAL_GATEWAY_SECRET}"
         )
 
+        headers["X-ARYA-Internal-Secret"] = (
+            INTERNAL_GATEWAY_SECRET
+        )
+
     return headers
+
+
+# ============================================================
+# REQUEST SIZE
+# ============================================================
+
+async def validate_request_size(
+    request: Request,
+) -> None:
+
+    content_length = request.headers.get(
+        "content-length"
+    )
+
+    if not content_length:
+        return
+
+    try:
+        size = int(content_length)
+    except ValueError:
+        return
+
+    if size > MAX_REQUEST_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "Request exceeds configured "
+                "maximum size"
+            ),
+        )
 
 
 # ============================================================
@@ -235,11 +291,9 @@ def internal_headers(
 
 class RuntimeGatewayClient:
     """
-    Client for owner_runtime_gateway.py.
+    OWNER Runtime Gateway remains the routing authority.
 
-    The bridge never keeps a local copy of service
-    configuration. OWNER Runtime Gateway remains
-    the single runtime routing authority.
+    This bridge does not duplicate service configuration.
     """
 
     def __init__(
@@ -255,18 +309,20 @@ class RuntimeGatewayClient:
         payload: Optional[Dict[str, Any]] = None,
         query: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
+        request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
 
         method = method.upper()
 
         url = (
-            self.base_url.rstrip("/")
+            self.base_url
             + "/"
             + path.lstrip("/")
         )
 
         headers = internal_headers(
-            authorization
+            authorization=authorization,
+            request_id=request_id,
         )
 
         try:
@@ -274,15 +330,19 @@ class RuntimeGatewayClient:
             async with httpx.AsyncClient(
                 timeout=DEFAULT_TIMEOUT,
                 follow_redirects=False,
-                max_redirects=0,
             ) as client:
 
                 response = await client.request(
                     method=method,
                     url=url,
-                    json=payload
-                    if method != "GET"
-                    else None,
+                    json=(
+                        payload
+                        if method not in {
+                            "GET",
+                            "HEAD",
+                        }
+                        else None
+                    ),
                     params=query,
                     headers=headers,
                 )
@@ -292,9 +352,7 @@ class RuntimeGatewayClient:
                 )
 
                 if content_length:
-
                     try:
-
                         if (
                             int(content_length)
                             > MAX_RESPONSE_BYTES
@@ -302,11 +360,11 @@ class RuntimeGatewayClient:
                             raise HTTPException(
                                 status_code=502,
                                 detail=(
-                                    "Runtime Gateway response "
-                                    "exceeds configured limit"
+                                    "Runtime Gateway "
+                                    "response exceeds "
+                                    "configured limit"
                                 ),
                             )
-
                     except ValueError:
                         pass
 
@@ -330,7 +388,6 @@ class RuntimeGatewayClient:
 
                     try:
                         result = response.json()
-
                     except Exception:
                         result = {
                             "raw": content.decode(
@@ -338,6 +395,10 @@ class RuntimeGatewayClient:
                                 errors="replace",
                             )
                         }
+
+                elif not content:
+
+                    result = {}
 
                 else:
 
@@ -365,17 +426,48 @@ class RuntimeGatewayClient:
         except HTTPException:
             raise
 
-        except Exception as exc:
+        except (
+            httpx.TimeoutException,
+        ) as exc:
 
-            logger.exception(
-                "Runtime Gateway request failed: %s",
+            logger.error(
+                "Runtime Gateway timeout: %s",
+                url,
+            )
+
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "Runtime Gateway timeout"
+                ),
+            ) from exc
+
+        except (
+            httpx.RequestError,
+        ) as exc:
+
+            logger.error(
+                "Runtime Gateway unavailable: %s",
                 url,
             )
 
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    "Runtime Gateway unavailable: "
+                    "Runtime Gateway unavailable"
+                ),
+            ) from exc
+
+        except Exception as exc:
+
+            logger.exception(
+                "Runtime Gateway request failed"
+            )
+
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "Runtime Gateway request failed: "
                     f"{str(exc)}"
                 ),
             ) from exc
@@ -387,15 +479,18 @@ runtime_gateway = RuntimeGatewayClient(
 
 
 # ============================================================
-# SERVICE ROUTING
+# ACTION ROUTING
 # ============================================================
 
 AGRI_ACTIONS = {
     "agri",
     "agriculture",
     "analyze",
+    "analysis",
     "diagnose",
+    "diagnosis",
     "recommend",
+    "recommendation",
     "crop_suitability",
     "soil",
     "water",
@@ -443,7 +538,9 @@ def detect_action_route(
     action: str,
 ) -> str:
 
-    action = normalize_action(action)
+    action = normalize_action(
+        action
+    )
 
     if action in DOCTOR_ACTIONS:
         return "doctor"
@@ -466,29 +563,38 @@ def detect_action_route(
             "error": "unsupported_action",
             "action": action,
             "message": (
-                "No supported ARYA runtime route "
-                "exists for this action."
+                "No supported ARYA runtime "
+                "route exists for this action."
             ),
         },
     )
 
 
 # ============================================================
-# SPECIALIZED RUNTIME CALLS
+# SPECIALIZED CALLS
 # ============================================================
 
 async def call_agri_engine(
     action: str,
     payload: Dict[str, Any],
     authorization: Optional[str],
+    request_id: Optional[str],
 ) -> Dict[str, Any]:
 
-    normalized = normalize_action(action)
+    normalized = normalize_action(
+        action
+    )
 
-    if normalized == "diagnose":
+    if normalized in {
+        "diagnose",
+        "diagnosis",
+    }:
         gateway_path = "/arya/diagnose"
 
-    elif normalized == "recommend":
+    elif normalized in {
+        "recommend",
+        "recommendation",
+    }:
         gateway_path = "/arya/recommend"
 
     else:
@@ -499,12 +605,14 @@ async def call_agri_engine(
         method="POST",
         payload=payload,
         authorization=authorization,
+        request_id=request_id,
     )
 
 
 async def call_vision(
     payload: Dict[str, Any],
     authorization: Optional[str],
+    request_id: Optional[str],
 ) -> Dict[str, Any]:
 
     return await runtime_gateway.request(
@@ -512,12 +620,14 @@ async def call_vision(
         method="POST",
         payload=payload,
         authorization=authorization,
+        request_id=request_id,
     )
 
 
 async def call_payment(
     payload: Dict[str, Any],
     authorization: Optional[str],
+    request_id: Optional[str],
 ) -> Dict[str, Any]:
 
     return await runtime_gateway.request(
@@ -525,18 +635,18 @@ async def call_payment(
         method="POST",
         payload=payload,
         authorization=authorization,
+        request_id=request_id,
     )
 
 
 async def call_voice(
     payload: Dict[str, Any],
     authorization: Optional[str],
+    request_id: Optional[str],
 ) -> Dict[str, Any]:
 
-    # voice_language is not currently exposed by
-    # owner_runtime_gateway.py as a specialized shortcut.
-    # Therefore use the generic runtime service route.
-
+    # OWNER Runtime Gateway currently exposes the
+    # generic runtime compatibility route for voice.
     return await runtime_gateway.request(
         path="/runtime/call",
         method="POST",
@@ -545,18 +655,21 @@ async def call_voice(
             "path": "/voice/process",
             "method": "POST",
             "payload": payload,
+            "request_id": request_id,
         },
         authorization=authorization,
+        request_id=request_id,
     )
 
 
 # ============================================================
-# AGRICULTURAL DOCTOR FLOW
+# DOCTOR FLOW
 # ============================================================
 
 async def execute_doctor_flow(
     payload: Dict[str, Any],
     authorization: Optional[str],
+    request_id: str,
 ) -> Dict[str, Any]:
 
     results: Dict[str, Any] = {}
@@ -570,6 +683,7 @@ async def execute_doctor_flow(
         vision_result = await call_vision(
             payload=payload,
             authorization=authorization,
+            request_id=request_id,
         )
 
         results["vision"] = vision_result
@@ -594,6 +708,7 @@ async def execute_doctor_flow(
         voice_result = await call_voice(
             payload=payload,
             authorization=authorization,
+            request_id=request_id,
         )
 
         results["voice_language"] = (
@@ -612,37 +727,26 @@ async def execute_doctor_flow(
             )
 
     # --------------------------------------------------------
-    # Agricultural reasoning
+    # Agricultural analysis
     # --------------------------------------------------------
 
     agri_result = await call_agri_engine(
         action="analyze",
         payload=payload,
         authorization=authorization,
+        request_id=request_id,
     )
 
     results["agri_engine"] = agri_result
 
-    success = any(
-        isinstance(value, dict)
-        and (
-            value.get("success") is True
-            or value.get("status_code") in range(
-                200,
-                300,
-            )
-        )
-        for value in results.values()
-    )
-
     return {
-        "success": success,
+        "success": True,
         "results": results,
     }
 
 
 # ============================================================
-# GENERAL ORCHESTRATION
+# GENERAL EXECUTION
 # ============================================================
 
 async def execute_request(
@@ -652,7 +756,9 @@ async def execute_request(
 
     started = time.perf_counter()
 
-    request_id = create_request_id()
+    request_id = create_request_id(
+        request.request_id
+    )
 
     action = normalize_action(
         request.action
@@ -669,53 +775,37 @@ async def execute_request(
 
     try:
 
-        # ----------------------------------------------------
-        # AGRICULTURAL DOCTOR
-        # ----------------------------------------------------
-
         if route == "doctor":
 
             result = await execute_doctor_flow(
                 payload=payload,
                 authorization=authorization,
+                request_id=request_id,
             )
-
-        # ----------------------------------------------------
-        # VISION
-        # ----------------------------------------------------
 
         elif route == "vision":
 
             result = await call_vision(
                 payload=payload,
                 authorization=authorization,
+                request_id=request_id,
             )
-
-        # ----------------------------------------------------
-        # VOICE
-        # ----------------------------------------------------
 
         elif route == "voice":
 
             result = await call_voice(
                 payload=payload,
                 authorization=authorization,
+                request_id=request_id,
             )
-
-        # ----------------------------------------------------
-        # PAYMENT
-        # ----------------------------------------------------
 
         elif route == "payment":
 
             result = await call_payment(
                 payload=payload,
                 authorization=authorization,
+                request_id=request_id,
             )
-
-        # ----------------------------------------------------
-        # AGRICULTURAL ENGINE
-        # ----------------------------------------------------
 
         elif route == "agri":
 
@@ -723,13 +813,16 @@ async def execute_request(
                 action=action,
                 payload=payload,
                 authorization=authorization,
+                request_id=request_id,
             )
 
         else:
 
             raise HTTPException(
                 status_code=400,
-                detail="Unsupported runtime route",
+                detail=(
+                    "Unsupported runtime route"
+                ),
             )
 
         elapsed = (
@@ -750,8 +843,27 @@ async def execute_request(
             result=result,
         )
 
-    except HTTPException:
-        raise
+    except HTTPException as exc:
+
+        elapsed = (
+            time.perf_counter()
+            - started
+        ) * 1000
+
+        detail = exc.detail
+
+        return RuntimeResponse(
+            success=False,
+            request_id=request_id,
+            action=action,
+            timestamp=utc_now(),
+            elapsed_ms=round(
+                elapsed,
+                2,
+            ),
+            gateway=RUNTIME_GATEWAY_URL,
+            error=str(detail),
+        )
 
     except Exception as exc:
 
@@ -790,6 +902,7 @@ async def root() -> Dict[str, Any]:
         "version": SERVICE_VERSION,
         "status": "online",
         "runtime_gateway": RUNTIME_GATEWAY_URL,
+        "port": PORT,
         "timestamp": utc_now(),
     }
 
@@ -870,9 +983,45 @@ async def system_map(
         "bridge": {
             "name": SERVICE_NAME,
             "version": SERVICE_VERSION,
+            "port": PORT,
         },
         "runtime_gateway": RUNTIME_GATEWAY_URL,
         "system": result,
+        "timestamp": utc_now(),
+    }
+
+
+# ============================================================
+# DISCOVERY / CONTRACT
+# ============================================================
+
+@app.get("/contract")
+async def contract() -> Dict[str, Any]:
+
+    return {
+        "service": SERVICE_NAME,
+        "version": SERVICE_VERSION,
+        "port": PORT,
+        "runtime_gateway": RUNTIME_GATEWAY_URL,
+        "routes": {
+            "orchestrate": "POST /orchestrate",
+            "doctor": "POST /arya/doctor",
+            "analyze": "POST /arya/analyze",
+            "diagnose": "POST /arya/diagnose",
+            "recommend": "POST /arya/recommend",
+            "vision": "POST /arya/vision",
+            "voice": "POST /arya/voice",
+            "payment": "POST /arya/payment",
+            "weather": "GET /arya/weather",
+            "geocode": "GET /arya/geocode",
+            "updates": "GET /arya/updates",
+            "updates_run": "POST /arya/updates/run",
+            "health": "GET /health",
+            "system_map": "GET /system-map",
+        },
+        "main_py": {
+            "modified": False,
+        },
         "timestamp": utc_now(),
     }
 
@@ -884,10 +1033,15 @@ async def system_map(
 @app.post("/orchestrate")
 async def orchestrate_endpoint(
     request: OrchestrationRequest,
+    raw_request: Request,
     authorization: Optional[str] = Header(
         default=None
     ),
 ) -> RuntimeResponse:
+
+    await validate_request_size(
+        raw_request
+    )
 
     return await execute_request(
         request=request,
@@ -902,10 +1056,15 @@ async def orchestrate_endpoint(
 @app.post("/arya/doctor")
 async def arya_doctor(
     request: OrchestrationRequest,
+    raw_request: Request,
     authorization: Optional[str] = Header(
         default=None
     ),
 ) -> RuntimeResponse:
+
+    await validate_request_size(
+        raw_request
+    )
 
     request.action = "agri_doctor"
 
@@ -922,10 +1081,15 @@ async def arya_doctor(
 @app.post("/arya/analyze")
 async def arya_analyze(
     request: OrchestrationRequest,
+    raw_request: Request,
     authorization: Optional[str] = Header(
         default=None
     ),
 ) -> RuntimeResponse:
+
+    await validate_request_size(
+        raw_request
+    )
 
     request.action = "analyze"
 
@@ -942,10 +1106,15 @@ async def arya_analyze(
 @app.post("/arya/diagnose")
 async def arya_diagnose(
     request: OrchestrationRequest,
+    raw_request: Request,
     authorization: Optional[str] = Header(
         default=None
     ),
 ) -> RuntimeResponse:
+
+    await validate_request_size(
+        raw_request
+    )
 
     request.action = "diagnose"
 
@@ -962,10 +1131,15 @@ async def arya_diagnose(
 @app.post("/arya/recommend")
 async def arya_recommend(
     request: OrchestrationRequest,
+    raw_request: Request,
     authorization: Optional[str] = Header(
         default=None
     ),
 ) -> RuntimeResponse:
+
+    await validate_request_size(
+        raw_request
+    )
 
     request.action = "recommend"
 
@@ -982,10 +1156,15 @@ async def arya_recommend(
 @app.post("/arya/vision")
 async def arya_vision(
     request: OrchestrationRequest,
+    raw_request: Request,
     authorization: Optional[str] = Header(
         default=None
     ),
 ) -> RuntimeResponse:
+
+    await validate_request_size(
+        raw_request
+    )
 
     request.action = "vision"
 
@@ -1002,10 +1181,15 @@ async def arya_vision(
 @app.post("/arya/voice")
 async def arya_voice(
     request: OrchestrationRequest,
+    raw_request: Request,
     authorization: Optional[str] = Header(
         default=None
     ),
 ) -> RuntimeResponse:
+
+    await validate_request_size(
+        raw_request
+    )
 
     request.action = "voice"
 
@@ -1022,10 +1206,15 @@ async def arya_voice(
 @app.post("/arya/payment")
 async def arya_payment(
     request: OrchestrationRequest,
+    raw_request: Request,
     authorization: Optional[str] = Header(
         default=None
     ),
 ) -> RuntimeResponse:
+
+    await validate_request_size(
+        raw_request
+    )
 
     request.action = "payment"
 
