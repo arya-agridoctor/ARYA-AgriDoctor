@@ -1,10 +1,11 @@
 """
 ARYA AgriDoctor
-Runtime Data & Provider Bridge v1.0.0
+Runtime Data & Provider Bridge
+Version: 2.0.0
 
 Purpose:
 - Connect Data Update Manager and External Providers to Runtime Gateway.
-- Keep existing modules unchanged.
+- Keep existing core services untouched.
 - Provide one runtime-facing interface for:
   * Weather
   * Geocoding
@@ -15,8 +16,9 @@ Purpose:
   * Update status
   * Provider health
   * System map
+  * Runtime discovery
 
-No modification is made to:
+Core services are NOT modified by this bridge:
 - backend/main.py
 - data_update.py
 - external_providers.py
@@ -26,6 +28,7 @@ No modification is made to:
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 import uuid
@@ -41,7 +44,7 @@ from pydantic import BaseModel, Field
 # ============================================================
 
 APP_NAME = "ARYA Runtime Data Provider Bridge"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 
 HOST = os.getenv(
     "ARYA_DATA_PROVIDER_BRIDGE_HOST",
@@ -60,6 +63,14 @@ RUNTIME_GATEWAY_URL = os.getenv(
     "http://127.0.0.1:8016",
 ).rstrip("/")
 
+INTERNAL_SECRET = os.getenv(
+    "ARYA_INTERNAL_GATEWAY_SECRET",
+    os.getenv(
+        "ARYA_BRIDGE_INTERNAL_SECRET",
+        "",
+    ),
+).strip()
+
 TIMEOUT = float(
     os.getenv(
         "ARYA_DATA_PROVIDER_BRIDGE_TIMEOUT",
@@ -67,16 +78,40 @@ TIMEOUT = float(
     )
 )
 
-MAX_RESPONSE_BYTES = int(
+MAX_REQUEST_BYTES = int(
     os.getenv(
-        "ARYA_DATA_PROVIDER_BRIDGE_MAX_RESPONSE_BYTES",
+        "ARYA_DATA_PROVIDER_BRIDGE_MAX_REQUEST_BYTES",
         str(10 * 1024 * 1024),
     )
 )
 
-INTERNAL_SECRET = os.getenv(
-    "ARYA_BRIDGE_INTERNAL_SECRET",
-    "",
+MAX_RESPONSE_BYTES = int(
+    os.getenv(
+        "ARYA_DATA_PROVIDER_BRIDGE_MAX_RESPONSE_BYTES",
+        str(20 * 1024 * 1024),
+    )
+)
+
+LOG_LEVEL = os.getenv(
+    "ARYA_DATA_PROVIDER_BRIDGE_LOG_LEVEL",
+    "INFO",
+).upper()
+
+
+logging.basicConfig(
+    level=getattr(
+        logging,
+        LOG_LEVEL,
+        logging.INFO,
+    ),
+    format=(
+        "%(asctime)s | %(levelname)s | "
+        "%(name)s | %(message)s"
+    ),
+)
+
+logger = logging.getLogger(
+    "arya.runtime_data_provider_bridge"
 )
 
 
@@ -88,8 +123,8 @@ app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description=(
-        "Runtime bridge for ARYA Data Update and "
-        "External Provider services."
+        "Runtime bridge for ARYA Data Update "
+        "and External Provider services."
     ),
 )
 
@@ -123,6 +158,9 @@ class SourceRequest(BaseModel):
         min_length=1,
         max_length=200,
     )
+    payload: Dict[str, Any] = Field(
+        default_factory=dict
+    )
     request_id: Optional[str] = None
 
 
@@ -133,30 +171,80 @@ class SourceRequest(BaseModel):
 def make_request_id(
     value: Optional[str] = None,
 ) -> str:
+
     if value:
-        return value[:200]
+        value = value.strip()
+
+        if value:
+            return value[:128]
 
     return str(uuid.uuid4())
 
 
 # ============================================================
-# Gateway headers
+# Headers
 # ============================================================
 
 def build_headers(
     request_id: str,
+    incoming_authorization: Optional[str] = None,
 ) -> Dict[str, str]:
 
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
         "X-ARYA-Request-ID": request_id,
+        "User-Agent": (
+            "ARYA-Runtime-Data-Provider-Bridge/"
+            f"{APP_VERSION}"
+        ),
     }
 
-    if INTERNAL_SECRET:
-        headers["X-ARYA-Internal-Secret"] = INTERNAL_SECRET
+    if incoming_authorization:
+        headers["Authorization"] = (
+            incoming_authorization
+        )
+
+    elif INTERNAL_SECRET:
+        headers["Authorization"] = (
+            f"Bearer {INTERNAL_SECRET}"
+        )
+
+        headers["X-ARYA-Internal-Secret"] = (
+            INTERNAL_SECRET
+        )
 
     return headers
+
+
+# ============================================================
+# Request size
+# ============================================================
+
+async def validate_request_size(
+    request: Request,
+) -> None:
+
+    content_length = request.headers.get(
+        "content-length"
+    )
+
+    if not content_length:
+        return
+
+    try:
+        size = int(content_length)
+    except ValueError:
+        return
+
+    if size > MAX_REQUEST_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={
+                "error": "request_too_large",
+                "max_bytes": MAX_REQUEST_BYTES,
+            },
+        )
 
 
 # ============================================================
@@ -170,37 +258,62 @@ async def call_gateway(
     request_id: str,
     method: str = "POST",
     params: Optional[Dict[str, Any]] = None,
+    authorization: Optional[str] = None,
 ) -> Any:
 
     if not path.startswith("/"):
         path = "/" + path
 
-    url = f"{RUNTIME_GATEWAY_URL}{path}"
+    method = method.upper()
 
-    headers = build_headers(request_id)
+    url = (
+        f"{RUNTIME_GATEWAY_URL}{path}"
+    )
+
+    headers = build_headers(
+        request_id=request_id,
+        incoming_authorization=authorization,
+    )
 
     started = time.monotonic()
 
     try:
+
         async with httpx.AsyncClient(
             timeout=TIMEOUT,
             follow_redirects=False,
         ) as client:
 
-            if method.upper() == "GET":
-                response = await client.get(
+            if method in {
+                "GET",
+                "HEAD",
+                "DELETE",
+            }:
+
+                response = await client.request(
+                    method,
                     url,
                     headers=headers,
                     params=params,
                 )
+
             else:
-                response = await client.post(
+
+                response = await client.request(
+                    method,
                     url,
                     headers=headers,
+                    params=params,
                     json=payload or {},
                 )
 
     except httpx.TimeoutException as exc:
+
+        logger.error(
+            "Runtime Gateway timeout: %s",
+            url,
+        )
+
         raise HTTPException(
             status_code=504,
             detail={
@@ -208,9 +321,15 @@ async def call_gateway(
                 "message": str(exc),
                 "request_id": request_id,
             },
-        )
+        ) from exc
 
     except httpx.RequestError as exc:
+
+        logger.error(
+            "Runtime Gateway unreachable: %s",
+            url,
+        )
+
         raise HTTPException(
             status_code=502,
             detail={
@@ -219,12 +338,35 @@ async def call_gateway(
                 "gateway": RUNTIME_GATEWAY_URL,
                 "request_id": request_id,
             },
-        )
+        ) from exc
 
     elapsed = round(
         time.monotonic() - started,
         4,
     )
+
+    content_length = response.headers.get(
+        "content-length"
+    )
+
+    if content_length:
+
+        try:
+
+            if (
+                int(content_length)
+                > MAX_RESPONSE_BYTES
+            ):
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "response_too_large",
+                        "request_id": request_id,
+                    },
+                )
+
+        except ValueError:
+            pass
 
     if len(response.content) > MAX_RESPONSE_BYTES:
         raise HTTPException(
@@ -235,19 +377,45 @@ async def call_gateway(
             },
         )
 
-    try:
-        data = response.json()
-    except Exception:
+    content_type = response.headers.get(
+        "content-type",
+        "",
+    ).lower()
+
+    if not response.content:
+
+        data: Any = {}
+
+    elif "json" in content_type:
+
+        try:
+            data = response.json()
+        except Exception:
+            data = {
+                "raw": response.text[:10000],
+            }
+
+    else:
+
         data = {
             "raw": response.text[:10000],
         }
 
     if response.status_code >= 400:
+
+        logger.warning(
+            "Runtime Gateway returned %s for %s",
+            response.status_code,
+            path,
+        )
+
         raise HTTPException(
             status_code=response.status_code,
             detail={
                 "error": "runtime_gateway_error",
-                "gateway_status": response.status_code,
+                "gateway_status": (
+                    response.status_code
+                ),
                 "response": data,
                 "request_id": request_id,
                 "elapsed_seconds": elapsed,
@@ -266,14 +434,25 @@ async def request_middleware(
     request: Request,
     call_next,
 ):
+
     request_id = (
-        request.headers.get("X-ARYA-Request-ID")
+        request.headers.get(
+            "X-ARYA-Request-ID"
+        )
         or str(uuid.uuid4())
+    )
+
+    request.state.arya_request_id = request_id
+
+    await validate_request_size(
+        request
     )
 
     started = time.monotonic()
 
-    response = await call_next(request)
+    response = await call_next(
+        request
+    )
 
     elapsed = round(
         time.monotonic() - started,
@@ -292,19 +471,37 @@ async def request_middleware(
 
 
 # ============================================================
-# Root / Health
+# Root
 # ============================================================
 
 @app.get("/")
 async def root():
+
     return {
         "service": APP_NAME,
         "version": APP_VERSION,
         "status": "running",
         "runtime_gateway": RUNTIME_GATEWAY_URL,
         "port": PORT,
+        "capabilities": [
+            "weather",
+            "geocode",
+            "satellite",
+            "provider",
+            "provider_health",
+            "providers_health",
+            "sources",
+            "source_fetch",
+            "updates",
+            "data_update",
+            "system_map",
+        ],
     }
 
+
+# ============================================================
+# Health
+# ============================================================
 
 @app.get("/health")
 async def health():
@@ -312,6 +509,7 @@ async def health():
     request_id = str(uuid.uuid4())
 
     try:
+
         data = await call_gateway(
             "/health",
             request_id=request_id,
@@ -320,6 +518,7 @@ async def health():
 
         return {
             "service": APP_NAME,
+            "version": APP_VERSION,
             "status": "healthy",
             "runtime_gateway": "reachable",
             "gateway": data,
@@ -330,6 +529,7 @@ async def health():
 
         return {
             "service": APP_NAME,
+            "version": APP_VERSION,
             "status": "degraded",
             "runtime_gateway": "unreachable",
             "error": exc.detail,
@@ -341,8 +541,29 @@ async def health():
 # Weather
 # ============================================================
 
+@app.get("/weather")
+async def weather_get(
+    latitude: float,
+    longitude: float,
+    authorization: Optional[str] = None,
+):
+
+    request_id = str(uuid.uuid4())
+
+    return await call_gateway(
+        "/arya/weather",
+        method="GET",
+        params={
+            "latitude": latitude,
+            "longitude": longitude,
+        },
+        request_id=request_id,
+        authorization=authorization,
+    )
+
+
 @app.post("/weather")
-async def weather(
+async def weather_post(
     request: PayloadRequest,
 ):
 
@@ -350,8 +571,39 @@ async def weather(
         request.request_id
     )
 
+    payload = dict(
+        request.payload
+    )
+
+    latitude = payload.pop(
+        "latitude",
+        None,
+    )
+
+    longitude = payload.pop(
+        "longitude",
+        None,
+    )
+
+    if (
+        latitude is not None
+        and longitude is not None
+    ):
+
+        return await call_gateway(
+            "/arya/weather",
+            method="GET",
+            params={
+                "latitude": latitude,
+                "longitude": longitude,
+                **payload,
+            },
+            request_id=request_id,
+        )
+
     return await call_gateway(
         "/arya/weather",
+        method="POST",
         payload=request.payload,
         request_id=request_id,
     )
@@ -361,8 +613,25 @@ async def weather(
 # Geocoding
 # ============================================================
 
+@app.get("/geocode")
+async def geocode_get(
+    name: str,
+):
+
+    request_id = str(uuid.uuid4())
+
+    return await call_gateway(
+        "/arya/geocode",
+        method="GET",
+        params={
+            "name": name,
+        },
+        request_id=request_id,
+    )
+
+
 @app.post("/geocode")
-async def geocode(
+async def geocode_post(
     request: PayloadRequest,
 ):
 
@@ -370,8 +639,30 @@ async def geocode(
         request.request_id
     )
 
+    payload = dict(
+        request.payload
+    )
+
+    name = payload.pop(
+        "name",
+        None,
+    )
+
+    if name is not None:
+
+        return await call_gateway(
+            "/arya/geocode",
+            method="GET",
+            params={
+                "name": name,
+                **payload,
+            },
+            request_id=request_id,
+        )
+
     return await call_gateway(
         "/arya/geocode",
+        method="POST",
         payload=request.payload,
         request_id=request_id,
     )
@@ -398,7 +689,7 @@ async def satellite(
 
 
 # ============================================================
-# Generic external provider
+# Generic provider
 # ============================================================
 
 @app.post("/provider")
@@ -413,6 +704,7 @@ async def provider(
     payload = {
         "provider_id": request.provider_id,
         "payload": request.payload,
+        "request_id": request_id,
     }
 
     return await call_gateway(
@@ -457,8 +749,8 @@ async def providers_health():
 
     return await call_gateway(
         "/arya/providers/health",
-        request_id=request_id,
         method="GET",
+        request_id=request_id,
     )
 
 
@@ -473,8 +765,8 @@ async def providers():
 
     return await call_gateway(
         "/arya/providers",
-        request_id=request_id,
         method="GET",
+        request_id=request_id,
     )
 
 
@@ -489,8 +781,8 @@ async def sources():
 
     return await call_gateway(
         "/arya/sources",
-        request_id=request_id,
         method="GET",
+        request_id=request_id,
     )
 
 
@@ -509,6 +801,7 @@ async def source_fetch(
 
     payload = {
         "source_id": request.source_id,
+        "payload": request.payload,
     }
 
     return await call_gateway(
@@ -529,9 +822,8 @@ async def updates_status():
 
     return await call_gateway(
         "/arya/updates",
-        payload={},
-        request_id=request_id,
         method="GET",
+        request_id=request_id,
     )
 
 
@@ -550,6 +842,7 @@ async def updates_run(
 
     return await call_gateway(
         "/arya/updates/run",
+        method="POST",
         payload=request.payload,
         request_id=request_id,
     )
@@ -570,6 +863,7 @@ async def data_update(
 
     return await call_gateway(
         "/arya/data/update",
+        method="POST",
         payload=request.payload,
         request_id=request_id,
     )
@@ -586,8 +880,8 @@ async def data_status():
 
     return await call_gateway(
         "/arya/data/status",
-        request_id=request_id,
         method="GET",
+        request_id=request_id,
     )
 
 
@@ -606,13 +900,14 @@ async def unified_data_request(
 
     return await call_gateway(
         "/arya/data/request",
+        method="POST",
         payload=request.payload,
         request_id=request_id,
     )
 
 
 # ============================================================
-# Runtime system map
+# System map
 # ============================================================
 
 @app.get("/system-map")
@@ -622,20 +917,94 @@ async def system_map():
 
     return await call_gateway(
         "/arya/system-map",
-        request_id=request_id,
         method="GET",
+        request_id=request_id,
     )
 
 
 # ============================================================
-# Application entry point
+# Contract
+# ============================================================
+
+@app.get("/contract")
+async def contract():
+
+    return {
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "port": PORT,
+        "runtime_gateway": RUNTIME_GATEWAY_URL,
+        "routes": {
+            "weather_get": "GET /weather",
+            "weather_post": "POST /weather",
+            "geocode_get": "GET /geocode",
+            "geocode_post": "POST /geocode",
+            "satellite": "POST /satellite",
+            "provider": "POST /provider",
+            "provider_health": (
+                "POST /provider/health"
+            ),
+            "providers_health": (
+                "GET /providers/health"
+            ),
+            "providers": "GET /providers",
+            "sources": "GET /sources",
+            "source_fetch": (
+                "POST /sources/fetch"
+            ),
+            "updates_status": (
+                "GET /updates/status"
+            ),
+            "updates_run": (
+                "POST /updates/run"
+            ),
+            "data_update": (
+                "POST /data/update"
+            ),
+            "data_status": (
+                "GET /data/status"
+            ),
+            "data_request": (
+                "POST /data/request"
+            ),
+            "system_map": (
+                "GET /system-map"
+            ),
+            "health": "GET /health",
+        },
+        "core_files_modified": False,
+    }
+
+
+# ============================================================
+# Startup
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event():
+
+    logger.info(
+        "%s v%s started",
+        APP_NAME,
+        APP_VERSION,
+    )
+
+    logger.info(
+        "Runtime Gateway: %s",
+        RUNTIME_GATEWAY_URL,
+    )
+
+
+# ============================================================
+# Standalone execution
 # ============================================================
 
 if __name__ == "__main__":
+
     import uvicorn
 
     uvicorn.run(
-        "runtime_data_provider_bridge:app",
+        app,
         host=HOST,
         port=PORT,
         reload=False,
