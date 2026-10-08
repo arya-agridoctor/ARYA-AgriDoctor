@@ -1,23 +1,27 @@
 """
 ARYA AgriDoctor
 Client API Gateway
-Version: 1.0.0
+Version: 2.0.0
 
 Purpose:
-- Unified API for Android and Windows clients
-- Client authentication and sessions
-- Device registration
+- Unified API boundary for Android and Windows clients
+- Secure client authentication and sessions
+- Device registration and control
 - Runtime Gateway communication
+- Agricultural doctor / vision / voice / weather / geocode / payment APIs
 - Rate limiting
-- Request audit
-- Secure client-facing API boundary
-- No modification of existing ARYA files required
+- Request auditing
+- OWNER controls
+- Request ID propagation
+- Internal gateway authentication
+- Compatibility routes for Unified API
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import secrets
@@ -27,6 +31,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
@@ -38,7 +43,13 @@ from pydantic import BaseModel, Field
 # ============================================================
 
 APP_NAME = "ARYA Client API Gateway"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
+
+BASE_DIR = os.path.dirname(
+    os.path.dirname(
+        os.path.abspath(__file__)
+    )
+)
 
 HOST = os.getenv(
     "ARYA_CLIENT_GATEWAY_HOST",
@@ -54,7 +65,10 @@ PORT = int(
 
 DB_PATH = os.getenv(
     "ARYA_CLIENT_GATEWAY_DB",
-    "client_api_gateway.db",
+    os.path.join(
+        BASE_DIR,
+        "client_api_gateway.db",
+    ),
 )
 
 RUNTIME_GATEWAY_URL = os.getenv(
@@ -72,39 +86,74 @@ INTERNAL_GATEWAY_SECRET = os.getenv(
     "",
 )
 
-SESSION_TTL = int(
-    os.getenv(
-        "ARYA_CLIENT_SESSION_TTL",
-        "86400",
-    )
+SESSION_TTL = max(
+    300,
+    int(
+        os.getenv(
+            "ARYA_CLIENT_SESSION_TTL",
+            "86400",
+        )
+    ),
 )
 
-REQUEST_TIMEOUT = float(
-    os.getenv(
-        "ARYA_CLIENT_GATEWAY_TIMEOUT",
-        "60",
-    )
+REQUEST_TIMEOUT = max(
+    5.0,
+    float(
+        os.getenv(
+            "ARYA_CLIENT_GATEWAY_TIMEOUT",
+            "60",
+        )
+    ),
 )
 
-MAX_RESPONSE_BYTES = int(
-    os.getenv(
-        "ARYA_CLIENT_GATEWAY_MAX_RESPONSE_BYTES",
-        str(8 * 1024 * 1024),
-    )
+MAX_RESPONSE_BYTES = max(
+    1024,
+    int(
+        os.getenv(
+            "ARYA_CLIENT_GATEWAY_MAX_RESPONSE_BYTES",
+            str(8 * 1024 * 1024),
+        )
+    ),
 )
 
-RATE_LIMIT_WINDOW = int(
-    os.getenv(
-        "ARYA_CLIENT_RATE_WINDOW",
-        "60",
-    )
+MAX_REQUEST_BYTES = max(
+    1024,
+    int(
+        os.getenv(
+            "ARYA_CLIENT_GATEWAY_MAX_REQUEST_BYTES",
+            str(8 * 1024 * 1024),
+        )
+    ),
 )
 
-RATE_LIMIT_MAX_REQUESTS = int(
-    os.getenv(
-        "ARYA_CLIENT_RATE_LIMIT",
-        "60",
-    )
+RATE_LIMIT_WINDOW = max(
+    1,
+    int(
+        os.getenv(
+            "ARYA_CLIENT_RATE_WINDOW",
+            "60",
+        )
+    ),
+)
+
+RATE_LIMIT_MAX_REQUESTS = max(
+    1,
+    int(
+        os.getenv(
+            "ARYA_CLIENT_RATE_LIMIT",
+            "60",
+        )
+    ),
+)
+
+MAX_DEVICES_PER_CLIENT = max(
+    1,
+    int(
+        os.getenv(
+            "ARYA_MAX_DEVICES_PER_CLIENT",
+            "3",
+        )
+    ),
 )
 
 
@@ -116,8 +165,8 @@ app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description=(
-        "Unified client API gateway for ARYA "
-        "Android and Windows applications."
+        "Secure unified client API gateway for "
+        "ARYA AgriDoctor Android and Windows clients."
     ),
 )
 
@@ -137,16 +186,31 @@ def db():
     conn.row_factory = sqlite3.Row
 
     try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
+
         yield conn
+
         conn.commit()
+
     except Exception:
         conn.rollback()
         raise
+
     finally:
         conn.close()
 
 
 def init_database():
+    parent = os.path.dirname(DB_PATH)
+
+    if parent:
+        os.makedirs(
+            parent,
+            exist_ok=True,
+        )
+
     with db() as conn:
         conn.executescript(
             """
@@ -170,7 +234,9 @@ def init_database():
                 enabled INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL,
                 last_seen_at TEXT,
-                metadata_json TEXT NOT NULL DEFAULT '{}'
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                FOREIGN KEY(client_id)
+                    REFERENCES clients(client_id)
             );
 
             CREATE TABLE IF NOT EXISTS sessions (
@@ -180,7 +246,11 @@ def init_database():
                 token_hash TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 expires_at INTEGER NOT NULL,
-                revoked INTEGER NOT NULL DEFAULT 0
+                revoked INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY(client_id)
+                    REFERENCES clients(client_id),
+                FOREIGN KEY(device_id)
+                    REFERENCES devices(device_id)
             );
 
             CREATE TABLE IF NOT EXISTS rate_limits (
@@ -206,6 +276,12 @@ def init_database():
             CREATE INDEX IF NOT EXISTS idx_sessions_token
             ON sessions(token_hash);
 
+            CREATE INDEX IF NOT EXISTS idx_sessions_client
+            ON sessions(client_id);
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_device
+            ON sessions(device_id);
+
             CREATE INDEX IF NOT EXISTS idx_sessions_expiry
             ON sessions(expires_at);
 
@@ -214,6 +290,9 @@ def init_database():
 
             CREATE INDEX IF NOT EXISTS idx_audit_created
             ON audit_logs(created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_audit_request
+            ON audit_logs(request_id);
             """
         )
 
@@ -252,7 +331,21 @@ def json_string(value: Any) -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        default=str,
     )
+
+
+def safe_json(value: Optional[str]) -> Dict[str, Any]:
+    try:
+        result = json.loads(value or "{}")
+
+        if isinstance(result, dict):
+            return result
+
+        return {}
+
+    except Exception:
+        return {}
 
 
 def generate_token() -> str:
@@ -261,6 +354,151 @@ def generate_token() -> str:
 
 def generate_secret() -> str:
     return secrets.token_urlsafe(48)
+
+
+def request_ip(
+    request: Request,
+) -> Optional[str]:
+    if not request.client:
+        return None
+
+    return request.client.host
+
+
+def new_request_id(
+    request: Optional[Request] = None,
+) -> str:
+    if request is not None:
+        incoming = request.headers.get(
+            "X-Request-ID"
+        )
+
+        if incoming:
+            incoming = incoming.strip()
+
+            if len(incoming) <= 128:
+                return incoming
+
+    return str(uuid.uuid4())
+
+
+def validate_platform(
+    platform: str,
+) -> str:
+    value = platform.strip().lower()
+
+    if value not in {
+        "android",
+        "windows",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported client platform.",
+        )
+
+    return value
+
+
+def validate_client_id(
+    client_id: str,
+) -> str:
+    value = client_id.strip().lower()
+
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail="Client ID is required.",
+        )
+
+    if len(value) > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="Client ID is too long.",
+        )
+
+    if not value.replace(
+        "_",
+        "",
+    ).replace(
+        "-",
+        "",
+    ).isalnum():
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid client ID.",
+        )
+
+    return value
+
+
+def validate_runtime_url(
+    value: str,
+):
+    parsed = urlparse(value)
+
+    if parsed.scheme not in {
+        "http",
+        "https",
+    }:
+        raise RuntimeError(
+            "Runtime Gateway URL must use HTTP or HTTPS."
+        )
+
+    if not parsed.netloc:
+        raise RuntimeError(
+            "Runtime Gateway URL is invalid."
+        )
+
+
+def validate_request_size(
+    request: Request,
+):
+    content_length = request.headers.get(
+        "content-length"
+    )
+
+    if not content_length:
+        return
+
+    try:
+        size = int(content_length)
+    except ValueError:
+        return
+
+    if size > MAX_REQUEST_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Request payload too large.",
+        )
+
+
+# ============================================================
+# Middleware
+# ============================================================
+
+@app.middleware("http")
+async def request_guard(
+    request: Request,
+    call_next,
+):
+    validate_request_size(request)
+
+    response = await call_next(
+        request
+    )
+
+    response.headers[
+        "X-Request-ID"
+    ] = request.headers.get(
+        "X-Request-ID",
+        "",
+    ) or str(uuid.uuid4())
+
+    response.headers[
+        "X-ARYA-Gateway"
+    ] = APP_VERSION
+
+    return response
 
 
 # ============================================================
@@ -277,36 +515,40 @@ def audit(
     source_ip: Optional[str] = None,
     details: Optional[Dict[str, Any]] = None,
 ):
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO audit_logs (
-                event_id,
-                event_type,
-                client_id,
-                device_id,
-                session_id,
-                request_id,
-                success,
-                source_ip,
-                details_json,
-                created_at
+    try:
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_logs (
+                    event_id,
+                    event_type,
+                    client_id,
+                    device_id,
+                    session_id,
+                    request_id,
+                    success,
+                    source_ip,
+                    details_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    event_type,
+                    client_id,
+                    device_id,
+                    session_id,
+                    request_id,
+                    1 if success else 0,
+                    source_ip,
+                    json_string(details or {}),
+                    utc_now(),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(uuid.uuid4()),
-                event_type,
-                client_id,
-                device_id,
-                session_id,
-                request_id,
-                1 if success else 0,
-                source_ip,
-                json_string(details or {}),
-                utc_now(),
-            ),
-        )
+    except Exception:
+        # Audit failure must never break authentication/runtime.
+        pass
 
 
 # ============================================================
@@ -369,17 +611,33 @@ def cleanup_sessions():
         )
 
 
+def count_client_devices(
+    client_id: str,
+) -> int:
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM devices
+            WHERE client_id = ?
+              AND enabled = 1
+            """,
+            (client_id,),
+        ).fetchone()
+
+    return int(row["count"])
+
+
 # ============================================================
 # Rate Limit
 # ============================================================
 
 def check_rate_limit(
     rate_key: str,
-):
+) -> bool:
     now = unix_time()
 
     with db() as conn:
-
         row = conn.execute(
             """
             SELECT
@@ -442,6 +700,28 @@ def check_rate_limit(
         )
 
         return True
+
+
+def enforce_rate_limit(
+    session,
+    scope: str,
+):
+    key = (
+        f"{session['client_id']}:"
+        f"{session['device_id']}:"
+        f"{scope}"
+    )
+
+    if not check_rate_limit(key):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded.",
+            headers={
+                "Retry-After": str(
+                    RATE_LIMIT_WINDOW
+                )
+            },
+        )
 
 
 # ============================================================
@@ -523,6 +803,14 @@ def startup():
     init_database()
     cleanup_sessions()
 
+    try:
+        validate_runtime_url(
+            RUNTIME_GATEWAY_URL
+        )
+    except Exception:
+        # Runtime failures are reported when called.
+        pass
+
 
 # ============================================================
 # Root / Health
@@ -539,11 +827,16 @@ def root():
             "windows",
         ],
         "runtime_gateway": RUNTIME_GATEWAY_URL,
+        "authentication": "client_session",
     }
 
 
 @app.get("/health")
 def health():
+    runtime_configured = bool(
+        RUNTIME_GATEWAY_URL
+    )
+
     with db() as conn:
         clients = conn.execute(
             """
@@ -573,9 +866,15 @@ def health():
 
     return {
         "status": "healthy",
+        "service": APP_NAME,
+        "version": APP_VERSION,
         "clients": clients,
         "devices": devices,
         "active_sessions": sessions,
+        "runtime_gateway_configured": runtime_configured,
+        "internal_secret_configured": bool(
+            INTERNAL_GATEWAY_SECRET
+        ),
         "time": utc_now(),
     }
 
@@ -648,13 +947,13 @@ def owner_create_client(
         x_arya_owner_secret,
     )
 
-    client_id = payload.client_id.strip().lower()
+    client_id = validate_client_id(
+        payload.client_id
+    )
 
-    if not client_id.replace("_", "").isalnum():
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid client ID.",
-        )
+    platform = validate_platform(
+        payload.platform
+    )
 
     if get_client(client_id):
         raise HTTPException(
@@ -682,8 +981,8 @@ def owner_create_client(
             """,
             (
                 client_id,
-                payload.client_name,
-                payload.platform.lower(),
+                payload.client_name.strip(),
+                platform,
                 sha256(secret),
                 now,
                 now,
@@ -699,8 +998,8 @@ def owner_create_client(
 
     return {
         "client_id": client_id,
-        "client_name": payload.client_name,
-        "platform": payload.platform,
+        "client_name": payload.client_name.strip(),
+        "platform": platform,
         "client_secret": secret,
         "warning": (
             "Store this secret securely. "
@@ -772,6 +1071,10 @@ def owner_enable_client(
         x_arya_owner_secret,
     )
 
+    client_id = validate_client_id(
+        client_id
+    )
+
     if not get_client(client_id):
         raise HTTPException(
             status_code=404,
@@ -817,6 +1120,10 @@ def owner_disable_client(
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
+    )
+
+    client_id = validate_client_id(
+        client_id
     )
 
     if not get_client(client_id):
@@ -868,10 +1175,17 @@ def owner_disable_client(
 @app.post("/client/devices/register")
 def register_device(
     payload: DeviceRegister,
+    request: Request,
 ):
-    client = get_client(
+    client_id = validate_client_id(
         payload.client_id
     )
+
+    platform = validate_platform(
+        payload.platform
+    )
+
+    client = get_client(client_id)
 
     if not client:
         raise HTTPException(
@@ -885,22 +1199,59 @@ def register_device(
             detail="Client is disabled.",
         )
 
-    now = utc_now()
-
     existing = get_device(
         payload.device_id
     )
 
+    if existing:
+        if existing["client_id"] != client_id:
+            audit(
+                "device_registration_conflict",
+                False,
+                client_id=client_id,
+                device_id=payload.device_id,
+                source_ip=request_ip(request),
+            )
+
+            raise HTTPException(
+                status_code=409,
+                detail="Device belongs to another client.",
+            )
+
+        if not secure_equal(
+            str(existing["device_fingerprint"]),
+            str(payload.device_fingerprint),
+        ):
+            audit(
+                "device_fingerprint_mismatch",
+                False,
+                client_id=client_id,
+                device_id=payload.device_id,
+                source_ip=request_ip(request),
+            )
+
+            raise HTTPException(
+                status_code=403,
+                detail="Device fingerprint mismatch.",
+            )
+
+    else:
+        if (
+            count_client_devices(client_id)
+            >= MAX_DEVICES_PER_CLIENT
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Maximum device limit reached "
+                    f"({MAX_DEVICES_PER_CLIENT})."
+                ),
+            )
+
+    now = utc_now()
+
     with db() as conn:
-
         if existing:
-
-            if existing["client_id"] != payload.client_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail="Device belongs to another client.",
-                )
-
             conn.execute(
                 """
                 UPDATE devices
@@ -912,7 +1263,7 @@ def register_device(
                 WHERE device_id = ?
                 """,
                 (
-                    payload.platform.lower(),
+                    platform,
                     payload.device_name,
                     payload.device_fingerprint,
                     json_string(payload.metadata),
@@ -922,7 +1273,6 @@ def register_device(
             )
 
         else:
-
             conn.execute(
                 """
                 INSERT INTO devices (
@@ -940,8 +1290,8 @@ def register_device(
                 """,
                 (
                     payload.device_id,
-                    payload.client_id,
-                    payload.platform.lower(),
+                    client_id,
+                    platform,
                     payload.device_name,
                     payload.device_fingerprint,
                     now,
@@ -953,13 +1303,14 @@ def register_device(
     audit(
         "device_registered",
         True,
-        client_id=payload.client_id,
+        client_id=client_id,
         device_id=payload.device_id,
+        source_ip=request_ip(request),
     )
 
     return {
         "device_id": payload.device_id,
-        "client_id": payload.client_id,
+        "client_id": client_id,
         "enabled": True,
         "registered_at": now,
     }
@@ -974,20 +1325,26 @@ def client_login(
     payload: ClientLogin,
     request: Request,
 ):
-    client = get_client(
+    client_id = validate_client_id(
         payload.client_id
     )
+
+    platform = validate_platform(
+        payload.platform
+    )
+
+    client = get_client(
+        client_id
+    )
+
+    source_ip = request_ip(request)
 
     if not client:
         audit(
             "client_login_unknown_client",
             False,
-            client_id=payload.client_id,
-            source_ip=(
-                request.client.host
-                if request.client
-                else None
-            ),
+            client_id=client_id,
+            source_ip=source_ip,
         )
 
         raise HTTPException(
@@ -1008,12 +1365,8 @@ def client_login(
         audit(
             "client_login_bad_secret",
             False,
-            client_id=payload.client_id,
-            source_ip=(
-                request.client.host
-                if request.client
-                else None
-            ),
+            client_id=client_id,
+            source_ip=source_ip,
         )
 
         raise HTTPException(
@@ -1029,21 +1382,40 @@ def client_login(
         register_device(
             DeviceRegister(
                 device_id=payload.device_id,
-                client_id=payload.client_id,
-                platform=payload.platform,
+                client_id=client_id,
+                platform=platform,
                 device_fingerprint=payload.device_fingerprint,
                 device_name=payload.device_name,
                 metadata=payload.metadata,
-            )
+            ),
+            request,
         )
+
         device = get_device(
             payload.device_id
         )
 
-    if device["client_id"] != payload.client_id:
+    if device["client_id"] != client_id:
         raise HTTPException(
             status_code=403,
             detail="Device/client mismatch.",
+        )
+
+    if not secure_equal(
+        str(device["device_fingerprint"]),
+        str(payload.device_fingerprint),
+    ):
+        audit(
+            "client_login_fingerprint_mismatch",
+            False,
+            client_id=client_id,
+            device_id=payload.device_id,
+            source_ip=source_ip,
+        )
+
+        raise HTTPException(
+            status_code=403,
+            detail="Device fingerprint mismatch.",
         )
 
     if not bool(device["enabled"]):
@@ -1073,7 +1445,7 @@ def client_login(
             """,
             (
                 session_id,
-                payload.client_id,
+                client_id,
                 payload.device_id,
                 sha256(session_token),
                 now,
@@ -1096,14 +1468,10 @@ def client_login(
     audit(
         "client_login_success",
         True,
-        client_id=payload.client_id,
+        client_id=client_id,
         device_id=payload.device_id,
         session_id=session_id,
-        source_ip=(
-            request.client.host
-            if request.client
-            else None
-        ),
+        source_ip=source_ip,
     )
 
     return {
@@ -1112,9 +1480,9 @@ def client_login(
         "token_type": "Bearer",
         "expires_at": expires,
         "expires_in": SESSION_TTL,
-        "client_id": payload.client_id,
+        "client_id": client_id,
         "device_id": payload.device_id,
-        "platform": payload.platform.lower(),
+        "platform": platform,
     }
 
 
@@ -1276,38 +1644,93 @@ def client_me(
 
 
 # ============================================================
+# Runtime Gateway Security
+# ============================================================
+
+def require_internal_runtime_secret():
+    if not INTERNAL_GATEWAY_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Internal gateway secret is not configured."
+            ),
+        )
+
+
+# ============================================================
 # Runtime Gateway Call
 # ============================================================
 
 async def runtime_call(
     path: str,
     payload: Dict[str, Any],
+    request_id: Optional[str] = None,
 ):
+    require_internal_runtime_secret()
+
+    try:
+        validate_runtime_url(
+            RUNTIME_GATEWAY_URL
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Runtime Gateway URL is invalid.",
+        )
+
+    normalized_path = path.lstrip("/")
+
+    allowed_paths = {
+        "runtime/call",
+        "arya/analyze",
+        "arya/diagnose",
+        "arya/recommend",
+        "arya/vision",
+        "arya/voice",
+        "arya/weather",
+        "arya/geocode",
+        "arya/payment",
+        "arya/updates",
+        "arya/updates/run",
+        "arya/system-map",
+    }
+
+    if normalized_path not in allowed_paths:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported runtime route.",
+        )
+
     url = (
         RUNTIME_GATEWAY_URL
         + "/"
-        + path.lstrip("/")
+        + normalized_path
+    )
+
+    rid = request_id or str(
+        uuid.uuid4()
     )
 
     headers = {
         "Content-Type": "application/json",
+        "Accept": "application/json",
         "X-ARYA-Client-Gateway": APP_VERSION,
+        "X-Request-ID": rid,
+        "X-ARYA-Internal-Secret":
+            INTERNAL_GATEWAY_SECRET,
     }
 
-    if INTERNAL_GATEWAY_SECRET:
-        headers[
-            "X-ARYA-Internal-Secret"
-        ] = INTERNAL_GATEWAY_SECRET
+    body = dict(payload)
+    body["request_id"] = rid
 
     async with httpx.AsyncClient(
         timeout=REQUEST_TIMEOUT,
         follow_redirects=False,
     ) as client:
-
         try:
             response = await client.post(
                 url,
-                json=payload,
+                json=body,
                 headers=headers,
             )
 
@@ -1361,18 +1784,14 @@ async def api_runtime(
         authorization
     )
 
-    rate_key = (
-        f"{session['client_id']}:"
-        f"{session['device_id']}"
+    enforce_rate_limit(
+        session,
+        "runtime",
     )
 
-    if not check_rate_limit(rate_key):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded.",
-        )
-
-    request_id = str(uuid.uuid4())
+    request_id = new_request_id(
+        request
+    )
 
     audit(
         "runtime_request",
@@ -1381,28 +1800,105 @@ async def api_runtime(
         device_id=session["device_id"],
         session_id=session["session_id"],
         request_id=request_id,
-        source_ip=(
-            request.client.host
-            if request.client
-            else None
-        ),
+        source_ip=request_ip(request),
         details={
             "action": payload.action,
         },
     )
 
-    data = await runtime_call(
-        "/runtime/call",
-        {
-            "action": payload.action,
-            "payload": payload.payload,
-            "request_id": request_id,
-        },
-    )
+    try:
+        data = await runtime_call(
+            "runtime/call",
+            {
+                "action": payload.action,
+                "payload": payload.payload,
+            },
+            request_id,
+        )
+
+    except HTTPException as exc:
+        audit(
+            "runtime_request_failed",
+            False,
+            client_id=session["client_id"],
+            device_id=session["device_id"],
+            session_id=session["session_id"],
+            request_id=request_id,
+            source_ip=request_ip(request),
+            details={
+                "action": payload.action,
+                "status_code": exc.status_code,
+            },
+        )
+        raise
 
     return {
         "request_id": request_id,
         "data": data,
+    }
+
+
+# ============================================================
+# Agricultural Doctor Internal Helper
+# ============================================================
+
+async def authenticated_arya_call(
+    runtime_path: str,
+    scope: str,
+    payload: Dict[str, Any],
+    request: Request,
+    authorization: Optional[str],
+):
+    session = require_session(
+        authorization
+    )
+
+    enforce_rate_limit(
+        session,
+        scope,
+    )
+
+    request_id = new_request_id(
+        request
+    )
+
+    try:
+        data = await runtime_call(
+            runtime_path,
+            {
+                "payload": payload,
+            },
+            request_id,
+        )
+
+    except HTTPException as exc:
+        audit(
+            f"{scope}_failed",
+            False,
+            client_id=session["client_id"],
+            device_id=session["device_id"],
+            session_id=session["session_id"],
+            request_id=request_id,
+            source_ip=request_ip(request),
+            details={
+                "status_code": exc.status_code,
+            },
+        )
+        raise
+
+    audit(
+        scope,
+        True,
+        client_id=session["client_id"],
+        device_id=session["device_id"],
+        session_id=session["session_id"],
+        request_id=request_id,
+        source_ip=request_ip(request),
+    )
+
+    return {
+        "request_id": request_id,
+        "result": data,
     }
 
 
@@ -1418,806 +1914,91 @@ async def doctor(
         default=None
     ),
 ):
-    session = require_session(
-        authorization
-    )
-
-    if not check_rate_limit(
-        f"{session['client_id']}:doctor"
-    ):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded.",
-        )
-
-    request_id = str(uuid.uuid4())
-
-    data = await runtime_call(
-        "/arya/analyze",
-        {
-            "payload": payload,
-            "request_id": request_id,
-        },
-    )
-
-    audit(
+    return await authenticated_arya_call(
+        "arya/analyze",
         "doctor_analysis",
-        True,
-        client_id=session["client_id"],
-        device_id=session["device_id"],
-        session_id=session["session_id"],
-        request_id=request_id,
-        source_ip=(
-            request.client.host
-            if request.client
-            else None
-        ),
+        payload,
+        request,
+        authorization,
     )
 
-    return {
-        "request_id": request_id,
-        "result": data,
-    }
+
+@app.post("/api/v1/doctor/analyze")
+async def doctor_analyze(
+    payload: Dict[str, Any],
+    request: Request,
+    authorization: Optional[str] = Header(
+        default=None
+    ),
+):
+    return await authenticated_arya_call(
+        "arya/analyze",
+        "doctor_analyze",
+        payload,
+        request,
+        authorization,
+    )
+
+
+@app.post("/api/v1/doctor/diagnose")
+async def doctor_diagnose(
+    payload: Dict[str, Any],
+    request: Request,
+    authorization: Optional[str] = Header(
+        default=None
+    ),
+):
+    return await authenticated_arya_call(
+        "arya/diagnose",
+        "doctor_diagnose",
+        payload,
+        request,
+        authorization,
+    )
+
+
+@app.post("/api/v1/doctor/recommend")
+async def doctor_recommend(
+    payload: Dict[str, Any],
+    request: Request,
+    authorization: Optional[str] = Header(
+        default=None
+    ),
+):
+    return await authenticated_arya_call(
+        "arya/recommend",
+        "doctor_recommend",
+        payload,
+        request,
+        authorization,
+    )
 
 
 @app.post("/api/v1/analyze")
 async def analyze(
     payload: Dict[str, Any],
+    request: Request,
     authorization: Optional[str] = Header(
         default=None
     ),
 ):
-    session = require_session(
-        authorization
+    return await authenticated_arya_call(
+        "arya/analyze",
+        "analyze",
+        payload,
+        request,
+        authorization,
     )
-
-    if not check_rate_limit(
-        f"{session['client_id']}:analyze"
-    ):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded.",
-        )
-
-    request_id = str(uuid.uuid4())
-
-    data = await runtime_call(
-        "/arya/analyze",
-        {
-            "payload": payload,
-            "request_id": request_id,
-        },
-    )
-
-    return {
-        "request_id": request_id,
-        "result": data,
-    }
 
 
 @app.post("/api/v1/diagnose")
 async def diagnose(
     payload: Dict[str, Any],
+    request: Request,
     authorization: Optional[str] = Header(
         default=None
     ),
 ):
-    session = require_session(
-        authorization
-    )
-
-    if not check_rate_limit(
-        f"{session['client_id']}:diagnose"
-    ):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded.",
-        )
-
-    request_id = str(uuid.uuid4())
-
-    data = await runtime_call(
-        "/arya/diagnose",
-        {
-            "payload": payload,
-            "request_id": request_id,
-        },
-    )
-
-    return {
-        "request_id": request_id,
-        "result": data,
-    }
-
-
-@app.post("/api/v1/recommend")
-async def recommend(
-    payload: Dict[str, Any],
-    authorization: Optional[str] = Header(
-        default=None
-    ),
-):
-    session = require_session(
-        authorization
-    )
-
-    if not check_rate_limit(
-        f"{session['client_id']}:recommend"
-    ):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded.",
-        )
-
-    request_id = str(uuid.uuid4())
-
-    data = await runtime_call(
-        "/arya/recommend",
-        {
-            "payload": payload,
-            "request_id": request_id,
-        },
-    )
-
-    return {
-        "request_id": request_id,
-        "result": data,
-    }
-
-
-# ============================================================
-# Vision
-# ============================================================
-
-@app.post("/api/v1/vision")
-async def vision(
-    payload: Dict[str, Any],
-    authorization: Optional[str] = Header(
-        default=None
-    ),
-):
-    session = require_session(
-        authorization
-    )
-
-    if not check_rate_limit(
-        f"{session['client_id']}:vision"
-    ):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded.",
-        )
-
-    request_id = str(uuid.uuid4())
-
-    data = await runtime_call(
-        "/arya/vision",
-        {
-            "payload": payload,
-            "request_id": request_id,
-        },
-    )
-
-    return {
-        "request_id": request_id,
-        "result": data,
-    }
-
-
-# ============================================================
-# Weather
-# ============================================================
-
-@app.post("/api/v1/weather")
-async def weather(
-    payload: Dict[str, Any],
-    authorization: Optional[str] = Header(
-        default=None
-    ),
-):
-    session = require_session(
-        authorization
-    )
-
-    if not check_rate_limit(
-        f"{session['client_id']}:weather"
-    ):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded.",
-        )
-
-    request_id = str(uuid.uuid4())
-
-    data = await runtime_call(
-        "/arya/weather",
-        {
-            "payload": payload,
-            "request_id": request_id,
-        },
-    )
-
-    return {
-        "request_id": request_id,
-        "result": data,
-    }
-
-
-# ============================================================
-# Geocoding / Location
-# ============================================================
-
-@app.post("/api/v1/geocode")
-async def geocode(
-    payload: Dict[str, Any],
-    authorization: Optional[str] = Header(
-        default=None
-    ),
-):
-    session = require_session(
-        authorization
-    )
-
-    if not check_rate_limit(
-        f"{session['client_id']}:geocode"
-    ):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded.",
-        )
-
-    request_id = str(uuid.uuid4())
-
-    data = await runtime_call(
-        "/arya/geocode",
-        {
-            "payload": payload,
-            "request_id": request_id,
-        },
-    )
-
-    return {
-        "request_id": request_id,
-        "result": data,
-    }
-
-
-# ============================================================
-# Updates
-# ============================================================
-
-@app.get("/api/v1/updates")
-async def updates(
-    authorization: Optional[str] = Header(
-        default=None
-    ),
-):
-    session = require_session(
-        authorization
-    )
-
-    if not check_rate_limit(
-        f"{session['client_id']}:updates"
-    ):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded.",
-        )
-
-    return await runtime_call(
-        "/arya/updates",
-        {
-            "client_id": session["client_id"],
-        },
-    )
-
-
-@app.post("/api/v1/updates/run")
-async def run_updates(
-    authorization: Optional[str] = Header(
-        default=None
-    ),
-):
-    session = require_session(
-        authorization
-    )
-
-    if not check_rate_limit(
-        f"{session['client_id']}:updates_run"
-    ):
-        raise HTTPException(
-            status_code=429,
-            detail="Rate limit exceeded.",
-        )
-
-    return await runtime_call(
-        "/arya/updates/run",
-        {
-            "requested_by": session["client_id"],
-        },
-    )
-
-
-# ============================================================
-# System Map
-# ============================================================
-
-@app.get("/api/v1/system-map")
-async def system_map(
-    authorization: Optional[str] = Header(
-        default=None
-    ),
-):
-    session = require_session(
-        authorization
-    )
-
-    return await runtime_call(
-        "/arya/system-map",
-        {
-            "client_id": session["client_id"],
-        },
-    )
-
-
-# ============================================================
-# Device Management
-# ============================================================
-
-@app.get("/client/devices")
-def client_devices(
-    authorization: Optional[str] = Header(
-        default=None
-    ),
-):
-    session = require_session(
-        authorization
-    )
-
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                device_id,
-                platform,
-                device_name,
-                enabled,
-                created_at,
-                last_seen_at,
-                metadata_json
-            FROM devices
-            WHERE client_id = ?
-            ORDER BY created_at DESC
-            """,
-            (session["client_id"],),
-        ).fetchall()
-
-    return {
-        "devices": [
-            {
-                "device_id": row["device_id"],
-                "platform": row["platform"],
-                "device_name": row["device_name"],
-                "enabled": bool(row["enabled"]),
-                "created_at": row["created_at"],
-                "last_seen_at": row["last_seen_at"],
-                "metadata": json.loads(
-                    row["metadata_json"]
-                    or "{}"
-                ),
-            }
-            for row in rows
-        ]
-    }
-
-
-# ============================================================
-# OWNER Device Control
-# ============================================================
-
-@app.post(
-    "/owner/devices/{device_id}/disable"
-)
-def owner_disable_device(
-    device_id: str,
-    x_arya_owner_email: Optional[str] = Header(
-        default=None
-    ),
-    x_arya_owner_secret: Optional[str] = Header(
-        default=None
-    ),
-):
-    require_owner(
-        x_arya_owner_email,
-        x_arya_owner_secret,
-    )
-
-    device = get_device(
-        device_id
-    )
-
-    if not device:
-        raise HTTPException(
-            status_code=404,
-            detail="Device not found.",
-        )
-
-    with db() as conn:
-        conn.execute(
-            """
-            UPDATE devices
-            SET enabled = 0
-            WHERE device_id = ?
-            """,
-            (device_id,),
-        )
-
-        conn.execute(
-            """
-            UPDATE sessions
-            SET revoked = 1
-            WHERE device_id = ?
-            """,
-            (device_id,),
-        )
-
-    audit(
-        "owner_device_disabled",
-        True,
-        client_id=device["client_id"],
-        device_id=device_id,
-    )
-
-    return {
-        "device_id": device_id,
-        "enabled": False,
-        "sessions_revoked": True,
-    }
-
-
-@app.post(
-    "/owner/devices/{device_id}/enable"
-)
-def owner_enable_device(
-    device_id: str,
-    x_arya_owner_email: Optional[str] = Header(
-        default=None
-    ),
-    x_arya_owner_secret: Optional[str] = Header(
-        default=None
-    ),
-):
-    require_owner(
-        x_arya_owner_email,
-        x_arya_owner_secret,
-    )
-
-    device = get_device(
-        device_id
-    )
-
-    if not device:
-        raise HTTPException(
-            status_code=404,
-            detail="Device not found.",
-        )
-
-    with db() as conn:
-        conn.execute(
-            """
-            UPDATE devices
-            SET enabled = 1
-            WHERE device_id = ?
-            """,
-            (device_id,),
-        )
-
-    audit(
-        "owner_device_enabled",
-        True,
-        client_id=device["client_id"],
-        device_id=device_id,
-    )
-
-    return {
-        "device_id": device_id,
-        "enabled": True,
-    }
-
-
-# ============================================================
-# OWNER Session Control
-# ============================================================
-
-@app.get("/owner/sessions")
-def owner_sessions(
-    x_arya_owner_email: Optional[str] = Header(
-        default=None
-    ),
-    x_arya_owner_secret: Optional[str] = Header(
-        default=None
-    ),
-):
-    require_owner(
-        x_arya_owner_email,
-        x_arya_owner_secret,
-    )
-
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                session_id,
-                client_id,
-                device_id,
-                created_at,
-                expires_at,
-                revoked
-            FROM sessions
-            ORDER BY created_at DESC
-            LIMIT 500
-            """
-        ).fetchall()
-
-    return {
-        "sessions": [
-            {
-                "session_id": row["session_id"],
-                "client_id": row["client_id"],
-                "device_id": row["device_id"],
-                "created_at": row["created_at"],
-                "expires_at": row["expires_at"],
-                "revoked": bool(row["revoked"]),
-            }
-            for row in rows
-        ]
-    }
-
-
-@app.post(
-    "/owner/sessions/revoke/{session_id}"
-)
-def owner_revoke_session(
-    session_id: str,
-    x_arya_owner_email: Optional[str] = Header(
-        default=None
-    ),
-    x_arya_owner_secret: Optional[str] = Header(
-        default=None
-    ),
-):
-    require_owner(
-        x_arya_owner_email,
-        x_arya_owner_secret,
-    )
-
-    with db() as conn:
-        cursor = conn.execute(
-            """
-            UPDATE sessions
-            SET revoked = 1
-            WHERE session_id = ?
-            """,
-            (session_id,),
-        )
-
-    if cursor.rowcount == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Session not found.",
-        )
-
-    audit(
-        "owner_session_revoked",
-        True,
-        session_id=session_id,
-    )
-
-    return {
-        "session_id": session_id,
-        "revoked": True,
-    }
-
-
-# ============================================================
-# OWNER Security Statistics
-# ============================================================
-
-@app.get("/owner/security/stats")
-def owner_security_stats(
-    x_arya_owner_email: Optional[str] = Header(
-        default=None
-    ),
-    x_arya_owner_secret: Optional[str] = Header(
-        default=None
-    ),
-):
-    require_owner(
-        x_arya_owner_email,
-        x_arya_owner_secret,
-    )
-
-    with db() as conn:
-        clients = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM clients
-            """
-        ).fetchone()["count"]
-
-        enabled_clients = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM clients
-            WHERE enabled = 1
-            """
-        ).fetchone()["count"]
-
-        devices = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM devices
-            """
-        ).fetchone()["count"]
-
-        active_devices = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM devices
-            WHERE enabled = 1
-            """
-        ).fetchone()["count"]
-
-        active_sessions = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM sessions
-            WHERE revoked = 0
-              AND expires_at > ?
-            """,
-            (unix_time(),),
-        ).fetchone()["count"]
-
-        audit_events = conn.execute(
-            """
-            SELECT COUNT(*) AS count
-            FROM audit_logs
-            """
-        ).fetchone()["count"]
-
-    return {
-        "clients": clients,
-        "enabled_clients": enabled_clients,
-        "devices": devices,
-        "active_devices": active_devices,
-        "active_sessions": active_sessions,
-        "audit_events": audit_events,
-        "rate_limit_window": RATE_LIMIT_WINDOW,
-        "rate_limit_max_requests": RATE_LIMIT_MAX_REQUESTS,
-        "runtime_gateway": RUNTIME_GATEWAY_URL,
-        "time": utc_now(),
-    }
-
-
-# ============================================================
-# OWNER Audit
-# ============================================================
-
-@app.get("/owner/audit")
-def owner_audit(
-    limit: int = 100,
-    x_arya_owner_email: Optional[str] = Header(
-        default=None
-    ),
-    x_arya_owner_secret: Optional[str] = Header(
-        default=None
-    ),
-):
-    require_owner(
-        x_arya_owner_email,
-        x_arya_owner_secret,
-    )
-
-    limit = max(
-        1,
-        min(limit, 500),
-    )
-
-    with db() as conn:
-        rows = conn.execute(
-            """
-            SELECT
-                event_id,
-                event_type,
-                client_id,
-                device_id,
-                session_id,
-                request_id,
-                success,
-                source_ip,
-                details_json,
-                created_at
-            FROM audit_logs
-            ORDER BY id DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
-
-    return {
-        "events": [
-            {
-                "event_id": row["event_id"],
-                "event_type": row["event_type"],
-                "client_id": row["client_id"],
-                "device_id": row["device_id"],
-                "session_id": row["session_id"],
-                "request_id": row["request_id"],
-                "success": bool(row["success"]),
-                "source_ip": row["source_ip"],
-                "details": json.loads(
-                    row["details_json"]
-                    or "{}"
-                ),
-                "created_at": row["created_at"],
-            }
-            for row in rows
-        ]
-    }
-
-
-# ============================================================
-# API Contract
-# ============================================================
-
-@app.get("/api/v1/contract")
-def api_contract():
-    return {
-        "version": APP_VERSION,
-        "platforms": [
-            "android",
-            "windows",
-        ],
-        "authentication": {
-            "client": "client_id + client_secret",
-            "session": "Bearer access_token",
-        },
-        "core_endpoints": [
-            "/client/login",
-            "/client/logout",
-            "/client/me",
-            "/client/devices",
-            "/api/v1/doctor",
-            "/api/v1/analyze",
-            "/api/v1/diagnose",
-            "/api/v1/recommend",
-            "/api/v1/vision",
-            "/api/v1/weather",
-            "/api/v1/geocode",
-            "/api/v1/updates",
-            "/api/v1/updates/run",
-            "/api/v1/system-map",
-        ],
-        "security": [
-            "session_authentication",
-            "device_control",
-            "rate_limiting",
-            "audit_logging",
-            "owner_controls",
-        ],
-    }
-
-
-# ============================================================
-# Run
-# ============================================================
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "client_api_gateway:app",
-        host=HOST,
-        port=PORT,
-        reload=False,
-    )
+    return await authenticated_arya_call(
+        "arya/diagnose",
+       
