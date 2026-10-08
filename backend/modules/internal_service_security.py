@@ -1,21 +1,22 @@
 """
 ARYA AgriDoctor
 Internal Service Security Layer
-Version: 1.0.0
+Version: 2.0.0
 
 Purpose:
-- Service-to-service authentication
-- HMAC signed internal requests
+- Secure service-to-service authentication
+- HMAC-SHA256 signed internal requests
 - Replay protection
 - Timestamp validation
 - Nonce protection
 - Service identity validation
 - Secret rotation
-- Audit logging
 - OWNER-controlled service credentials
+- Security audit logging
+- Request ID propagation
+- Fail-closed internal security
+- No plaintext service secrets stored in database
 - No modification of existing ARYA files required
-
-This module is intentionally standalone.
 """
 
 from __future__ import annotations
@@ -24,15 +25,17 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 
@@ -41,7 +44,13 @@ from pydantic import BaseModel, Field
 # ============================================================
 
 APP_NAME = "ARYA Internal Service Security"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
+
+BASE_DIR = os.path.dirname(
+    os.path.dirname(
+        os.path.abspath(__file__)
+    )
+)
 
 HOST = os.getenv(
     "ARYA_INTERNAL_SECURITY_HOST",
@@ -57,7 +66,10 @@ PORT = int(
 
 DB_PATH = os.getenv(
     "ARYA_INTERNAL_SECURITY_DB",
-    "internal_service_security.db",
+    os.path.join(
+        BASE_DIR,
+        "internal_service_security.db",
+    ),
 )
 
 MASTER_EMAIL = os.getenv(
@@ -75,32 +87,48 @@ INTERNAL_GATEWAY_SECRET = os.getenv(
     "",
 )
 
-REQUEST_TTL_SECONDS = int(
-    os.getenv(
-        "ARYA_INTERNAL_REQUEST_TTL",
-        "120",
-    )
+REQUEST_TTL_SECONDS = max(
+    15,
+    int(
+        os.getenv(
+            "ARYA_INTERNAL_REQUEST_TTL",
+            "120",
+        )
+    ),
 )
 
-NONCE_TTL_SECONDS = int(
-    os.getenv(
-        "ARYA_INTERNAL_NONCE_TTL",
-        "300",
-    )
+NONCE_TTL_SECONDS = max(
+    REQUEST_TTL_SECONDS,
+    int(
+        os.getenv(
+            "ARYA_INTERNAL_NONCE_TTL",
+            "300",
+        )
+    ),
 )
 
-MAX_BODY_BYTES = int(
-    os.getenv(
-        "ARYA_INTERNAL_MAX_BODY_BYTES",
-        str(2 * 1024 * 1024),
-    )
+MAX_BODY_BYTES = max(
+    1024,
+    int(
+        os.getenv(
+            "ARYA_INTERNAL_MAX_BODY_BYTES",
+            str(2 * 1024 * 1024),
+        )
+    ),
 )
 
-SESSION_TTL_SECONDS = int(
-    os.getenv(
-        "ARYA_INTERNAL_SECURITY_SESSION_TTL",
-        "3600",
-    )
+SESSION_TTL_SECONDS = max(
+    300,
+    int(
+        os.getenv(
+            "ARYA_INTERNAL_SECURITY_SESSION_TTL",
+            "3600",
+        )
+    ),
+)
+
+SERVICE_ID_PATTERN = re.compile(
+    r"^[a-z0-9][a-z0-9_-]{1,99}$"
 )
 
 
@@ -112,10 +140,41 @@ app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description=(
-        "Central security authority for ARYA internal "
-        "service-to-service communication."
+        "Central security authority for ARYA "
+        "internal service-to-service communication."
     ),
 )
+
+
+# ============================================================
+# Request ID Middleware
+# ============================================================
+
+@app.middleware("http")
+async def request_id_middleware(
+    request: Request,
+    call_next,
+):
+    request_id = (
+        request.headers.get("X-ARYA-Request-ID")
+        or str(uuid.uuid4())
+    )
+
+    request.state.arya_request_id = request_id
+
+    try:
+        response = await call_next(request)
+    except Exception:
+        response = JSONResponse(
+            status_code=500,
+            content={
+                "detail": "Internal security service error.",
+                "request_id": request_id,
+            },
+        )
+
+    response.headers["X-ARYA-Request-ID"] = request_id
+    return response
 
 
 # ============================================================
@@ -133,17 +192,34 @@ def db():
     connection.row_factory = sqlite3.Row
 
     try:
+        connection.execute(
+            "PRAGMA foreign_keys = ON"
+        )
+
+        connection.execute(
+            "PRAGMA busy_timeout = 30000"
+        )
+
+        connection.execute(
+            "PRAGMA journal_mode = WAL"
+        )
+
         yield connection
+
         connection.commit()
+
     except Exception:
         connection.rollback()
         raise
+
     finally:
         connection.close()
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
 
 
 def unix_time() -> int:
@@ -151,6 +227,11 @@ def unix_time() -> int:
 
 
 def init_database() -> None:
+    os.makedirs(
+        os.path.dirname(DB_PATH) or ".",
+        exist_ok=True,
+    )
+
     with db() as conn:
         conn.executescript(
             """
@@ -207,6 +288,10 @@ def init_database() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_secret_versions_service_version
+            ON secret_versions(service_id, version);
+
             CREATE INDEX IF NOT EXISTS idx_nonce_expiry
             ON used_nonces(expires_at);
 
@@ -223,7 +308,7 @@ def init_database() -> None:
 
 
 # ============================================================
-# Security Helpers
+# Cryptographic Helpers
 # ============================================================
 
 def sha256_text(value: str) -> str:
@@ -237,8 +322,8 @@ def constant_compare(
     second: str,
 ) -> bool:
     return hmac.compare_digest(
-        first.encode("utf-8"),
-        second.encode("utf-8"),
+        str(first).encode("utf-8"),
+        str(second).encode("utf-8"),
     )
 
 
@@ -264,13 +349,22 @@ def canonical_body(body: bytes) -> str:
         return ""
 
     try:
-        parsed = json.loads(body.decode("utf-8"))
+        parsed = json.loads(
+            body.decode("utf-8")
+        )
         return canonical_json(parsed)
+
     except Exception:
         return body.decode(
             "utf-8",
             errors="replace",
         )
+
+
+def body_hash(body: bytes) -> str:
+    return sha256_text(
+        canonical_body(body)
+    )
 
 
 def build_signature(
@@ -281,8 +375,9 @@ def build_signature(
     timestamp: str,
     nonce: str,
     request_id: str,
-    body_hash: str,
+    body_hash_value: str,
 ) -> str:
+
     payload = "\n".join(
         [
             service_id,
@@ -291,7 +386,7 @@ def build_signature(
             timestamp,
             nonce,
             request_id,
-            body_hash,
+            body_hash_value,
         ]
     )
 
@@ -301,6 +396,10 @@ def build_signature(
         hashlib.sha256,
     ).hexdigest()
 
+
+# ============================================================
+# Maintenance
+# ============================================================
 
 def clean_old_nonces() -> None:
     now = unix_time()
@@ -342,36 +441,43 @@ def audit(
     details: Optional[Dict[str, Any]] = None,
 ) -> None:
 
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO audit_logs (
-                event_id,
-                event_type,
-                service_id,
-                request_id,
-                success,
-                source_ip,
-                details_json,
-                created_at
+    try:
+        with db() as conn:
+            conn.execute(
+                """
+                INSERT INTO audit_logs (
+                    event_id,
+                    event_type,
+                    service_id,
+                    request_id,
+                    success,
+                    source_ip,
+                    details_json,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    event_type,
+                    service_id,
+                    request_id,
+                    1 if success else 0,
+                    source_ip,
+                    canonical_json(
+                        details or {}
+                    ),
+                    utc_now(),
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(uuid.uuid4()),
-                event_type,
-                service_id,
-                request_id,
-                1 if success else 0,
-                source_ip,
-                canonical_json(details or {}),
-                utc_now(),
-            ),
-        )
+    except Exception:
+        # Security state must never be exposed because
+        # an audit write failed.
+        pass
 
 
 # ============================================================
-# Service Registry
+# Default Service Registry
 # ============================================================
 
 DEFAULT_SERVICES = [
@@ -392,10 +498,19 @@ DEFAULT_SERVICES = [
 
 
 def ensure_default_services() -> None:
+    """
+    Creates service identities without storing generated
+    plaintext secrets.
+
+    A new secret must be obtained through OWNER rotation
+    before the service can authenticate.
+    """
+
     now = utc_now()
 
     with db() as conn:
         for service_id in DEFAULT_SERVICES:
+
             existing = conn.execute(
                 """
                 SELECT service_id
@@ -409,6 +524,9 @@ def ensure_default_services() -> None:
                 continue
 
             generated_secret = generate_secret()
+            generated_hash = hash_secret(
+                generated_secret
+            )
 
             conn.execute(
                 """
@@ -426,16 +544,18 @@ def ensure_default_services() -> None:
                 """,
                 (
                     service_id,
-                    service_id.replace("_", " ").title(),
-                    hash_secret(generated_secret),
+                    service_id.replace(
+                        "_",
+                        " ",
+                    ).title(),
+                    generated_hash,
                     now,
                     now,
                     canonical_json(
                         {
-                            "bootstrap_secret": generated_secret,
-                            "bootstrap_warning": (
-                                "Retrieve and rotate this secret "
-                                "through OWNER before production."
+                            "bootstrap": True,
+                            "secret_available_via": (
+                                "OWNER rotation only"
                             ),
                         }
                     ),
@@ -455,11 +575,15 @@ def ensure_default_services() -> None:
                 """,
                 (
                     service_id,
-                    hash_secret(generated_secret),
+                    generated_hash,
                     now,
                 ),
             )
 
+
+# ============================================================
+# Service Helpers
+# ============================================================
 
 def get_service(
     service_id: str,
@@ -493,7 +617,48 @@ def get_active_secret_hash(
             (service_id,),
         ).fetchone()
 
-    return row["secret_hash"] if row else None
+    return (
+        row["secret_hash"]
+        if row
+        else None
+    )
+
+
+def validate_service_id(
+    service_id: str,
+) -> str:
+
+    normalized = (
+        service_id or ""
+    ).strip().lower()
+
+    if not SERVICE_ID_PATTERN.fullmatch(
+        normalized
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid service ID.",
+        )
+
+    return normalized
+
+
+def safe_json_loads(
+    value: Optional[str],
+) -> Dict[str, Any]:
+
+    try:
+        parsed = json.loads(
+            value or "{}"
+        )
+
+        if isinstance(parsed, dict):
+            return parsed
+
+    except Exception:
+        pass
+
+    return {}
 
 
 # ============================================================
@@ -551,13 +716,17 @@ def require_owner(
     if not MASTER_EMAIL or not MASTER_SECRET:
         raise HTTPException(
             status_code=503,
-            detail="OWNER credentials are not configured.",
+            detail=(
+                "OWNER credentials are not configured."
+            ),
         )
 
     if not email or not secret:
         raise HTTPException(
             status_code=401,
-            detail="OWNER authentication required.",
+            detail=(
+                "OWNER authentication required."
+            ),
         )
 
     if not constant_compare(
@@ -580,27 +749,195 @@ def require_owner(
 
 
 # ============================================================
-# Internal Request Verification
+# Internal Gateway Authentication
 # ============================================================
 
-def verify_internal_request(
+def require_internal_gateway(
+    secret_header: Optional[str],
+) -> None:
+
+    if not INTERNAL_GATEWAY_SECRET:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Internal gateway secret is not configured."
+            ),
+        )
+
+    if not secret_header:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Internal gateway authentication required."
+            ),
+        )
+
+    if not constant_compare(
+        secret_header,
+        INTERNAL_GATEWAY_SECRET,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid internal gateway secret.",
+        )
+
+
+# ============================================================
+# Replay Protection
+# ============================================================
+
+def reserve_nonce(
     service_id: str,
-    method: str,
-    path: str,
-    timestamp: str,
     nonce: str,
     request_id: str,
-    body_hash: str,
-    signature: str,
+) -> None:
+
+    nonce_hash = sha256_text(
+        nonce
+    )
+
+    now = unix_time()
+
+    with db() as conn:
+
+        conn.execute(
+            """
+            DELETE FROM used_nonces
+            WHERE expires_at < ?
+            """,
+            (now,),
+        )
+
+        existing = conn.execute(
+            """
+            SELECT nonce_hash
+            FROM used_nonces
+            WHERE nonce_hash = ?
+            """,
+            (nonce_hash,),
+        ).fetchone()
+
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail="Replay detected.",
+            )
+
+        try:
+            conn.execute(
+                """
+                INSERT INTO used_nonces (
+                    nonce_hash,
+                    service_id,
+                    request_id,
+                    created_at,
+                    expires_at
+                )
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    nonce_hash,
+                    service_id,
+                    request_id,
+                    now,
+                    now + NONCE_TTL_SECONDS,
+                ),
+            )
+
+        except sqlite3.IntegrityError:
+            raise HTTPException(
+                status_code=409,
+                detail="Replay detected.",
+            )
+
+
+# ============================================================
+# Full Internal Request Verification
+# ============================================================
+
+async def verify_request_from_headers(
+    request: Request,
+    service_id: Optional[str],
+    timestamp: Optional[str],
+    nonce: Optional[str],
+    request_id: Optional[str],
+    signature: Optional[str],
+    service_secret: Optional[str],
 ) -> Dict[str, Any]:
+
+    source_ip = (
+        request.client.host
+        if request.client
+        else None
+    )
 
     if not service_id:
         raise HTTPException(
             status_code=401,
-            detail="Missing service identity.",
+            detail=(
+                "Missing X-ARYA-Service-ID."
+            ),
         )
 
-    service = get_service(service_id)
+    service_id = validate_service_id(
+        service_id
+    )
+
+    if not timestamp:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Missing X-ARYA-Timestamp."
+            ),
+        )
+
+    if not nonce:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Missing X-ARYA-Nonce."
+            ),
+        )
+
+    if not request_id:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Missing X-ARYA-Request-ID."
+            ),
+        )
+
+    if not signature:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Missing X-ARYA-Signature."
+            ),
+        )
+
+    if not service_secret:
+        raise HTTPException(
+            status_code=401,
+            detail=(
+                "Missing X-ARYA-Service-Secret."
+            ),
+        )
+
+    if len(nonce) > 512:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid nonce.",
+        )
+
+    if len(request_id) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid request ID.",
+        )
+
+    service = get_service(
+        service_id
+    )
 
     if not service:
         audit(
@@ -608,6 +945,7 @@ def verify_internal_request(
             False,
             service_id=service_id,
             request_id=request_id,
+            source_ip=source_ip,
         )
 
         raise HTTPException(
@@ -621,21 +959,26 @@ def verify_internal_request(
             False,
             service_id=service_id,
             request_id=request_id,
+            source_ip=source_ip,
         )
 
         raise HTTPException(
             status_code=403,
-            detail="Internal service is disabled.",
+            detail="Internal service disabled.",
         )
 
     try:
-        request_timestamp = int(timestamp)
+        request_timestamp = int(
+            timestamp
+        )
+
     except Exception:
         audit(
             "internal_auth_invalid_timestamp",
             False,
             service_id=service_id,
             request_id=request_id,
+            source_ip=source_ip,
         )
 
         raise HTTPException(
@@ -645,200 +988,16 @@ def verify_internal_request(
 
     now = unix_time()
 
-    if abs(now - request_timestamp) > REQUEST_TTL_SECONDS:
-        audit(
-            "internal_auth_expired_request",
-            False,
-            service_id=service_id,
-            request_id=request_id,
-        )
+    if abs(
+        now - request_timestamp
+    ) > REQUEST_TTL_SECONDS:
 
-        raise HTTPException(
-            status_code=401,
-            detail="Request timestamp expired.",
-        )
-
-    if not nonce or len(nonce) < 16:
-        audit(
-            "internal_auth_invalid_nonce",
-            False,
-            service_id=service_id,
-            request_id=request_id,
-        )
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid nonce.",
-        )
-
-    if not request_id:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing request ID.",
-        )
-
-    nonce_hash = sha256_text(nonce)
-
-    with db() as conn:
-
-        existing_nonce = conn.execute(
-            """
-            SELECT nonce_hash
-            FROM used_nonces
-            WHERE nonce_hash = ?
-            """,
-            (nonce_hash,),
-        ).fetchone()
-
-        if existing_nonce:
-            audit(
-                "internal_auth_replay_detected",
-                False,
-                service_id=service_id,
-                request_id=request_id,
-            )
-
-            raise HTTPException(
-                status_code=409,
-                detail="Replay detected.",
-            )
-
-        conn.execute(
-            """
-            INSERT INTO used_nonces (
-                nonce_hash,
-                service_id,
-                request_id,
-                created_at,
-                expires_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                nonce_hash,
-                service_id,
-                request_id,
-                now,
-                now + NONCE_TTL_SECONDS,
-            ),
-        )
-
-    active_secret_hash = get_active_secret_hash(
-        service_id
-    )
-
-    if not active_secret_hash:
-        raise HTTPException(
-            status_code=503,
-            detail="No active service secret.",
-        )
-
-    supplied_secret = None
-
-    # A service secret is intentionally not accepted
-    # through query parameters or JSON payloads.
-    #
-    # This function expects the caller to pass the secret
-    # through the dedicated internal header:
-    #
-    # X-ARYA-Service-Secret
-    #
-    # The direct helper below is used by the HTTP endpoint.
-
-    audit(
-        "internal_auth_verified",
-        True,
-        service_id=service_id,
-        request_id=request_id,
-    )
-
-    return {
-        "authenticated": True,
-        "service_id": service_id,
-        "request_id": request_id,
-        "timestamp": request_timestamp,
-    }
-
-
-# ============================================================
-# Full Header-Based Verification
-# ============================================================
-
-async def verify_request_from_headers(
-    request: Request,
-    service_id: Optional[str],
-    timestamp: Optional[str],
-    nonce: Optional[str],
-    request_id: Optional[str],
-    signature: Optional[str],
-    service_secret: Optional[str],
-) -> Dict[str, Any]:
-
-    if not service_id:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing X-ARYA-Service-ID.",
-        )
-
-    if not timestamp:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing X-ARYA-Timestamp.",
-        )
-
-    if not nonce:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing X-ARYA-Nonce.",
-        )
-
-    if not request_id:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing X-ARYA-Request-ID.",
-        )
-
-    if not signature:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing X-ARYA-Signature.",
-        )
-
-    if not service_secret:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing X-ARYA-Service-Secret.",
-        )
-
-    service = get_service(service_id)
-
-    if not service:
-        raise HTTPException(
-            status_code=401,
-            detail="Unknown internal service.",
-        )
-
-    if not bool(service["enabled"]):
-        raise HTTPException(
-            status_code=403,
-            detail="Internal service disabled.",
-        )
-
-    try:
-        request_timestamp = int(timestamp)
-    except Exception:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid timestamp.",
-        )
-
-    if abs(unix_time() - request_timestamp) > REQUEST_TTL_SECONDS:
         audit(
             "internal_auth_expired",
             False,
             service_id=service_id,
             request_id=request_id,
-            source_ip=request.client.host if request.client else None,
+            source_ip=source_ip,
         )
 
         raise HTTPException(
@@ -849,13 +1008,22 @@ async def verify_request_from_headers(
     body = await request.body()
 
     if len(body) > MAX_BODY_BYTES:
+        audit(
+            "internal_auth_body_too_large",
+            False,
+            service_id=service_id,
+            request_id=request_id,
+            source_ip=source_ip,
+        )
+
         raise HTTPException(
             status_code=413,
             detail="Request body is too large.",
         )
 
-    body_text = canonical_body(body)
-    body_hash = sha256_text(body_text)
+    calculated_body_hash = body_hash(
+        body
+    )
 
     expected_signature = build_signature(
         secret=service_secret,
@@ -865,19 +1033,20 @@ async def verify_request_from_headers(
         timestamp=timestamp,
         nonce=nonce,
         request_id=request_id,
-        body_hash=body_hash,
+        body_hash_value=calculated_body_hash,
     )
 
     if not constant_compare(
         expected_signature,
         signature,
     ):
+
         audit(
             "internal_auth_bad_signature",
             False,
             service_id=service_id,
             request_id=request_id,
-            source_ip=request.client.host if request.client else None,
+            source_ip=source_ip,
         )
 
         raise HTTPException(
@@ -885,26 +1054,35 @@ async def verify_request_from_headers(
             detail="Invalid internal signature.",
         )
 
-    stored_secret_hash = get_active_secret_hash(
-        service_id
+    stored_secret_hash = (
+        get_active_secret_hash(
+            service_id
+        )
     )
 
     if not stored_secret_hash:
         raise HTTPException(
             status_code=503,
-            detail="Service secret is unavailable.",
+            detail=(
+                "Service secret is unavailable."
+            ),
         )
 
+    supplied_secret_hash = hash_secret(
+        service_secret
+    )
+
     if not constant_compare(
-        hash_secret(service_secret),
+        supplied_secret_hash,
         stored_secret_hash,
     ):
+
         audit(
             "internal_auth_bad_secret",
             False,
             service_id=service_id,
             request_id=request_id,
-            source_ip=request.client.host if request.client else None,
+            source_ip=source_ip,
         )
 
         raise HTTPException(
@@ -912,52 +1090,18 @@ async def verify_request_from_headers(
             detail="Invalid service secret.",
         )
 
-    nonce_hash = sha256_text(nonce)
+    # Reserve nonce only AFTER all authentication
+    # checks have succeeded. This prevents attackers
+    # from consuming valid nonces with invalid secrets.
+    reserve_nonce(
+        service_id=service_id,
+        nonce=nonce,
+        request_id=request_id,
+    )
+
+    now_iso = utc_now()
 
     with db() as conn:
-        existing_nonce = conn.execute(
-            """
-            SELECT nonce_hash
-            FROM used_nonces
-            WHERE nonce_hash = ?
-            """,
-            (nonce_hash,),
-        ).fetchone()
-
-        if existing_nonce:
-            audit(
-                "internal_auth_replay",
-                False,
-                service_id=service_id,
-                request_id=request_id,
-                source_ip=request.client.host if request.client else None,
-            )
-
-            raise HTTPException(
-                status_code=409,
-                detail="Replay detected.",
-            )
-
-        conn.execute(
-            """
-            INSERT INTO used_nonces (
-                nonce_hash,
-                service_id,
-                request_id,
-                created_at,
-                expires_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (
-                nonce_hash,
-                service_id,
-                request_id,
-                unix_time(),
-                unix_time() + NONCE_TTL_SECONDS,
-            ),
-        )
-
         conn.execute(
             """
             UPDATE services
@@ -966,8 +1110,8 @@ async def verify_request_from_headers(
             WHERE service_id = ?
             """,
             (
-                utc_now(),
-                utc_now(),
+                now_iso,
+                now_iso,
                 service_id,
             ),
         )
@@ -977,14 +1121,18 @@ async def verify_request_from_headers(
         True,
         service_id=service_id,
         request_id=request_id,
-        source_ip=request.client.host if request.client else None,
+        source_ip=source_ip,
+        details={
+            "method": request.method,
+            "path": request.url.path,
+        },
     )
 
     return {
         "authenticated": True,
         "service_id": service_id,
         "request_id": request_id,
-        "body_hash": body_hash,
+        "body_hash": calculated_body_hash,
     }
 
 
@@ -1016,6 +1164,7 @@ def root():
         "service_identity": True,
         "secret_rotation": True,
         "audit_logging": True,
+        "fail_closed_internal_security": True,
     }
 
 
@@ -1053,20 +1202,19 @@ def owner_create_service(
         default=None
     ),
 ):
+
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
     )
 
-    service_id = payload.service_id.strip().lower()
+    service_id = validate_service_id(
+        payload.service_id
+    )
 
-    if not service_id.replace("_", "").isalnum():
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid service ID.",
-        )
-
-    existing = get_service(service_id)
+    existing = get_service(
+        service_id
+    )
 
     if existing:
         raise HTTPException(
@@ -1075,9 +1223,24 @@ def owner_create_service(
         )
 
     secret = generate_secret()
+    secret_hash = hash_secret(
+        secret
+    )
     now = utc_now()
 
+    metadata = dict(
+        payload.metadata
+    )
+
+    # Never allow callers to smuggle a secret
+    # into persistent metadata.
+    metadata.pop(
+        "bootstrap_secret",
+        None,
+    )
+
     with db() as conn:
+
         conn.execute(
             """
             INSERT INTO services (
@@ -1094,11 +1257,13 @@ def owner_create_service(
             """,
             (
                 service_id,
-                payload.service_name,
-                hash_secret(secret),
+                payload.service_name.strip(),
+                secret_hash,
                 now,
                 now,
-                canonical_json(payload.metadata),
+                canonical_json(
+                    metadata
+                ),
             ),
         )
 
@@ -1115,7 +1280,7 @@ def owner_create_service(
             """,
             (
                 service_id,
-                hash_secret(secret),
+                secret_hash,
                 now,
             ),
         )
@@ -1128,7 +1293,7 @@ def owner_create_service(
 
     return {
         "service_id": service_id,
-        "service_name": payload.service_name,
+        "service_name": payload.service_name.strip(),
         "version": 1,
         "secret": secret,
         "warning": (
@@ -1147,6 +1312,7 @@ def owner_list_services(
         default=None
     ),
 ):
+
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
@@ -1177,13 +1343,14 @@ def owner_list_services(
                 "service_id": row["service_id"],
                 "service_name": row["service_name"],
                 "secret_version": row["secret_version"],
-                "enabled": bool(row["enabled"]),
+                "enabled": bool(
+                    row["enabled"]
+                ),
                 "created_at": row["created_at"],
                 "updated_at": row["updated_at"],
                 "last_seen_at": row["last_seen_at"],
-                "metadata": json.loads(
+                "metadata": safe_json_loads(
                     row["metadata_json"]
-                    or "{}"
                 ),
             }
         )
@@ -1194,7 +1361,9 @@ def owner_list_services(
     }
 
 
-@app.get("/owner/services/{service_id}")
+@app.get(
+    "/owner/services/{service_id}"
+)
 def owner_service_details(
     service_id: str,
     x_arya_owner_email: Optional[str] = Header(
@@ -1204,12 +1373,19 @@ def owner_service_details(
         default=None
     ),
 ):
+
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
     )
 
-    row = get_service(service_id)
+    service_id = validate_service_id(
+        service_id
+    )
+
+    row = get_service(
+        service_id
+    )
 
     if not row:
         raise HTTPException(
@@ -1221,13 +1397,14 @@ def owner_service_details(
         "service_id": row["service_id"],
         "service_name": row["service_name"],
         "secret_version": row["secret_version"],
-        "enabled": bool(row["enabled"]),
+        "enabled": bool(
+            row["enabled"]
+        ),
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "last_seen_at": row["last_seen_at"],
-        "metadata": json.loads(
+        "metadata": safe_json_loads(
             row["metadata_json"]
-            or "{}"
         ),
     }
 
@@ -1236,7 +1413,9 @@ def owner_service_details(
 # OWNER: Enable / Disable
 # ============================================================
 
-@app.post("/owner/services/{service_id}/enable")
+@app.post(
+    "/owner/services/{service_id}/enable"
+)
 def owner_enable_service(
     service_id: str,
     x_arya_owner_email: Optional[str] = Header(
@@ -1246,9 +1425,14 @@ def owner_enable_service(
         default=None
     ),
 ):
+
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
+    )
+
+    service_id = validate_service_id(
+        service_id
     )
 
     if not get_service(service_id):
@@ -1256,6 +1440,8 @@ def owner_enable_service(
             status_code=404,
             detail="Service not found.",
         )
+
+    now = utc_now()
 
     with db() as conn:
         conn.execute(
@@ -1266,7 +1452,7 @@ def owner_enable_service(
             WHERE service_id = ?
             """,
             (
-                utc_now(),
+                now,
                 service_id,
             ),
         )
@@ -1283,7 +1469,9 @@ def owner_enable_service(
     }
 
 
-@app.post("/owner/services/{service_id}/disable")
+@app.post(
+    "/owner/services/{service_id}/disable"
+)
 def owner_disable_service(
     service_id: str,
     x_arya_owner_email: Optional[str] = Header(
@@ -1293,9 +1481,14 @@ def owner_disable_service(
         default=None
     ),
 ):
+
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
+    )
+
+    service_id = validate_service_id(
+        service_id
     )
 
     if not get_service(service_id):
@@ -1303,6 +1496,8 @@ def owner_disable_service(
             status_code=404,
             detail="Service not found.",
         )
+
+    now = utc_now()
 
     with db() as conn:
         conn.execute(
@@ -1313,7 +1508,7 @@ def owner_disable_service(
             WHERE service_id = ?
             """,
             (
-                utc_now(),
+                now,
                 service_id,
             ),
         )
@@ -1347,12 +1542,19 @@ def owner_rotate_secret(
         default=None
     ),
 ):
+
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
     )
 
-    service = get_service(service_id)
+    service_id = validate_service_id(
+        service_id
+    )
+
+    service = get_service(
+        service_id
+    )
 
     if not service:
         raise HTTPException(
@@ -1361,11 +1563,16 @@ def owner_rotate_secret(
         )
 
     new_secret = generate_secret()
+    new_hash = hash_secret(
+        new_secret
+    )
+
     now = utc_now()
 
-    new_version = int(
-        service["secret_version"]
-    ) + 1
+    new_version = (
+        int(service["secret_version"])
+        + 1
+    )
 
     with db() as conn:
 
@@ -1397,7 +1604,7 @@ def owner_rotate_secret(
             (
                 service_id,
                 new_version,
-                hash_secret(new_secret),
+                new_hash,
                 now,
             ),
         )
@@ -1411,7 +1618,7 @@ def owner_rotate_secret(
             WHERE service_id = ?
             """,
             (
-                hash_secret(new_secret),
+                new_hash,
                 new_version,
                 now,
                 service_id,
@@ -1439,7 +1646,9 @@ def owner_rotate_secret(
 # Internal Authentication Endpoint
 # ============================================================
 
-@app.post("/internal/auth/verify")
+@app.post(
+    "/internal/auth/verify"
+)
 async def internal_auth_verify(
     request: Request,
     x_arya_service_id: Optional[str] = Header(
@@ -1461,6 +1670,7 @@ async def internal_auth_verify(
         default=None
     ),
 ):
+
     result = await verify_request_from_headers(
         request=request,
         service_id=x_arya_service_id,
@@ -1481,7 +1691,9 @@ async def internal_auth_verify(
 # Internal Protected Ping
 # ============================================================
 
-@app.post("/internal/ping")
+@app.post(
+    "/internal/ping"
+)
 async def internal_ping(
     request: Request,
     x_arya_service_id: Optional[str] = Header(
@@ -1503,6 +1715,7 @@ async def internal_ping(
         default=None
     ),
 ):
+
     result = await verify_request_from_headers(
         request=request,
         service_id=x_arya_service_id,
@@ -1517,16 +1730,28 @@ async def internal_ping(
         "status": "authenticated",
         "service_id": result["service_id"],
         "request_id": result["request_id"],
+        "body_hash": result["body_hash"],
         "time": utc_now(),
     }
 
 
 # ============================================================
-# Public Service Metadata
+# Internal Service Metadata
 # ============================================================
 
-@app.get("/internal/services")
-def internal_services():
+@app.get(
+    "/internal/services"
+)
+def internal_services(
+    x_arya_internal_secret: Optional[str] = Header(
+        default=None
+    ),
+):
+
+    require_internal_gateway(
+        x_arya_internal_secret
+    )
+
     with db() as conn:
         rows = conn.execute(
             """
@@ -1547,7 +1772,9 @@ def internal_services():
                 "service_id": row["service_id"],
                 "service_name": row["service_name"],
                 "secret_version": row["secret_version"],
-                "enabled": bool(row["enabled"]),
+                "enabled": bool(
+                    row["enabled"]
+                ),
                 "last_seen_at": row["last_seen_at"],
             }
             for row in rows
@@ -1559,7 +1786,9 @@ def internal_services():
 # Security Statistics
 # ============================================================
 
-@app.get("/owner/security/stats")
+@app.get(
+    "/owner/security/stats"
+)
 def owner_security_stats(
     x_arya_owner_email: Optional[str] = Header(
         default=None
@@ -1568,6 +1797,7 @@ def owner_security_stats(
         default=None
     ),
 ):
+
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
@@ -1630,7 +1860,9 @@ def owner_security_stats(
 # OWNER Audit
 # ============================================================
 
-@app.get("/owner/security/audit")
+@app.get(
+    "/owner/security/audit"
+)
 def owner_security_audit(
     limit: int = 100,
     x_arya_owner_email: Optional[str] = Header(
@@ -1640,6 +1872,7 @@ def owner_security_audit(
         default=None
     ),
 ):
+
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
@@ -1647,7 +1880,10 @@ def owner_security_audit(
 
     limit = max(
         1,
-        min(limit, 500),
+        min(
+            int(limit),
+            500,
+        ),
     )
 
     with db() as conn:
@@ -1676,11 +1912,12 @@ def owner_security_audit(
                 "event_type": row["event_type"],
                 "service_id": row["service_id"],
                 "request_id": row["request_id"],
-                "success": bool(row["success"]),
+                "success": bool(
+                    row["success"]
+                ),
                 "source_ip": row["source_ip"],
-                "details": json.loads(
+                "details": safe_json_loads(
                     row["details_json"]
-                    or "{}"
                 ),
                 "created_at": row["created_at"],
             }
@@ -1693,7 +1930,9 @@ def owner_security_audit(
 # Maintenance
 # ============================================================
 
-@app.post("/owner/security/cleanup")
+@app.post(
+    "/owner/security/cleanup"
+)
 def owner_security_cleanup(
     x_arya_owner_email: Optional[str] = Header(
         default=None
@@ -1702,6 +1941,7 @@ def owner_security_cleanup(
         default=None
     ),
 ):
+
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
@@ -1722,10 +1962,12 @@ def owner_security_cleanup(
 
 
 # ============================================================
-# Service Secret Bootstrap / Recovery Information
+# Secret Status
 # ============================================================
 
-@app.get("/owner/services/{service_id}/secret-status")
+@app.get(
+    "/owner/services/{service_id}/secret-status"
+)
 def owner_secret_status(
     service_id: str,
     x_arya_owner_email: Optional[str] = Header(
@@ -1735,12 +1977,19 @@ def owner_secret_status(
         default=None
     ),
 ):
+
     require_owner(
         x_arya_owner_email,
         x_arya_owner_secret,
     )
 
-    service = get_service(service_id)
+    service_id = validate_service_id(
+        service_id
+    )
+
+    service = get_service(
+        service_id
+    )
 
     if not service:
         raise HTTPException(
@@ -1765,13 +2014,17 @@ def owner_secret_status(
 
     return {
         "service_id": service_id,
-        "current_version": service["secret_version"],
+        "current_version": service[
+            "secret_version"
+        ],
         "versions": [
             {
                 "version": row["version"],
                 "created_at": row["created_at"],
                 "disabled_at": row["disabled_at"],
-                "active": bool(row["active"]),
+                "active": bool(
+                    row["active"]
+                ),
             }
             for row in versions
         ],
@@ -1782,7 +2035,9 @@ def owner_secret_status(
 # Internal Security Contract
 # ============================================================
 
-@app.get("/internal/security-contract")
+@app.get(
+    "/internal/security-contract"
+)
 def security_contract():
     return {
         "version": APP_VERSION,
@@ -1806,10 +2061,12 @@ def security_contract():
             "audit_logging",
             "secret_rotation",
             "service_enable_disable",
+            "fail_closed_internal_metadata",
         ],
         "signature_algorithm": "HMAC-SHA256",
         "timestamp_window_seconds": REQUEST_TTL_SECONDS,
         "nonce_window_seconds": NONCE_TTL_SECONDS,
+        "max_body_bytes": MAX_BODY_BYTES,
     }
 
 
