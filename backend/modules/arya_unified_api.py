@@ -1,33 +1,22 @@
 """
 ARYA Unified API
 ================
-Version: 1.0.0
+Version: 2.0.0
 
 Final API composition layer for ARYA AgriDoctor.
 
 Purpose:
 - Provide one unified backend entry point for Android and Windows clients.
-- Connect Client API Gateway to Runtime Gateway.
-- Keep existing main.py untouched.
-- Keep all existing specialist services untouched.
-- Expose a stable /api/v1 contract.
-- Provide service discovery, health and system-map endpoints.
-- Forward authenticated client requests to the existing Client API Gateway.
-
-Environment:
-    ARYA_UNIFIED_API_HOST
-    ARYA_UNIFIED_API_PORT
-    ARYA_CLIENT_API_GATEWAY_URL
-    ARYA_UNIFIED_API_TIMEOUT
-    ARYA_UNIFIED_API_MAX_RESPONSE_BYTES
-    ARYA_UNIFIED_API_MAX_REQUEST_BYTES
-    ARYA_UNIFIED_API_SECRET
-    ARYA_INTERNAL_GATEWAY_SECRET
-
-Default:
-    Host: 127.0.0.1
-    Port: 8023
-    Client Gateway: http://127.0.0.1:8021
+- Connect Client API Gateway to the existing runtime/API layers.
+- Keep main.py untouched.
+- Preserve all existing /api/v1 routes.
+- Preserve legacy compatibility routes.
+- Support HMAC + legacy internal-secret authentication.
+- Propagate request IDs.
+- Normalize canonical ARYA action contracts.
+- Provide voice/payment compatibility routes.
+- Provide health, contract, service-map and system information.
+- Never accept arbitrary upstream URLs from clients.
 """
 
 from __future__ import annotations
@@ -43,7 +32,6 @@ from typing import Any, Dict, Optional
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 
 
 # ============================================================
@@ -51,7 +39,7 @@ from pydantic import BaseModel, Field
 # ============================================================
 
 APP_NAME = "ARYA Unified API"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 
 HOST = os.getenv("ARYA_UNIFIED_API_HOST", "127.0.0.1")
 PORT = int(os.getenv("ARYA_UNIFIED_API_PORT", "8023"))
@@ -66,11 +54,17 @@ UNIFIED_API_TIMEOUT = float(
 )
 
 MAX_RESPONSE_BYTES = int(
-    os.getenv("ARYA_UNIFIED_API_MAX_RESPONSE_BYTES", "10485760")
+    os.getenv(
+        "ARYA_UNIFIED_API_MAX_RESPONSE_BYTES",
+        "10485760",
+    )
 )
 
 MAX_REQUEST_BYTES = int(
-    os.getenv("ARYA_UNIFIED_API_MAX_REQUEST_BYTES", "5242880")
+    os.getenv(
+        "ARYA_UNIFIED_API_MAX_REQUEST_BYTES",
+        "5242880",
+    )
 )
 
 UNIFIED_API_SECRET = os.getenv(
@@ -84,7 +78,18 @@ INTERNAL_GATEWAY_SECRET = os.getenv(
 )
 
 REQUEST_TTL = int(
-    os.getenv("ARYA_UNIFIED_API_REQUEST_TTL", "60")
+    os.getenv(
+        "ARYA_UNIFIED_API_REQUEST_TTL",
+        "60",
+    )
+)
+
+REQUIRE_INTERNAL_SIGNATURE = (
+    os.getenv(
+        "ARYA_UNIFIED_API_REQUIRE_SIGNATURE",
+        "false",
+    ).strip().lower()
+    in {"1", "true", "yes", "on"}
 )
 
 
@@ -97,24 +102,9 @@ app = FastAPI(
     version=APP_VERSION,
     description=(
         "Unified API composition layer for ARYA AgriDoctor. "
-        "This service does not replace main.py or existing specialist services."
+        "This service does not replace main.py or specialist services."
     ),
 )
-
-
-# ============================================================
-# Models
-# ============================================================
-
-class UnifiedRequest(BaseModel):
-    payload: Dict[str, Any] = Field(default_factory=dict)
-
-
-class HealthResponse(BaseModel):
-    status: str
-    service: str
-    version: str
-    timestamp: int
 
 
 # ============================================================
@@ -125,40 +115,45 @@ def now_ts() -> int:
     return int(time.time())
 
 
-def request_id() -> str:
+def new_request_id() -> str:
     return uuid.uuid4().hex
 
 
 def constant_time_equal(a: str, b: str) -> bool:
     if not a or not b:
         return False
-    return hmac.compare_digest(a.encode(), b.encode())
+
+    try:
+        return hmac.compare_digest(
+            a.encode("utf-8"),
+            b.encode("utf-8"),
+        )
+    except Exception:
+        return False
 
 
-def sign_payload(timestamp: str, body: bytes, secret: str) -> str:
-    message = timestamp.encode() + b"." + body
+def sign_payload(
+    timestamp: str,
+    body: bytes,
+    secret: str,
+) -> str:
+    message = timestamp.encode("utf-8") + b"." + body
+
     return hmac.new(
-        secret.encode(),
+        secret.encode("utf-8"),
         message,
         hashlib.sha256,
     ).hexdigest()
 
 
-def verify_incoming_signature(
+def verify_signature(
     timestamp: Optional[str],
     signature: Optional[str],
     body: bytes,
+    secret: str,
 ) -> bool:
-    """
-    Optional HMAC verification.
-
-    If ARYA_UNIFIED_API_SECRET is not configured, signature verification
-    is skipped. This allows local development while still supporting
-    hardened production deployment.
-    """
-
-    if not UNIFIED_API_SECRET:
-        return True
+    if not secret:
+        return False
 
     if not timestamp or not signature:
         return False
@@ -174,7 +169,7 @@ def verify_incoming_signature(
     expected = sign_payload(
         timestamp,
         body,
-        UNIFIED_API_SECRET,
+        secret,
     )
 
     provided = signature.strip()
@@ -182,62 +177,167 @@ def verify_incoming_signature(
     if provided.lower().startswith("sha256="):
         provided = provided[7:]
 
-    return constant_time_equal(expected, provided)
+    return constant_time_equal(
+        expected,
+        provided,
+    )
 
 
-def validate_target_url(url: str) -> bool:
+def verify_incoming_request(
+    timestamp: Optional[str],
+    signature: Optional[str],
+    internal_secret: Optional[str],
+    body: bytes,
+) -> bool:
     """
-    This service intentionally accepts only the configured Client Gateway URL.
+    Accept the canonical HMAC contract and preserve compatibility
+    with the existing internal-secret contract.
 
-    It does not allow clients to provide arbitrary target URLs.
+    Priority:
+    1. HMAC using ARYA_UNIFIED_API_SECRET.
+    2. HMAC using ARYA_INTERNAL_GATEWAY_SECRET.
+    3. Legacy X-ARYA-Internal-Secret.
     """
 
-    return url.rstrip("/") == CLIENT_API_GATEWAY_URL
+    if UNIFIED_API_SECRET:
+        if verify_signature(
+            timestamp,
+            signature,
+            body,
+            UNIFIED_API_SECRET,
+        ):
+            return True
 
+        if REQUIRE_INTERNAL_SIGNATURE:
+            return False
+
+    if INTERNAL_GATEWAY_SECRET:
+        if verify_signature(
+            timestamp,
+            signature,
+            body,
+            INTERNAL_GATEWAY_SECRET,
+        ):
+            return True
+
+    if (
+        INTERNAL_GATEWAY_SECRET
+        and internal_secret
+        and constant_time_equal(
+            internal_secret,
+            INTERNAL_GATEWAY_SECRET,
+        )
+    ):
+        return True
+
+    if (
+        not UNIFIED_API_SECRET
+        and not INTERNAL_GATEWAY_SECRET
+        and not REQUIRE_INTERNAL_SIGNATURE
+    ):
+        return True
+
+    return False
+
+
+def validate_relative_path(path: str) -> bool:
+    if not path:
+        return True
+
+    if path.startswith(("http://", "https://")):
+        return False
+
+    if "\\" in path:
+        return False
+
+    parts = path.split("/")
+
+    if ".." in parts:
+        return False
+
+    return True
+
+
+def build_request_headers(
+    request: Optional[Request] = None,
+    request_id: Optional[str] = None,
+) -> Dict[str, str]:
+    headers: Dict[str, str] = {
+        "Accept": "application/json",
+        "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+        "X-ARYA-Internal": "true",
+        "X-ARYA-Request-ID": request_id or new_request_id(),
+    }
+
+    if INTERNAL_GATEWAY_SECRET:
+        headers["X-ARYA-Internal-Secret"] = (
+            INTERNAL_GATEWAY_SECRET
+        )
+
+    if request is not None:
+        authorization = request.headers.get("authorization")
+        if authorization:
+            headers["Authorization"] = authorization
+
+        content_type = request.headers.get("content-type")
+        if content_type:
+            headers["Content-Type"] = content_type
+
+        client_id = request.headers.get("x-client-id")
+        if client_id:
+            headers["X-Client-ID"] = client_id
+
+        device_id = request.headers.get("x-device-id")
+        if device_id:
+            headers["X-Device-ID"] = device_id
+
+        language = request.headers.get("accept-language")
+        if language:
+            headers["Accept-Language"] = language
+
+    return headers
+
+
+# ============================================================
+# Controlled gateway forwarding
+# ============================================================
 
 async def gateway_request(
     method: str,
     path: str,
     body: Optional[bytes] = None,
     headers: Optional[Dict[str, str]] = None,
+    request_id: Optional[str] = None,
 ) -> Any:
-    """
-    Controlled forwarding to Client API Gateway.
 
-    No arbitrary URL supplied by the client is accepted.
-    """
-
-    url = CLIENT_API_GATEWAY_URL + "/" + path.lstrip("/")
-
-    if not validate_target_url(
-        url.rsplit("/", 1)[0]
-        if path.strip("/")
-        else url
-    ):
+    if not validate_relative_path(path):
         raise HTTPException(
-            status_code=500,
-            detail="Configured gateway validation failed",
+            status_code=400,
+            detail="Invalid gateway path",
         )
 
-    outgoing_headers: Dict[str, str] = {
-        "Accept": "application/json",
-        "User-Agent": "ARYA-Unified-API/1.0",
-        "X-ARYA-Request-ID": request_id(),
-    }
+    normalized_path = "/" + path.lstrip("/")
+
+    url = (
+        CLIENT_API_GATEWAY_URL
+        + normalized_path
+    )
+
+    outgoing_headers = build_request_headers(
+        request_id=request_id,
+    )
 
     if headers:
         for key, value in headers.items():
             if value:
                 outgoing_headers[key] = value
 
-    if INTERNAL_GATEWAY_SECRET:
-        outgoing_headers["X-ARYA-Internal-Secret"] = (
-            INTERNAL_GATEWAY_SECRET
-        )
-
     timeout = httpx.Timeout(
         UNIFIED_API_TIMEOUT,
-        connect=min(15.0, UNIFIED_API_TIMEOUT),
+        connect=min(
+            15.0,
+            UNIFIED_API_TIMEOUT,
+        ),
     )
 
     try:
@@ -298,7 +398,7 @@ async def gateway_request(
 
 
 # ============================================================
-# Middleware
+# Request middleware
 # ============================================================
 
 @app.middleware("http")
@@ -306,7 +406,9 @@ async def request_size_middleware(
     request: Request,
     call_next,
 ):
-    content_length = request.headers.get("content-length")
+    content_length = request.headers.get(
+        "content-length"
+    )
 
     if content_length:
         try:
@@ -314,7 +416,10 @@ async def request_size_middleware(
                 return JSONResponse(
                     status_code=413,
                     content={
-                        "detail": "Request body exceeds configured limit"
+                        "detail": (
+                            "Request body exceeds "
+                            "configured limit"
+                        )
                     },
                 )
         except ValueError:
@@ -326,6 +431,51 @@ async def request_size_middleware(
             )
 
     return await call_next(request)
+
+
+# ============================================================
+# Incoming internal authentication
+# ============================================================
+
+async def verify_internal_route_request(
+    request: Request,
+) -> str:
+
+    body = await request.body()
+
+    if len(body) > MAX_REQUEST_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Request body too large",
+        )
+
+    timestamp = request.headers.get(
+        "x-arya-timestamp"
+    )
+
+    signature = request.headers.get(
+        "x-arya-signature"
+    )
+
+    internal_secret = request.headers.get(
+        "x-arya-internal-secret"
+    )
+
+    if not verify_incoming_request(
+        timestamp=timestamp,
+        signature=signature,
+        internal_secret=internal_secret,
+        body=body,
+    ):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid internal API authentication",
+        )
+
+    return request.headers.get(
+        "x-arya-request-id",
+        new_request_id(),
+    )
 
 
 # ============================================================
@@ -376,6 +526,15 @@ async def health():
 
 
 # ============================================================
+# API health compatibility
+# ============================================================
+
+@app.get("/api/v1/health")
+async def unified_health():
+    return await health()
+
+
+# ============================================================
 # Contract
 # ============================================================
 
@@ -387,7 +546,13 @@ async def api_contract():
         "base_path": "/api/v1",
         "authentication": {
             "client_session": True,
-            "hmac_supported": bool(UNIFIED_API_SECRET),
+            "hmac_supported": bool(
+                UNIFIED_API_SECRET
+                or INTERNAL_GATEWAY_SECRET
+            ),
+            "legacy_internal_secret_supported": bool(
+                INTERNAL_GATEWAY_SECRET
+            ),
         },
         "routes": {
             "login": "/api/v1/auth/login",
@@ -398,11 +563,21 @@ async def api_contract():
             "diagnose": "/api/v1/diagnose",
             "recommend": "/api/v1/recommend",
             "vision": "/api/v1/vision",
+            "voice": "/api/v1/voice",
             "weather": "/api/v1/weather",
             "geocode": "/api/v1/geocode",
+            "payment": "/api/v1/payment",
             "updates": "/api/v1/updates",
+            "updates_run": "/api/v1/updates/run",
+            "runtime": "/api/v1/runtime/{path}",
             "system_map": "/api/v1/system-map",
+            "services": "/api/v1/services",
+            "info": "/api/v1/info",
             "health": "/api/v1/health",
+        },
+        "compatibility": {
+            "api_unified": "/api/unified",
+            "legacy_arya_routes": True,
         },
         "architecture": {
             "client": [
@@ -423,29 +598,12 @@ async def api_contract():
 
 
 # ============================================================
-# Unified Health
-# ============================================================
-
-@app.get("/api/v1/health")
-async def unified_health():
-    return await health()
-
-
-# ============================================================
 # Authentication forwarding
 # ============================================================
 
 @app.post("/api/v1/auth/login")
 async def auth_login(
     request: Request,
-    x_arya_timestamp: Optional[str] = Header(
-        default=None,
-        alias="X-ARYA-Timestamp",
-    ),
-    x_arya_signature: Optional[str] = Header(
-        default=None,
-        alias="X-ARYA-Signature",
-    ),
 ):
     body = await request.body()
 
@@ -455,73 +613,50 @@ async def auth_login(
             detail="Request body too large",
         )
 
-    if not verify_incoming_signature(
-        x_arya_timestamp,
-        x_arya_signature,
-        body,
-    ):
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid API signature",
-        )
+    headers = build_request_headers(
+        request=request,
+    )
 
     return await gateway_request(
         "POST",
         "/client/login",
         body=body,
-        headers={
-            "Content-Type": request.headers.get(
-                "content-type",
-                "application/json",
-            ),
-        },
+        headers=headers,
+        request_id=headers.get(
+            "X-ARYA-Request-ID"
+        ),
     )
 
 
 @app.post("/api/v1/auth/logout")
 async def auth_logout(
-    authorization: Optional[str] = Header(
-        default=None,
-    ),
+    request: Request,
 ):
-    headers = {}
-
-    if authorization:
-        headers["Authorization"] = authorization
-
-    return await gateway_request(
-        "POST",
+    return await forward_authenticated(
+        request,
         "/client/logout",
-        headers=headers,
     )
 
 
 @app.get("/api/v1/auth/me")
 async def auth_me(
-    authorization: Optional[str] = Header(
-        default=None,
-    ),
+    request: Request,
 ):
-    headers = {}
-
-    if authorization:
-        headers["Authorization"] = authorization
-
-    return await gateway_request(
-        "GET",
+    return await forward_authenticated(
+        request,
         "/client/me",
-        headers=headers,
     )
 
 
 # ============================================================
-# Common authenticated forwarding helper
+# Common authenticated forwarding
 # ============================================================
 
 async def forward_authenticated(
     request: Request,
     gateway_path: str,
 ) -> Any:
+
     body = await request.body()
 
     if len(body) > MAX_REQUEST_BYTES:
@@ -530,50 +665,85 @@ async def forward_authenticated(
             detail="Request body too large",
         )
 
-    headers: Dict[str, str] = {}
-
-    authorization = request.headers.get("authorization")
-
-    if authorization:
-        headers["Authorization"] = authorization
-
-    content_type = request.headers.get("content-type")
-
-    if content_type:
-        headers["Content-Type"] = content_type
-
-    client_id = request.headers.get("x-client-id")
-
-    if client_id:
-        headers["X-Client-ID"] = client_id
-
-    device_id = request.headers.get("x-device-id")
-
-    if device_id:
-        headers["X-Device-ID"] = device_id
+    headers = build_request_headers(
+        request=request,
+    )
 
     return await gateway_request(
         request.method,
         gateway_path,
         body=body if body else None,
         headers=headers,
+        request_id=headers.get(
+            "X-ARYA-Request-ID"
+        ),
     )
 
 
 # ============================================================
-# Doctor / AI
+# Canonical Doctor / AI routes
 # ============================================================
 
-@app.post("/api/v1/doctor")
-async def doctor(request: Request):
+@app.api_route(
+    "/api/v1/doctor",
+    methods=["GET", "POST"],
+)
+async def doctor(
+    request: Request,
+):
     return await forward_authenticated(
         request,
         "/api/v1/doctor",
     )
 
 
+@app.api_route(
+    "/api/v1/doctor/analyze",
+    methods=["POST"],
+)
+async def doctor_analyze(
+    request: Request,
+):
+    return await forward_authenticated(
+        request,
+        "/api/v1/doctor/analyze",
+    )
+
+
+@app.api_route(
+    "/api/v1/doctor/diagnose",
+    methods=["POST"],
+)
+async def doctor_diagnose(
+    request: Request,
+):
+    return await forward_authenticated(
+        request,
+        "/api/v1/doctor/diagnose",
+    )
+
+
+@app.api_route(
+    "/api/v1/doctor/recommend",
+    methods=["POST"],
+)
+async def doctor_recommend(
+    request: Request,
+):
+    return await forward_authenticated(
+        request,
+        "/api/v1/doctor/recommend",
+    )
+
+
+# ============================================================
+# Legacy AI route compatibility
+# ============================================================
+
 @app.post("/api/v1/analyze")
-async def analyze(request: Request):
+async def analyze(
+    request: Request,
+):
     return await forward_authenticated(
         request,
         "/api/v1/analyze",
@@ -581,7 +751,9 @@ async def analyze(request: Request):
 
 
 @app.post("/api/v1/diagnose")
-async def diagnose(request: Request):
+async def diagnose(
+    request: Request,
+):
     return await forward_authenticated(
         request,
         "/api/v1/diagnose",
@@ -589,7 +761,9 @@ async def diagnose(request: Request):
 
 
 @app.post("/api/v1/recommend")
-async def recommend(request: Request):
+async def recommend(
+    request: Request,
+):
     return await forward_authenticated(
         request,
         "/api/v1/recommend",
@@ -601,7 +775,9 @@ async def recommend(request: Request):
 # ============================================================
 
 @app.post("/api/v1/vision")
-async def vision(request: Request):
+async def vision(
+    request: Request,
+):
     return await forward_authenticated(
         request,
         "/api/v1/vision",
@@ -609,11 +785,59 @@ async def vision(request: Request):
 
 
 # ============================================================
-# Location / Weather
+# Voice
+# ============================================================
+
+@app.api_route(
+    "/api/v1/voice",
+    methods=[
+        "POST",
+        "GET",
+    ],
+)
+async def voice(
+    request: Request,
+):
+    return await forward_authenticated(
+        request,
+        "/api/v1/voice",
+    )
+
+
+@app.api_route(
+    "/api/v1/voice/{voice_path:path}",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+    ],
+)
+async def voice_subroute(
+    voice_path: str,
+    request: Request,
+):
+    if not validate_relative_path(voice_path):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid voice path",
+        )
+
+    return await forward_authenticated(
+        request,
+        "/api/v1/voice/" + voice_path,
+    )
+
+
+# ============================================================
+# Weather / Geocode
 # ============================================================
 
 @app.post("/api/v1/weather")
-async def weather(request: Request):
+async def weather(
+    request: Request,
+):
     return await forward_authenticated(
         request,
         "/api/v1/weather",
@@ -621,10 +845,58 @@ async def weather(request: Request):
 
 
 @app.post("/api/v1/geocode")
-async def geocode(request: Request):
+async def geocode(
+    request: Request,
+):
     return await forward_authenticated(
         request,
         "/api/v1/geocode",
+    )
+
+
+# ============================================================
+# Payment
+# ============================================================
+
+@app.api_route(
+    "/api/v1/payment",
+    methods=[
+        "GET",
+        "POST",
+    ],
+)
+async def payment(
+    request: Request,
+):
+    return await forward_authenticated(
+        request,
+        "/api/v1/payment",
+    )
+
+
+@app.api_route(
+    "/api/v1/payment/{payment_path:path}",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+    ],
+)
+async def payment_subroute(
+    payment_path: str,
+    request: Request,
+):
+    if not validate_relative_path(payment_path):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid payment path",
+        )
+
+    return await forward_authenticated(
+        request,
+        "/api/v1/payment/" + payment_path,
     )
 
 
@@ -634,19 +906,11 @@ async def geocode(request: Request):
 
 @app.get("/api/v1/updates")
 async def updates(
-    authorization: Optional[str] = Header(
-        default=None,
-    ),
+    request: Request,
 ):
-    headers = {}
-
-    if authorization:
-        headers["Authorization"] = authorization
-
-    return await gateway_request(
-        "GET",
+    return await forward_authenticated(
+        request,
         "/api/v1/updates",
-        headers=headers,
     )
 
 
@@ -666,19 +930,11 @@ async def updates_run(
 
 @app.get("/api/v1/system-map")
 async def system_map(
-    authorization: Optional[str] = Header(
-        default=None,
-    ),
+    request: Request,
 ):
-    headers = {}
-
-    if authorization:
-        headers["Authorization"] = authorization
-
-    return await gateway_request(
-        "GET",
+    return await forward_authenticated(
+        request,
         "/api/v1/system-map",
-        headers=headers,
     )
 
 
@@ -700,21 +956,7 @@ async def runtime_forward(
     runtime_path: str,
     request: Request,
 ):
-    """
-    Controlled compatibility route.
-
-    The client cannot specify a host or arbitrary URL.
-    Only a relative path is accepted and forwarded to the existing
-    Client API Gateway runtime endpoint.
-    """
-
-    if runtime_path.startswith(("http://", "https://")):
-        raise HTTPException(
-            status_code=400,
-            detail="Absolute URLs are not allowed",
-        )
-
-    if ".." in runtime_path.split("/"):
+    if not validate_relative_path(runtime_path):
         raise HTTPException(
             status_code=400,
             detail="Invalid runtime path",
@@ -723,6 +965,175 @@ async def runtime_forward(
     return await forward_authenticated(
         request,
         "/api/v1/runtime/" + runtime_path,
+    )
+
+
+# ============================================================
+# Unified compatibility route
+# ============================================================
+
+@app.api_route(
+    "/api/unified",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+    ],
+)
+async def unified_compatibility(
+    request: Request,
+):
+    """
+    Compatibility endpoint for Final Integration and older clients.
+
+    It forwards the request to the corresponding canonical
+    /api/v1 contract without exposing an arbitrary upstream.
+    """
+
+    body = await request.body()
+
+    if len(body) > MAX_REQUEST_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="Request body too large",
+        )
+
+    payload: Dict[str, Any] = {}
+
+    if body:
+        try:
+            decoded = json.loads(
+                body.decode("utf-8")
+            )
+
+            if isinstance(decoded, dict):
+                payload = decoded
+
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            payload = {}
+
+    action = str(
+        payload.get("action", "")
+    ).strip().lower()
+
+    action_map = {
+        "doctor": "/api/v1/doctor",
+        "analyze": "/api/v1/doctor/analyze",
+        "diagnose": "/api/v1/doctor/diagnose",
+        "recommend": "/api/v1/doctor/recommend",
+        "vision": "/api/v1/vision",
+        "voice": "/api/v1/voice",
+        "weather": "/api/v1/weather",
+        "geocode": "/api/v1/geocode",
+        "payment": "/api/v1/payment",
+        "updates": "/api/v1/updates",
+        "updates_run": "/api/v1/updates/run",
+    }
+
+    target = action_map.get(
+        action,
+        "/api/v1/doctor",
+    )
+
+    if payload.get("payload") is not None:
+        forwarded_payload = payload["payload"]
+
+        try:
+            forwarded_body = json.dumps(
+                forwarded_payload,
+                ensure_ascii=False,
+            ).encode("utf-8")
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid unified payload",
+            ) from exc
+    else:
+        forwarded_body = body
+
+    headers = build_request_headers(
+        request=request,
+        request_id=payload.get(
+            "request_id"
+        ) or request.headers.get(
+            "x-arya-request-id"
+        ),
+    )
+
+    if forwarded_body:
+        headers["Content-Type"] = "application/json"
+
+    return await gateway_request(
+        request.method,
+        target,
+        body=(
+            forwarded_body
+            if forwarded_body
+            else None
+        ),
+        headers=headers,
+        request_id=headers.get(
+            "X-ARYA-Request-ID"
+        ),
+    )
+
+
+# ============================================================
+# Legacy /arya compatibility
+# ============================================================
+
+@app.api_route(
+    "/arya/{action:path}",
+    methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+    ],
+)
+async def legacy_arya_route(
+    action: str,
+    request: Request,
+):
+    """
+    Compatibility for older ARYA gateway callers.
+
+    No arbitrary host is accepted.
+    """
+
+    if not validate_relative_path(action):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid ARYA path",
+        )
+
+    action_clean = action.strip("/")
+
+    aliases = {
+        "doctor": "/api/v1/doctor",
+        "analyze": "/api/v1/doctor/analyze",
+        "diagnose": "/api/v1/doctor/diagnose",
+        "recommend": "/api/v1/doctor/recommend",
+        "vision": "/api/v1/vision",
+        "voice": "/api/v1/voice",
+        "weather": "/api/v1/weather",
+        "geocode": "/api/v1/geocode",
+        "payment": "/api/v1/payment",
+        "updates": "/api/v1/updates",
+        "updates/run": "/api/v1/updates/run",
+    }
+
+    target = aliases.get(
+        action_clean,
+        "/api/v1/" + action_clean,
+    )
+
+    return await forward_authenticated(
+        request,
+        target,
     )
 
 
@@ -815,7 +1226,7 @@ async def info():
 
 
 # ============================================================
-# Error handlers
+# Error handler
 # ============================================================
 
 @app.exception_handler(Exception)
@@ -828,7 +1239,7 @@ async def generic_exception_handler(
         content={
             "error": "internal_server_error",
             "service": APP_NAME,
-            "request_id": request_id(),
+            "request_id": new_request_id(),
         },
     )
 
