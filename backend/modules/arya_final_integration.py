@@ -1,39 +1,22 @@
 """
 ARYA AgriDoctor
 Final Integration Layer
-Version: 1.1.0
+Version: 2.0.0
 
 Purpose:
-    Final integration/orchestration layer for the ARYA backend.
-
-Architecture:
-
-    CLIENT
-       ↓
-    CLIENT API GATEWAY
-       ↓
-    ARYA FINAL INTEGRATION
-       ↓
-    ARYA UNIFIED API
-       ↓
-    RUNTIME CONFIG BRIDGE
-       ↓
-    SERVICE RUNTIME / RUNTIME GATEWAY
-       ↓
-    ARYA SERVICES
-       ↓
-    MAIN API BRIDGE
-       ↓
-    backend/main.py
+    Stable final integration/orchestration layer for ARYA.
 
 Important:
     - backend/main.py is NOT modified.
-    - Existing modules are NOT modified.
-    - This module is independent.
+    - Existing services are NOT deleted.
     - Internal URLs are configuration driven.
     - No arbitrary user supplied URLs are proxied.
     - Request/response limits are enforced.
-    - Internal HMAC signing is supported.
+    - Canonical internal authentication is supported.
+    - Legacy X-ARYA-Internal-Secret authentication is preserved.
+    - HMAC authentication is fail-closed when explicitly required.
+    - Request IDs are propagated.
+    - Unified API route compatibility is preserved.
 """
 
 from __future__ import annotations
@@ -47,9 +30,10 @@ import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from urllib.parse import urlsplit
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
@@ -59,11 +43,11 @@ from pydantic import BaseModel, Field
 # ============================================================
 
 APP_NAME = "ARYA Final Integration"
-APP_VERSION = "1.1.0"
+APP_VERSION = "2.0.0"
 
 HOST = os.getenv(
     "ARYA_FINAL_INTEGRATION_HOST",
-    "127.0.0.1",
+    "0.0.0.0",
 )
 
 PORT = int(
@@ -73,9 +57,8 @@ PORT = int(
     )
 )
 
-
 # ------------------------------------------------------------
-# Core services
+# Internal services
 # ------------------------------------------------------------
 
 UNIFIED_API_URL = os.getenv(
@@ -114,14 +97,14 @@ MAIN_API_BRIDGE_URL = os.getenv(
 ).rstrip("/")
 
 
-# ------------------------------------------------------------
+# ============================================================
 # Security
-# ------------------------------------------------------------
+# ============================================================
 
 INTERNAL_SECRET = os.getenv(
     "ARYA_INTERNAL_GATEWAY_SECRET",
     "",
-)
+).strip()
 
 REQUIRE_INTERNAL_SIGNATURE = (
     os.getenv(
@@ -131,10 +114,26 @@ REQUIRE_INTERNAL_SIGNATURE = (
     in {"1", "true", "yes", "on"}
 )
 
+REQUIRE_INTERNAL_HEADER = (
+    os.getenv(
+        "ARYA_FINAL_REQUIRE_INTERNAL_HEADER",
+        "false",
+    ).strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 
-# ------------------------------------------------------------
-# Limits
-# ------------------------------------------------------------
+SEND_LEGACY_INTERNAL_SECRET = (
+    os.getenv(
+        "ARYA_FINAL_SEND_LEGACY_INTERNAL_SECRET",
+        "true",
+    ).strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+
+
+# ============================================================
+# Limits / resilience
+# ============================================================
 
 REQUEST_TIMEOUT = float(
     os.getenv(
@@ -143,10 +142,10 @@ REQUEST_TIMEOUT = float(
     )
 )
 
-MAX_RESPONSE_BYTES = int(
+CONNECT_TIMEOUT = float(
     os.getenv(
-        "ARYA_FINAL_INTEGRATION_MAX_RESPONSE_BYTES",
-        str(10 * 1024 * 1024),
+        "ARYA_FINAL_INTEGRATION_CONNECT_TIMEOUT",
+        "10",
     )
 )
 
@@ -157,11 +156,48 @@ MAX_REQUEST_BYTES = int(
     )
 )
 
-HEALTH_CACHE_SECONDS = int(
+MAX_RESPONSE_BYTES = int(
+    os.getenv(
+        "ARYA_FINAL_INTEGRATION_MAX_RESPONSE_BYTES",
+        str(16 * 1024 * 1024),
+    )
+)
+
+HEALTH_CACHE_SECONDS = float(
     os.getenv(
         "ARYA_FINAL_INTEGRATION_HEALTH_CACHE_SECONDS",
         "10",
     )
+)
+
+MAX_RETRIES = max(
+    0,
+    int(
+        os.getenv(
+            "ARYA_FINAL_INTEGRATION_MAX_RETRIES",
+            "1",
+        )
+    ),
+)
+
+CIRCUIT_FAILURE_THRESHOLD = max(
+    1,
+    int(
+        os.getenv(
+            "ARYA_FINAL_INTEGRATION_CIRCUIT_THRESHOLD",
+            "3",
+        )
+    ),
+)
+
+CIRCUIT_COOLDOWN_SECONDS = max(
+    1.0,
+    float(
+        os.getenv(
+            "ARYA_FINAL_INTEGRATION_CIRCUIT_COOLDOWN",
+            "30",
+        )
+    ),
 )
 
 
@@ -174,18 +210,20 @@ app = FastAPI(
     version=APP_VERSION,
     description=(
         "Final integration layer connecting ARYA client, "
-        "unified API, runtime, configuration and main API layers."
+        "unified API, runtime, configuration and main API."
     ),
 )
 
 
 # ============================================================
-# Runtime State
+# Runtime state
 # ============================================================
 
 _started_at = time.time()
 
 _health_cache: Dict[str, Dict[str, Any]] = {}
+
+_failure_state: Dict[str, Dict[str, Any]] = {}
 
 _state_lock = asyncio.Lock()
 
@@ -236,7 +274,21 @@ def new_request_id() -> str:
     return str(uuid.uuid4())
 
 
+def normalize_request_id(
+    request_id: Optional[str],
+) -> str:
+
+    if request_id:
+        value = str(request_id).strip()
+
+        if value:
+            return value[:200]
+
+    return new_request_id()
+
+
 def safe_json(value: Any) -> Any:
+
     try:
         json.dumps(
             value,
@@ -248,78 +300,42 @@ def safe_json(value: Any) -> Any:
         return str(value)
 
 
-def normalize_request_id(
-    request_id: Optional[str],
-) -> str:
+def serialize_payload(
+    payload: Any,
+) -> bytes:
 
-    if request_id:
-        request_id = str(request_id).strip()
+    try:
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
 
-        if request_id:
-            return request_id[:200]
+    except Exception as exc:
 
-    return new_request_id()
-
-
-# ============================================================
-# Internal Security
-# ============================================================
-
-def sign_body(body: bytes) -> str:
-
-    if not INTERNAL_SECRET:
-        return ""
-
-    return hmac.new(
-        INTERNAL_SECRET.encode("utf-8"),
-        body,
-        hashlib.sha256,
-    ).hexdigest()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Request payload is not JSON serializable: "
+                f"{exc}"
+            ),
+        )
 
 
-def internal_headers(
-    body: bytes = b"",
-    request_id: Optional[str] = None,
-) -> Dict[str, str]:
-
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "X-ARYA-Internal": "1",
-        "X-ARYA-Request-ID": (
-            request_id or new_request_id()
-        ),
-    }
-
-    signature = sign_body(body)
-
-    if signature:
-        headers["X-ARYA-Signature"] = signature
-
-    return headers
-
-
-def verify_internal_signature(
+def validate_payload_size(
     body: bytes,
-    signature: Optional[str],
-) -> bool:
+) -> None:
 
-    if not INTERNAL_SECRET:
-        return not REQUIRE_INTERNAL_SIGNATURE
+    if len(body) > MAX_REQUEST_BYTES:
 
-    if not signature:
-        return False
-
-    expected = sign_body(body)
-
-    return hmac.compare_digest(
-        expected,
-        signature.strip(),
-    )
+        raise HTTPException(
+            status_code=413,
+            detail="Request body is too large.",
+        )
 
 
 # ============================================================
-# Approved Internal Services
+# Approved internal services
 # ============================================================
 
 def approved_services() -> Dict[str, str]:
@@ -347,18 +363,9 @@ def validate_internal_url(
     }
 
 
-# ============================================================
-# HTTP Client
-# ============================================================
-
-async def http_request(
-    method: str,
+def validate_internal_target(
     url: str,
-    *,
-    json_body: Optional[Dict[str, Any]] = None,
-    timeout: Optional[float] = None,
-    request_id: Optional[str] = None,
-) -> Any:
+) -> None:
 
     if not validate_internal_url(url):
 
@@ -370,110 +377,415 @@ async def http_request(
             ),
         )
 
+
+# ============================================================
+# HMAC security
+# ============================================================
+
+def sign_body(
+    body: bytes,
+) -> str:
+
+    if not INTERNAL_SECRET:
+        return ""
+
+    return hmac.new(
+        INTERNAL_SECRET.encode("utf-8"),
+        body,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def internal_headers(
+    body: bytes = b"",
+    request_id: Optional[str] = None,
+) -> Dict[str, str]:
+
+    rid = normalize_request_id(
+        request_id
+    )
+
+    headers: Dict[str, str] = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "X-ARYA-Internal": "1",
+        "X-ARYA-Request-ID": rid,
+    }
+
+    if INTERNAL_SECRET:
+
+        signature = sign_body(body)
+
+        headers["X-ARYA-Signature"] = signature
+
+        if SEND_LEGACY_INTERNAL_SECRET:
+
+            headers[
+                "X-ARYA-Internal-Secret"
+            ] = INTERNAL_SECRET
+
+    return headers
+
+
+def verify_internal_signature(
+    body: bytes,
+    signature: Optional[str],
+) -> bool:
+
+    if not INTERNAL_SECRET:
+
+        return not REQUIRE_INTERNAL_SIGNATURE
+
+    if not signature:
+
+        return False
+
+    expected = sign_body(body)
+
+    return hmac.compare_digest(
+        expected,
+        signature.strip(),
+    )
+
+
+# ============================================================
+# Incoming request security
+# ============================================================
+
+async def verify_incoming_request(
+    request: Request,
+) -> str:
+
+    request_id = normalize_request_id(
+        request.headers.get(
+            "X-ARYA-Request-ID"
+        )
+    )
+
+    body = await request.body()
+
+    validate_payload_size(body)
+
+    internal_header = (
+        request.headers.get(
+            "X-ARYA-Internal",
+            "",
+        ).strip().lower()
+    )
+
+    if REQUIRE_INTERNAL_HEADER:
+
+        if internal_header not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+
+            raise HTTPException(
+                status_code=401,
+                detail="ARYA internal header is required.",
+            )
+
+    if REQUIRE_INTERNAL_SIGNATURE:
+
+        signature = request.headers.get(
+            "X-ARYA-Signature",
+        )
+
+        if not verify_internal_signature(
+            body,
+            signature,
+        ):
+
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid ARYA internal signature.",
+            )
+
+    return request_id
+
+
+# ============================================================
+# Circuit breaker
+# ============================================================
+
+def circuit_is_open(
+    service_name: str,
+) -> bool:
+
+    state = _failure_state.get(
+        service_name
+    )
+
+    if not state:
+        return False
+
+    opened_at = state.get(
+        "opened_at"
+    )
+
+    if not opened_at:
+        return False
+
+    if (
+        time.time() - opened_at
+        >= CIRCUIT_COOLDOWN_SECONDS
+    ):
+
+        state["opened_at"] = None
+        state["failures"] = 0
+
+        return False
+
+    return True
+
+
+def record_success(
+    service_name: str,
+) -> None:
+
+    state = _failure_state.setdefault(
+        service_name,
+        {
+            "failures": 0,
+            "opened_at": None,
+        },
+    )
+
+    state["failures"] = 0
+    state["opened_at"] = None
+
+
+def record_failure(
+    service_name: str,
+) -> None:
+
+    state = _failure_state.setdefault(
+        service_name,
+        {
+            "failures": 0,
+            "opened_at": None,
+        },
+    )
+
+    state["failures"] = int(
+        state.get("failures", 0)
+    ) + 1
+
+    if (
+        state["failures"]
+        >= CIRCUIT_FAILURE_THRESHOLD
+    ):
+
+        state["opened_at"] = time.time()
+
+
+def service_name_from_url(
+    url: str,
+) -> str:
+
+    for name, value in approved_services().items():
+
+        if url.rstrip("/") == value.rstrip("/"):
+            return name
+
+    return url
+
+
+# ============================================================
+# HTTP client
+# ============================================================
+
+async def http_request(
+    method: str,
+    url: str,
+    *,
+    json_body: Optional[Dict[str, Any]] = None,
+    timeout: Optional[float] = None,
+    request_id: Optional[str] = None,
+) -> Any:
+
+    validate_internal_target(url)
+
+    method_upper = method.upper()
+
+    service_name = service_name_from_url(
+        url
+    )
+
+    if circuit_is_open(service_name):
+
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"ARYA internal service circuit is open: "
+                f"{service_name}"
+            ),
+        )
+
     body = b""
 
     if json_body is not None:
 
-        try:
-            body = json.dumps(
-                json_body,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
+        body = serialize_payload(
+            json_body
+        )
 
-        except Exception:
-
-            raise HTTPException(
-                status_code=400,
-                detail="Request payload is not JSON serializable.",
-            )
-
-        if len(body) > MAX_REQUEST_BYTES:
-
-            raise HTTPException(
-                status_code=413,
-                detail="Request body is too large.",
-            )
+        validate_payload_size(body)
 
     headers = internal_headers(
         body,
         request_id=request_id,
     )
 
-    try:
+    request_timeout = httpx.Timeout(
+        timeout or REQUEST_TIMEOUT,
+        connect=CONNECT_TIMEOUT,
+    )
 
-        async with httpx.AsyncClient(
-            timeout=timeout or REQUEST_TIMEOUT,
-            follow_redirects=False,
-        ) as client:
+    attempts = 1
 
-            response = await client.request(
-                method.upper(),
-                url,
-                content=(
-                    body
-                    if json_body is not None
-                    else None
-                ),
-                headers=headers,
-            )
+    if method_upper in {
+        "GET",
+        "HEAD",
+        "OPTIONS",
+    }:
 
-    except httpx.TimeoutException:
+        attempts += MAX_RETRIES
 
-        raise HTTPException(
-            status_code=504,
-            detail="ARYA internal service timeout.",
-        )
+    last_error: Optional[Exception] = None
 
-    except httpx.RequestError as exc:
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "ARYA internal service connection failed: "
-                f"{str(exc)}"
-            ),
-        )
-
-    if len(response.content) > MAX_RESPONSE_BYTES:
-
-        raise HTTPException(
-            status_code=502,
-            detail=(
-                "Internal service response is too large."
-            ),
-        )
-
-    content_type = response.headers.get(
-        "content-type",
-        "",
-    ).lower()
-
-    if "application/json" in content_type:
+    for attempt in range(attempts):
 
         try:
-            data = response.json()
 
-        except Exception:
+            async with httpx.AsyncClient(
+                timeout=request_timeout,
+                follow_redirects=False,
+                max_redirects=0,
+            ) as client:
 
-            data = {
-                "raw": response.text,
-            }
+                response = await client.request(
+                    method_upper,
+                    url,
+                    content=(
+                        body
+                        if json_body is not None
+                        else None
+                    ),
+                    headers=headers,
+                )
 
-    else:
+            if len(response.content) > MAX_RESPONSE_BYTES:
 
-        data = {
-            "raw": response.text,
-        }
+                record_failure(service_name)
 
-    if response.status_code >= 400:
+                raise HTTPException(
+                    status_code=502,
+                    detail=(
+                        "Internal service response "
+                        "is too large."
+                    ),
+                )
 
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=safe_json(data),
-        )
+            content_type = response.headers.get(
+                "content-type",
+                "",
+            ).lower()
 
-    return data
+            if "application/json" in content_type:
+
+                try:
+                    data = response.json()
+
+                except Exception:
+                    data = {
+                        "raw": response.text,
+                    }
+
+            else:
+
+                data = {
+                    "raw": response.text,
+                }
+
+            if response.status_code >= 500:
+
+                record_failure(service_name)
+
+                if attempt + 1 < attempts:
+
+                    await asyncio.sleep(
+                        0.25 * (attempt + 1)
+                    )
+
+                    continue
+
+            elif response.status_code < 400:
+
+                record_success(service_name)
+
+            if response.status_code >= 400:
+
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=safe_json(data),
+                )
+
+            return data
+
+        except HTTPException:
+            raise
+
+        except httpx.TimeoutException as exc:
+
+            last_error = exc
+            record_failure(service_name)
+
+            if attempt + 1 < attempts:
+
+                await asyncio.sleep(
+                    0.25 * (attempt + 1)
+                )
+
+                continue
+
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    "ARYA internal service timeout."
+                ),
+            )
+
+        except httpx.RequestError as exc:
+
+            last_error = exc
+            record_failure(service_name)
+
+            if attempt + 1 < attempts:
+
+                await asyncio.sleep(
+                    0.25 * (attempt + 1)
+                )
+
+                continue
+
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    "ARYA internal service connection "
+                    f"failed: {str(exc)}"
+                ),
+            )
+
+    raise HTTPException(
+        status_code=502,
+        detail=(
+            "ARYA internal request failed: "
+            f"{last_error}"
+        ),
+    )
 
 
 async def service_get(
@@ -503,39 +815,6 @@ async def service_post(
         f"{base_url}{path}",
         json_body=payload or {},
         request_id=request_id,
-    )
-
-
-# ============================================================
-# Incoming Internal Signature
-# ============================================================
-
-async def verify_incoming_request(
-    request: Request,
-) -> Optional[str]:
-
-    if not REQUIRE_INTERNAL_SIGNATURE:
-
-        return None
-
-    body = await request.body()
-
-    signature = request.headers.get(
-        "X-ARYA-Signature",
-    )
-
-    if not verify_internal_signature(
-        body,
-        signature,
-    ):
-
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid ARYA internal signature.",
-        )
-
-    return request.headers.get(
-        "X-ARYA-Request-ID",
     )
 
 
@@ -570,19 +849,17 @@ async def check_service(
             "/health",
         )
 
-        elapsed = round(
-            (
-                time.perf_counter()
-                - started
-            ) * 1000,
-            2,
-        )
-
         health = {
             "service": name,
             "url": base_url,
             "status": "online",
-            "latency_ms": elapsed,
+            "latency_ms": round(
+                (
+                    time.perf_counter()
+                    - started
+                ) * 1000,
+                2,
+            ),
             "response": result,
             "checked_at": utc_now(),
         }
@@ -623,8 +900,7 @@ async def all_health() -> Dict[str, Any]:
                 url,
             )
             for name, url in services.items()
-        ],
-        return_exceptions=False,
+        ]
     )
 
     online = sum(
@@ -678,9 +954,10 @@ async def root():
             "internal_secret_configured": bool(
                 INTERNAL_SECRET
             ),
-            "signature_required": (
-                REQUIRE_INTERNAL_SIGNATURE
-            ),
+            "signature_required":
+                REQUIRE_INTERNAL_SIGNATURE,
+            "internal_header_required":
+                REQUIRE_INTERNAL_HEADER,
         },
     }
 
@@ -714,7 +991,6 @@ async def system_map():
         "timestamp": utc_now(),
 
         "layers": {
-
             "client": {
                 "client_api_gateway":
                     CLIENT_API_GATEWAY_URL,
@@ -810,7 +1086,7 @@ async def features():
 
 
 # ============================================================
-# Runtime Services
+# Runtime services
 # ============================================================
 
 @app.get("/runtime/services")
@@ -898,53 +1174,190 @@ async def runtime_system_map():
 
 
 # ============================================================
-# Unified API Proxy
+# Unified API compatibility proxy
 # ============================================================
+
+async def unified_action(
+    action: str,
+    payload: Dict[str, Any],
+    request_id: Optional[str] = None,
+) -> Any:
+
+    rid = normalize_request_id(
+        request_id
+    )
+
+    # Canonical Unified API routes.
+    routes = {
+        "doctor":
+            "/api/v1/doctor",
+
+        "analyze":
+            "/api/v1/doctor/analyze",
+
+        "diagnose":
+            "/api/v1/doctor/diagnose",
+
+        "recommend":
+            "/api/v1/doctor/recommend",
+
+        "vision":
+            "/api/v1/vision",
+
+        "weather":
+            "/api/v1/weather",
+
+        "geocode":
+            "/api/v1/geocode",
+
+        "payment":
+            "/api/v1/payment",
+
+        "updates":
+            "/api/v1/updates",
+
+        "updates_run":
+            "/api/v1/updates/run",
+
+        "voice":
+            "/api/v1/voice",
+    }
+
+    route = routes.get(action)
+
+    if route is None:
+
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported ARYA action: {action}",
+        )
+
+    envelope = {
+        "action": action,
+        "payload": payload,
+        "request_id": rid,
+    }
+
+    try:
+
+        return await service_post(
+            UNIFIED_API_URL,
+            route,
+            envelope,
+            request_id=rid,
+        )
+
+    except HTTPException as exc:
+
+        # Compatibility fallback for older Unified API
+        # deployments that still expose /api or /arya/doctor.
+        if exc.status_code not in {
+            404,
+            405,
+        }:
+
+            raise
+
+        legacy_routes = {
+            "doctor": "/arya/doctor",
+            "analyze": "/arya/analyze",
+            "diagnose": "/arya/diagnose",
+            "recommend": "/arya/recommend",
+            "vision": "/arya/vision",
+            "weather": "/arya/weather",
+            "geocode": "/arya/geocode",
+            "payment": "/arya/payment",
+            "updates": "/arya/updates",
+            "updates_run": "/arya/updates/run",
+            "voice": "/arya/voice",
+        }
+
+        legacy_route = legacy_routes.get(
+            action
+        )
+
+        if legacy_route:
+
+            return await service_post(
+                UNIFIED_API_URL,
+                legacy_route,
+                envelope,
+                request_id=rid,
+            )
+
+        raise
+
 
 @app.post("/api/unified")
 async def unified_api_proxy(
     request: Request,
 ):
 
-    request_id = (
-        request.headers.get(
-            "X-ARYA-Request-ID"
-        )
-        or new_request_id()
+    request_id = await verify_incoming_request(
+        request
     )
 
     raw = await request.body()
 
-    if len(raw) > MAX_REQUEST_BYTES:
+    if not raw:
 
-        raise HTTPException(
-            status_code=413,
-            detail="Request body is too large.",
-        )
+        payload: Dict[str, Any] = {}
 
-    try:
+    else:
 
-        payload = json.loads(
-            raw.decode("utf-8")
-        )
+        try:
 
-    except Exception:
+            payload = json.loads(
+                raw.decode("utf-8")
+            )
+
+        except Exception:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid JSON body.",
+            )
+
+    if not isinstance(payload, dict):
 
         raise HTTPException(
             status_code=400,
-            detail="Invalid JSON body.",
+            detail="JSON body must be an object.",
         )
 
-    return await service_post(
-        UNIFIED_API_URL,
-        "/api",
+    action = str(
+        payload.get(
+            "action",
+            "doctor",
+        )
+    )
+
+    inner_payload = payload.get(
+        "payload",
         payload,
-        request_id=request_id,
+    )
+
+    if not isinstance(
+        inner_payload,
+        dict,
+    ):
+
+        inner_payload = {
+            "value": inner_payload,
+        }
+
+    return await unified_action(
+        action,
+        inner_payload,
+        payload.get(
+            "request_id",
+            request_id,
+        ),
     )
 
 
 # ============================================================
-# Runtime Gateway Proxy
+# Runtime Gateway proxy
 # ============================================================
 
 @app.post("/runtime/call")
@@ -952,21 +1365,11 @@ async def runtime_call(
     request: Request,
 ):
 
-    request_id = (
-        request.headers.get(
-            "X-ARYA-Request-ID"
-        )
-        or new_request_id()
+    request_id = await verify_incoming_request(
+        request
     )
 
     raw = await request.body()
-
-    if len(raw) > MAX_REQUEST_BYTES:
-
-        raise HTTPException(
-            status_code=413,
-            detail="Request body is too large.",
-        )
 
     try:
 
@@ -981,11 +1384,21 @@ async def runtime_call(
             detail="Invalid JSON body.",
         )
 
+    if not isinstance(payload, dict):
+
+        raise HTTPException(
+            status_code=400,
+            detail="JSON body must be an object.",
+        )
+
     return await service_post(
         RUNTIME_GATEWAY_URL,
         "/runtime/call",
         payload,
-        request_id=request_id,
+        request_id=payload.get(
+            "request_id",
+            request_id,
+        ),
     )
 
 
@@ -1007,21 +1420,11 @@ async def main_request(
     request: Request,
 ):
 
-    request_id = (
-        request.headers.get(
-            "X-ARYA-Request-ID"
-        )
-        or new_request_id()
+    request_id = await verify_incoming_request(
+        request
     )
 
     raw = await request.body()
-
-    if len(raw) > MAX_REQUEST_BYTES:
-
-        raise HTTPException(
-            status_code=413,
-            detail="Request body is too large.",
-        )
 
     try:
 
@@ -1036,11 +1439,21 @@ async def main_request(
             detail="Invalid JSON body.",
         )
 
+    if not isinstance(payload, dict):
+
+        raise HTTPException(
+            status_code=400,
+            detail="JSON body must be an object.",
+        )
+
     return await service_post(
         MAIN_API_BRIDGE_URL,
         "/internal/main-api/request",
         payload,
-        request_id=request_id,
+        request_id=payload.get(
+            "request_id",
+            request_id,
+        ),
     )
 
 
@@ -1058,45 +1471,19 @@ async def doctor_action(
         request_id
     )
 
-    body = {
-        "action": action,
-        "payload": payload,
+    result = await unified_action(
+        action,
+        payload,
+        rid,
+    )
+
+    return {
+        "success": True,
         "request_id": rid,
+        "action": action,
+        "result": result,
+        "timestamp": utc_now(),
     }
-
-    try:
-
-        result = await service_post(
-            UNIFIED_API_URL,
-            "/arya/doctor",
-            body,
-            request_id=rid,
-        )
-
-        return {
-            "success": True,
-            "request_id": rid,
-            "action": action,
-            "result": result,
-            "timestamp": utc_now(),
-        }
-
-    except HTTPException:
-
-        raise
-
-    except Exception as exc:
-
-        return JSONResponse(
-            status_code=502,
-            content={
-                "success": False,
-                "request_id": rid,
-                "action": action,
-                "error": str(exc),
-                "timestamp": utc_now(),
-            },
-        )
 
 
 @app.post("/arya/doctor")
@@ -1219,8 +1606,20 @@ async def arya_updates_run(
     )
 
 
+@app.post("/arya/voice")
+async def arya_voice(
+    request: IntegrationRequest,
+):
+
+    return await doctor_action(
+        "voice",
+        request.payload,
+        request.request_id,
+    )
+
+
 # ============================================================
-# Full System Status
+# Full system status
 # ============================================================
 
 @app.get("/status")
@@ -1270,19 +1669,22 @@ async def status():
         "service": APP_NAME,
         "version": APP_VERSION,
         "timestamp": utc_now(),
-
         "health": health_result,
-
         "runtime": runtime_result,
-
         "configuration": config_result,
-
         "uptime_seconds": round(
             time.time() - _started_at,
             2,
         ),
-
         "architecture": approved_services(),
+        "security": {
+            "internal_secret_configured":
+                bool(INTERNAL_SECRET),
+            "signature_required":
+                REQUIRE_INTERNAL_SIGNATURE,
+            "internal_header_required":
+                REQUIRE_INTERNAL_HEADER,
+        },
     }
 
 
@@ -1297,33 +1699,14 @@ async def contract():
         "service": APP_NAME,
         "version": APP_VERSION,
 
-        "purpose": (
-            "Final integration layer connecting "
-            "ARYA client, API, configuration, "
-            "runtime and agricultural services."
-        ),
-
         "routes": {
-
             "health": "/health",
-
-            "system_map":
-                "/system-map",
-
-            "status":
-                "/status",
-
-            "config":
-                "/config",
-
-            "runtime_config":
-                "/runtime/config",
-
-            "providers":
-                "/providers",
-
-            "features":
-                "/features",
+            "system_map": "/system-map",
+            "status": "/status",
+            "config": "/config",
+            "runtime_config": "/runtime/config",
+            "providers": "/providers",
+            "features": "/features",
 
             "runtime_services":
                 "/runtime/services",
@@ -1367,6 +1750,9 @@ async def contract():
             "vision":
                 "/arya/vision",
 
+            "voice":
+                "/arya/voice",
+
             "weather":
                 "/arya/weather",
 
@@ -1384,35 +1770,26 @@ async def contract():
         },
 
         "principles": [
-
-            "No modification of backend/main.py",
-
-            "No deletion of existing services",
-
-            "Internal service URLs are configuration driven",
-
-            "Internal requests support HMAC authentication",
-
-            "No arbitrary user supplied URLs are proxied",
-
-            "Request size is limited",
-
-            "Response size is limited",
-
-            "Health results are cached",
-
+            "backend/main.py remains unchanged",
+            "Existing services remain available",
+            "No arbitrary proxy URLs",
+            "Internal URLs are configuration driven",
+            "HMAC authentication is supported",
+            "Legacy internal secret authentication is preserved",
             "Request IDs are propagated",
-
-            "Existing modules remain independent",
-
-            "Future providers can be added without "
-            "changing backend/main.py",
+            "Request size is limited",
+            "Response size is limited",
+            "Safe retry is limited to idempotent requests",
+            "Circuit breaker protects failing internal services",
+            "Unified API route compatibility is preserved",
+            "Voice compatibility route is available",
+            "Android and Windows clients can use the same integration layer",
         ],
     }
 
 
 # ============================================================
-# Security Information
+# Security information
 # ============================================================
 
 @app.get("/security")
@@ -1423,13 +1800,17 @@ async def security_status():
         "version": APP_VERSION,
         "timestamp": utc_now(),
 
-        "internal_secret_configured": bool(
-            INTERNAL_SECRET
-        ),
+        "internal_secret_configured":
+            bool(INTERNAL_SECRET),
 
-        "signature_required": (
-            REQUIRE_INTERNAL_SIGNATURE
-        ),
+        "signature_required":
+            REQUIRE_INTERNAL_SIGNATURE,
+
+        "internal_header_required":
+            REQUIRE_INTERNAL_HEADER,
+
+        "legacy_secret_forwarding":
+            SEND_LEGACY_INTERNAL_SECRET,
 
         "request_limit_bytes":
             MAX_REQUEST_BYTES,
@@ -1437,15 +1818,80 @@ async def security_status():
         "response_limit_bytes":
             MAX_RESPONSE_BYTES,
 
-        "redirects_allowed": False,
+        "redirects_allowed":
+            False,
 
-        "arbitrary_proxy_urls": False,
+        "arbitrary_proxy_urls":
+            False,
+
+        "max_retries":
+            MAX_RETRIES,
+
+        "circuit_failure_threshold":
+            CIRCUIT_FAILURE_THRESHOLD,
+
+        "circuit_cooldown_seconds":
+            CIRCUIT_COOLDOWN_SECONDS,
     }
 
 
 # ============================================================
-# Error Handling
+# Circuit status
 # ============================================================
+
+@app.get("/security/circuits")
+async def circuit_status():
+
+    result: Dict[str, Any] = {}
+
+    for name, state in _failure_state.items():
+
+        result[name] = {
+            "failures":
+                state.get("failures", 0),
+
+            "open":
+                circuit_is_open(name),
+
+            "opened_at":
+                state.get("opened_at"),
+        }
+
+    return {
+        "service": APP_NAME,
+        "timestamp": utc_now(),
+        "circuits": result,
+    }
+
+
+# ============================================================
+# Error handling
+# ============================================================
+
+@app.exception_handler(
+    HTTPException
+)
+async def http_exception_handler(
+    request: Request,
+    exc: HTTPException,
+):
+
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "success": False,
+            "service": APP_NAME,
+            "error": safe_json(
+                exc.detail
+            ),
+            "request_id":
+                request.headers.get(
+                    "X-ARYA-Request-ID"
+                ),
+            "timestamp": utc_now(),
+        },
+    )
+
 
 @app.exception_handler(Exception)
 async def global_exception_handler(
@@ -1459,9 +1905,10 @@ async def global_exception_handler(
             "success": False,
             "service": APP_NAME,
             "error": str(exc),
-            "request_id": request.headers.get(
-                "X-ARYA-Request-ID"
-            ),
+            "request_id":
+                request.headers.get(
+                    "X-ARYA-Request-ID"
+                ),
             "timestamp": utc_now(),
         },
     )
@@ -1479,6 +1926,7 @@ async def startup_event():
     async with _state_lock:
 
         _health_cache.clear()
+        _failure_state.clear()
 
 
 # ============================================================
@@ -1494,7 +1942,7 @@ async def shutdown_event():
 
 
 # ============================================================
-# Local Execution
+# Local execution
 # ============================================================
 
 if __name__ == "__main__":
