@@ -1,32 +1,15 @@
 """
 ARYA AgriDoctor
 VOICE & LANGUAGE SERVICE
-Version: 1.0.0
+Version: 2.0.0
 
-این فایل مستقل است و نباید main.py یا vision.py را تغییر دهد.
-
-قابلیت‌ها:
-- Speech To Text
-- Text To Speech
-- Language Detection
-- Translation
-- مدیریت Provider
-- Failover بین Providerها
-- ثبت درخواست‌ها و خطاها
-- محدودیت حجم فایل
-- حذف خودکار فایل‌های موقت
-- Cache پایه
-- آماده برای Providerهای آینده
-- آماده برای Realtime Voice
-- آماده برای ترجمه زنده
-- آماده برای OWNER
-- آماده برای به‌روزرسانی Providerها
-- طراحی API مستقل برای اتصال بعدی به ARYA اصلی
+Independent voice/language service.
+Preserves legacy routes and adds compatibility for the unified/runtime
+gateways. main.py and vision.py are not modified.
 """
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import logging
@@ -34,7 +17,6 @@ import mimetypes
 import os
 import re
 import sqlite3
-import tempfile
 import time
 import uuid
 from dataclasses import dataclass
@@ -47,15 +29,11 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 
-# ============================================================
-# CONFIG
-# ============================================================
-
 APP_NAME = "ARYA Voice & Language"
-APP_VERSION = "1.0.0"
+APP_VERSION = "2.0.0"
 
 HOST = os.getenv("ARYA_VOICE_HOST", "0.0.0.0")
-PORT = int(os.getenv("ARYA_VOICE_PORT", "8001"))
+PORT = int(os.getenv("ARYA_VOICE_PORT", "8002"))
 
 DB_PATH = os.getenv(
     "ARYA_VOICE_DB",
@@ -71,7 +49,6 @@ MEDIA_DIR = Path(
 
 MAX_AUDIO_MB = float(os.getenv("ARYA_VOICE_MAX_AUDIO_MB", "25"))
 MAX_TEXT_LENGTH = int(os.getenv("ARYA_VOICE_MAX_TEXT_LENGTH", "20000"))
-
 REQUEST_TIMEOUT = int(os.getenv("ARYA_VOICE_TIMEOUT", "120"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
@@ -112,16 +89,8 @@ ALLOW_EXTERNAL_PROVIDERS = os.getenv(
 ).lower() in {"1", "true", "yes", "on"}
 
 TEMP_FILE_TTL_SECONDS = int(
-    os.getenv(
-        "ARYA_VOICE_TEMP_FILE_TTL",
-        "3600",
-    )
+    os.getenv("ARYA_VOICE_TEMP_FILE_TTL", "3600")
 )
-
-
-# ============================================================
-# LOGGING
-# ============================================================
 
 logging.basicConfig(
     level=os.getenv("ARYA_LOG_LEVEL", "INFO"),
@@ -130,39 +99,130 @@ logging.basicConfig(
 
 logger = logging.getLogger("arya.voice")
 
-
-# ============================================================
-# DIRECTORIES
-# ============================================================
-
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
-
-
-# ============================================================
-# APP
-# ============================================================
 
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
-    description=(
-        "Independent multilingual voice, speech and translation "
-        "service for ARYA AgriDoctor."
-    ),
+    description="Independent multilingual voice, speech and translation service.",
 )
 
 
-# ============================================================
-# DATABASE
-# ============================================================
-
 def db_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     return conn
 
 
+def now() -> float:
+    return time.time()
+
+
+def make_id(prefix: str) -> str:
+    return f"{prefix}_{uuid.uuid4().hex}"
+
+
+def sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def normalize_language(language: Optional[str]) -> Optional[str]:
+    if not language:
+        return None
+
+    value = language.strip().lower()
+
+    aliases = {
+        "persian": "fa",
+        "farsi": "fa",
+        "فارسی": "fa",
+        "english": "en",
+        "انگلیسی": "en",
+        "german": "de",
+        "deutsch": "de",
+        "آلمانی": "de",
+        "french": "fr",
+        "spanish": "es",
+        "arabic": "ar",
+        "turkish": "tr",
+        "azerbaijani": "az",
+        "azeri": "az",
+        "kurdish": "ku",
+        "chinese": "zh",
+        "japanese": "ja",
+        "korean": "ko",
+        "russian": "ru",
+        "hindi": "hi",
+        "urdu": "ur",
+        "italian": "it",
+        "portuguese": "pt",
+    }
+
+    return aliases.get(value, value)
+
+
+def validate_text(text: str) -> str:
+    text = text.strip()
+
+    if not text:
+        raise HTTPException(
+            status_code=400,
+            detail="Text cannot be empty.",
+        )
+
+    if len(text) > MAX_TEXT_LENGTH:
+        raise HTTPException(
+            status_code=413,
+            detail="Text is too long.",
+        )
+
+    return text
+
+
+def safe_filename(filename: Optional[str]) -> str:
+    if not filename:
+        return "audio.bin"
+
+    name = Path(filename).name
+
+    if name in {".", "..", ""}:
+        return "audio.bin"
+
+    return name
+
+
+def audio_extension(
+    filename: str,
+    content_type: Optional[str],
+) -> str:
+
+    suffix = Path(filename).suffix.lower()
+
+    if suffix:
+        return suffix
+
+    return (
+        mimetypes.guess_extension(
+            content_type or ""
+        )
+        or ".bin"
+    )
+
+
+def provider_headers() -> Dict[str, str]:
+
+    if not OPENAI_API_KEY:
+        raise RuntimeError(
+            "OPENAI_API_KEY is not configured."
+        )
+
+    return {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+    }
+
+
 def init_db() -> None:
+
     conn = db_connection()
 
     conn.executescript(
@@ -242,43 +302,32 @@ def init_db() -> None:
         """
     )
 
-    now = time.time()
+    current_time = now()
 
-    default_providers = [
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO providers
         (
-            "openai",
-            "multimodal_ai",
+            provider_key,
+            provider_type,
+            enabled,
+            priority,
+            config_json,
+            created_at,
+            updated_at
+        )
+        VALUES (
+            'openai',
+            'multimodal_ai',
             1,
             10,
-            "{}",
-        ),
-    ]
-
-    for provider_key, provider_type, enabled, priority, config in default_providers:
-        conn.execute(
-            """
-            INSERT OR IGNORE INTO providers
-            (
-                provider_key,
-                provider_type,
-                enabled,
-                priority,
-                config_json,
-                created_at,
-                updated_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                provider_key,
-                provider_type,
-                enabled,
-                priority,
-                config,
-                now,
-                now,
-            ),
+            '{}',
+            ?,
+            ?
         )
+        """,
+        (current_time, current_time),
+    )
 
     languages = [
         ("fa", "Persian"),
@@ -314,6 +363,7 @@ def init_db() -> None:
     ]
 
     for code, name in languages:
+
         conn.execute(
             """
             INSERT OR IGNORE INTO language_catalog
@@ -325,16 +375,12 @@ def init_db() -> None:
             )
             VALUES (?, ?, 1, ?)
             """,
-            (code, name, now),
+            (code, name, current_time),
         )
 
     conn.commit()
     conn.close()
 
-
-# ============================================================
-# MODELS
-# ============================================================
 
 class TranslateRequest(BaseModel):
     text: str = Field(..., min_length=1)
@@ -362,110 +408,12 @@ class ProviderRegistration(BaseModel):
     config: Dict[str, Any] = {}
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def now() -> float:
-    return time.time()
-
-
-def make_id(prefix: str) -> str:
-    return f"{prefix}_{uuid.uuid4().hex}"
-
-
-def sha256_text(value: str) -> str:
-    return hashlib.sha256(
-        value.encode("utf-8")
-    ).hexdigest()
-
-
-def normalize_language(language: Optional[str]) -> Optional[str]:
-    if not language:
-        return None
-
-    value = language.strip().lower()
-
-    aliases = {
-        "persian": "fa",
-        "farsi": "fa",
-        "فارسی": "fa",
-        "english": "en",
-        "انگلیسی": "en",
-        "german": "de",
-        "deutsch": "de",
-        "آلمانی": "de",
-        "french": "fr",
-        "spanish": "es",
-        "arabic": "ar",
-        "turkish": "tr",
-        "azerbaijani": "az",
-        "azeri": "az",
-        "kurdish": "ku",
-        "chinese": "zh",
-        "japanese": "ja",
-        "korean": "ko",
-        "russian": "ru",
-    }
-
-    return aliases.get(value, value)
-
-
-def validate_text(text: str) -> str:
-    text = text.strip()
-
-    if not text:
-        raise HTTPException(
-            status_code=400,
-            detail="Text cannot be empty.",
-        )
-
-    if len(text) > MAX_TEXT_LENGTH:
-        raise HTTPException(
-            status_code=413,
-            detail="Text is too long.",
-        )
-
-    return text
-
-
-def validate_audio_filename(filename: Optional[str]) -> str:
-    if not filename:
-        return "audio.bin"
-
-    safe = Path(filename).name
-
-    if safe in {".", ".."}:
-        return "audio.bin"
-
-    return safe
-
-
-def audio_extension(filename: str, content_type: Optional[str]) -> str:
-    suffix = Path(filename).suffix.lower()
-
-    if suffix:
-        return suffix
-
-    if content_type:
-        guessed = mimetypes.guess_extension(content_type)
-
-        if guessed:
-            return guessed
-
-    return ".bin"
-
-
-def provider_headers() -> Dict[str, str]:
-    if not OPENAI_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="OPENAI_API_KEY is not configured.",
-        )
-
-    return {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-    }
+@dataclass
+class Provider:
+    key: str
+    provider_type: str
+    priority: int
+    enabled: bool
 
 
 def record_request(
@@ -483,7 +431,7 @@ def record_request(
 
     conn.execute(
         """
-        INSERT INTO requests
+        INSERT OR REPLACE INTO requests
         (
             request_id,
             operation,
@@ -508,7 +456,9 @@ def record_request(
             status,
             error,
             now(),
-            now() if status in {"success", "error"} else None,
+            now()
+            if status in {"success", "error"}
+            else None,
         ),
     )
 
@@ -516,57 +466,8 @@ def record_request(
     conn.close()
 
 
-def update_provider_success(provider: str) -> None:
-    conn = db_connection()
-
-    conn.execute(
-        """
-        UPDATE providers
-        SET last_success_at = ?, updated_at = ?
-        WHERE provider_key = ?
-        """,
-        (now(), now(), provider),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def update_provider_error(
-    provider: str,
-    error: str,
-) -> None:
-
-    conn = db_connection()
-
-    conn.execute(
-        """
-        UPDATE providers
-        SET last_error_at = ?,
-            last_error = ?,
-            updated_at = ?
-        WHERE provider_key = ?
-        """,
-        (now(), error[:2000], now(), provider),
-    )
-
-    conn.commit()
-    conn.close()
-
-
-# ============================================================
-# PROVIDER SYSTEM
-# ============================================================
-
-@dataclass
-class Provider:
-    key: str
-    provider_type: str
-    priority: int
-    enabled: bool
-
-
 def get_providers() -> List[Provider]:
+
     conn = db_connection()
 
     rows = conn.execute(
@@ -578,7 +479,7 @@ def get_providers() -> List[Provider]:
             enabled
         FROM providers
         WHERE enabled = 1
-        ORDER BY priority ASC, id ASC
+        ORDER BY priority, id
         """
     ).fetchall()
 
@@ -586,66 +487,95 @@ def get_providers() -> List[Provider]:
 
     return [
         Provider(
-            key=row["provider_key"],
-            provider_type=row["provider_type"],
-            priority=row["priority"],
-            enabled=bool(row["enabled"]),
+            r["provider_key"],
+            r["provider_type"],
+            r["priority"],
+            bool(r["enabled"]),
         )
-        for row in rows
+        for r in rows
     ]
 
 
-def get_provider(provider_key: str) -> Optional[Provider]:
-    conn = db_connection()
+def extract_response_text(
+    result: Dict[str, Any],
+) -> str:
 
-    row = conn.execute(
-        """
-        SELECT
-            provider_key,
-            provider_type,
-            priority,
-            enabled
-        FROM providers
-        WHERE provider_key = ?
-        """,
-        (provider_key,),
-    ).fetchone()
+    if isinstance(
+        result.get("output_text"),
+        str,
+    ):
+        return result["output_text"].strip()
 
-    conn.close()
+    output = result.get("output")
 
-    if not row:
-        return None
+    if isinstance(output, list):
 
-    return Provider(
-        key=row["provider_key"],
-        provider_type=row["provider_type"],
-        priority=row["priority"],
-        enabled=bool(row["enabled"]),
-    )
+        parts = []
 
+        for item in output:
 
-# ============================================================
-# OPENAI HTTP
-# ============================================================
+            content = (
+                item.get("content", [])
+                if isinstance(item, dict)
+                else []
+            )
+
+            for part in content:
+
+                if (
+                    isinstance(part, dict)
+                    and isinstance(
+                        part.get("text"),
+                        str,
+                    )
+                ):
+                    parts.append(
+                        part["text"]
+                    )
+
+        if parts:
+            return "\n".join(parts).strip()
+
+    choices = result.get("choices")
+
+    if isinstance(choices, list):
+
+        for choice in choices:
+
+            message = choice.get(
+                "message",
+                {},
+            )
+
+            if (
+                isinstance(message, dict)
+                and isinstance(
+                    message.get("content"),
+                    str,
+                )
+            ):
+                return message["content"].strip()
+
+    return ""
+
 
 def openai_post_json(
     endpoint: str,
     payload: Dict[str, Any],
 ) -> requests.Response:
 
-    headers = {
-        **provider_headers(),
-        "Content-Type": "application/json",
-    }
-
     response = requests.post(
         f"{OPENAI_BASE_URL}/{endpoint.lstrip('/')}",
-        headers=headers,
+        headers={
+            **provider_headers(),
+            "Content-Type": "application/json",
+        },
         json=payload,
         timeout=REQUEST_TIMEOUT,
     )
 
     if response.status_code >= 400:
+
         raise RuntimeError(
             f"OpenAI HTTP {response.status_code}: "
             f"{response.text[:2000]}"
@@ -669,6 +599,7 @@ def openai_post_multipart(
     )
 
     if response.status_code >= 400:
+
         raise RuntimeError(
             f"OpenAI HTTP {response.status_code}: "
             f"{response.text[:2000]}"
@@ -676,10 +607,6 @@ def openai_post_multipart(
 
     return response
 
-
-# ============================================================
-# SPEECH TO TEXT
-# ============================================================
 
 def openai_transcribe(
     file_path: Path,
@@ -696,48 +623,41 @@ def openai_transcribe(
         data["language"] = language
 
     with file_path.open("rb") as audio_file:
+
         response = openai_post_multipart(
             "/audio/transcriptions",
-            files={
+            {
                 "file": (
                     file_path.name,
                     audio_file,
                     mimetypes.guess_type(
                         file_path.name
-                    )[0] or "application/octet-stream",
+                    )[0]
+                    or "application/octet-stream",
                 )
             },
-            data=data,
+            data,
         )
 
     result = response.json()
 
-    text = result.get("text", "").strip()
-
     return {
-        "text": text,
+        "text": str(
+            result.get("text", "")
+        ).strip(),
         "language": language,
         "provider": "openai",
         "model": STT_MODEL,
-        "raw": result,
     }
 
 
-# ============================================================
-# TEXT TO SPEECH
-# ============================================================
-
 def openai_speak(
     text: str,
-    voice: Optional[str] = None,
-    response_format: str = "mp3",
+    voice: Optional[str],
+    response_format: str,
 ) -> Path:
 
-    text = validate_text(text)
-
-    voice = voice or DEFAULT_TTS_VOICE
-
-    allowed_formats = {
+    formats = {
         "mp3",
         "wav",
         "opus",
@@ -746,219 +666,163 @@ def openai_speak(
         "pcm",
     }
 
-    if response_format not in allowed_formats:
+    if response_format not in formats:
         raise HTTPException(
             status_code=400,
             detail="Unsupported audio format.",
         )
 
-    payload = {
-        "model": TTS_MODEL,
-        "voice": voice,
-        "input": text,
-        "response_format": response_format,
-    }
-
-    headers = {
-        **provider_headers(),
-        "Content-Type": "application/json",
-    }
-
     response = requests.post(
         f"{OPENAI_BASE_URL}/audio/speech",
-        headers=headers,
-        json=payload,
+        headers={
+            **provider_headers(),
+            "Content-Type": "application/json",
+        },
+        json={
+            "model": TTS_MODEL,
+            "voice": voice or DEFAULT_TTS_VOICE,
+            "input": validate_text(text),
+            "response_format": response_format,
+        },
         timeout=REQUEST_TIMEOUT,
     )
 
     if response.status_code >= 400:
+
         raise RuntimeError(
             f"OpenAI TTS HTTP {response.status_code}: "
             f"{response.text[:2000]}"
         )
 
-    audio_id = make_id("aud")
-
-    file_path = MEDIA_DIR / (
-        f"{audio_id}.{response_format}"
+    path = (
+        MEDIA_DIR
+        / f"{make_id('aud')}.{response_format}"
     )
 
-    file_path.write_bytes(response.content)
+    path.write_bytes(
+        response.content
+    )
 
-    return file_path
+    return path
 
 
-# ============================================================
-# LANGUAGE DETECTION
-# ============================================================
+def detect_language_heuristic(
+    text: str,
+) -> Optional[str]:
 
-def detect_language_heuristic(text: str) -> Optional[str]:
-    """
-    تشخیص سریع اولیه.
-    نتیجه قطعی نیست.
-    برای تشخیص دقیق، از AI استفاده می‌شود.
-    """
-
-    text = text.strip()
-
-    if not text:
-        return None
-
-    fa_chars = len(
+    fa = len(
         re.findall(
             r"[\u0600-\u06FF]",
             text,
         )
     )
 
-    latin_chars = len(
+    latin = len(
         re.findall(
             r"[A-Za-z]",
             text,
         )
     )
 
-    cyrillic_chars = len(
+    cyr = len(
         re.findall(
             r"[\u0400-\u04FF]",
             text,
         )
     )
 
-    if fa_chars > latin_chars and fa_chars > cyrillic_chars:
+    if fa > latin and fa > cyr:
         return "fa"
 
-    if cyrillic_chars > latin_chars:
+    if cyr > latin:
         return "ru"
 
-    if latin_chars > 0:
+    if latin:
         return "en"
 
     return None
 
 
-def detect_language_ai(text: str) -> Dict[str, Any]:
-    prompt = f"""
-Identify the language of the following text.
+def detect_language_ai(
+    text: str,
+) -> Dict[str, Any]:
 
-Return JSON only:
-
-{{
-  "language_code": "ISO-639-1 code when possible",
-  "language_name": "English name",
-  "confidence": 0.0
-}}
-
-Text:
-{text}
-"""
-
-    response = openai_post_json(
+    result = openai_post_json(
         "/responses",
         {
             "model": TRANSLATION_MODEL,
-            "input": prompt,
+            "input": (
+                "Identify the language. "
+                "Return JSON only: "
+                '{"language_code":"ISO-639-1",'
+                '"language_name":"English name",'
+                '"confidence":0.0}'
+                f"\nText:\n{text}"
+            ),
         },
+    ).json()
+
+    raw = extract_response_text(
+        result
     )
 
-    result = response.json()
-
-    output_text = extract_response_text(result)
-
     try:
-        parsed = json.loads(output_text)
+
+        parsed = json.loads(raw)
 
         return {
             "language_code": normalize_language(
                 parsed.get("language_code")
             ),
-            "language_name": parsed.get("language_name"),
-            "confidence": parsed.get("confidence"),
+            "language_name": parsed.get(
+                "language_name"
+            ),
+            "confidence": float(
+                parsed.get(
+                    "confidence",
+                    0.0,
+                )
+            ),
             "provider": "openai",
         }
 
     except Exception:
-        heuristic = detect_language_heuristic(text)
+
+        code = detect_language_heuristic(
+            text
+        )
 
         return {
-            "language_code": heuristic,
+            "language_code": code,
             "language_name": None,
-            "confidence": 0.50 if heuristic else 0.0,
+            "confidence": 0.5
+            if code
+            else 0.0,
             "provider": "heuristic",
         }
 
 
-# ============================================================
-# RESPONSE TEXT EXTRACTION
-# ============================================================
-
-def extract_response_text(
-    result: Dict[str, Any],
-) -> str:
-
-    if isinstance(result.get("output_text"), str):
-        return result["output_text"].strip()
-
-    output = result.get("output")
-
-    if isinstance(output, list):
-        parts = []
-
-        for item in output:
-            content = item.get("content")
-
-            if not isinstance(content, list):
-                continue
-
-            for part in content:
-                text = part.get("text")
-
-                if isinstance(text, str):
-                    parts.append(text)
-
-        if parts:
-            return "\n".join(parts).strip()
-
-    choices = result.get("choices")
-
-    if isinstance(choices, list):
-        for choice in choices:
-            message = choice.get("message", {})
-
-            if isinstance(message, dict):
-                content = message.get("content")
-
-                if isinstance(content, str):
-                    return content.strip()
-
-    return ""
-
-
-# ============================================================
-# TRANSLATION
-# ============================================================
-
 def translation_cache_key(
     text: str,
-    source_language: Optional[str],
-    target_language: str,
+    source: Optional[str],
+    target: str,
 ) -> str:
 
-    raw = json.dumps(
-        {
-            "text": text,
-            "source": source_language,
-            "target": target_language,
-        },
-        sort_keys=True,
-        ensure_ascii=False,
+    return sha256_text(
+        json.dumps(
+            {
+                "text": text,
+                "source": source,
+                "target": target,
+            },
+            sort_keys=True,
+            ensure_ascii=False,
+        )
     )
-
-    return sha256_text(raw)
 
 
 def get_translation_cache(
-    cache_key: str,
+    key: str,
 ) -> Optional[Dict[str, Any]]:
 
     conn = db_connection()
@@ -969,35 +833,33 @@ def get_translation_cache(
         FROM translations
         WHERE cache_key = ?
         """,
-        (cache_key,),
+        (key,),
     ).fetchone()
 
     if row:
+
         conn.execute(
             """
             UPDATE translations
             SET last_used_at = ?
             WHERE cache_key = ?
             """,
-            (now(), cache_key),
+            (now(), key),
         )
 
         conn.commit()
 
     conn.close()
 
-    if not row:
-        return None
-
-    return dict(row)
+    return dict(row) if row else None
 
 
 def save_translation_cache(
-    cache_key: str,
-    source_language: Optional[str],
-    target_language: str,
+    key: str,
+    source: Optional[str],
+    target: str,
     source_text: str,
-    translated_text: str,
+    translated: str,
     provider: str,
 ) -> None:
 
@@ -1019,11 +881,11 @@ def save_translation_cache(
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            cache_key,
-            source_language,
-            target_language,
+            key,
+            source,
+            target,
             source_text,
-            translated_text,
+            translated,
             provider,
             now(),
             now(),
@@ -1036,78 +898,64 @@ def save_translation_cache(
 
 def openai_translate(
     text: str,
-    target_language: str,
-    source_language: Optional[str] = None,
-    preserve_format: bool = True,
+    target: str,
+    source: Optional[str],
+    preserve_format: bool,
 ) -> Dict[str, Any]:
 
-    target_language = normalize_language(
-        target_language
-    ) or target_language
-
-    source_language = normalize_language(
-        source_language
-    )
-
-    system_instruction = """
+    system = """
 You are ARYA AgriDoctor's professional multilingual
 translation engine.
 
 Translate accurately and naturally.
 
-Rules:
-- Never invent facts.
-- Preserve numbers, units, dates and technical names.
-- Preserve agricultural terminology.
-- Preserve pesticide active ingredients exactly.
-- Do not change dosage values.
-- Do not add medical or agricultural advice.
-- Preserve formatting when requested.
-- Do not summarize unless explicitly requested.
-- If a term is ambiguous, preserve the original technical term
-  rather than inventing a meaning.
+Never invent facts.
+Preserve numbers, units, dates and technical names.
+Preserve agricultural terminology.
+Preserve pesticide active ingredients exactly.
+Preserve dosage values.
+Preserve formatting.
+Do not add agricultural or medical advice.
+Do not summarize.
 """
 
-    payload = {
-        "model": TRANSLATION_MODEL,
-        "input": [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": system_instruction,
-                    }
-                ],
-            },
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": (
-                            f"Source language: "
-                            f"{source_language or 'auto'}\n"
-                            f"Target language: "
-                            f"{target_language}\n"
-                            f"Preserve formatting: "
-                            f"{preserve_format}\n\n"
-                            f"Text:\n{text}"
-                        ),
-                    }
-                ],
-            },
-        ],
-    }
-
-    response = openai_post_json(
+    result = openai_post_json(
         "/responses",
-        payload,
+        {
+            "model": TRANSLATION_MODEL,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": system,
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": (
+                                f"Source: "
+                                f"{source or 'auto'}\n"
+                                f"Target: {target}\n"
+                                f"Preserve formatting: "
+                                f"{preserve_format}\n\n"
+                                f"{text}"
+                            ),
+                        }
+                    ],
+                },
+            ],
+        },
+    ).json()
+
+    translated = extract_response_text(
+        result
     )
-
-    result = response.json()
-
-    translated = extract_response_text(result)
 
     if not translated:
         raise RuntimeError(
@@ -1116,19 +964,19 @@ Rules:
 
     return {
         "text": translated,
-        "source_language": source_language,
-        "target_language": target_language,
+        "source_language": source,
+        "target_language": target,
         "provider": "openai",
         "model": TRANSLATION_MODEL,
     }
 
 
-# ============================================================
-# CLEANUP
-# ============================================================
-
 def cleanup_old_audio() -> int:
-    cutoff = now() - TEMP_FILE_TTL_SECONDS
+
+    cutoff = (
+        now()
+        - TEMP_FILE_TTL_SECONDS
+    )
 
     deleted = 0
 
@@ -1138,10 +986,17 @@ def cleanup_old_audio() -> int:
             continue
 
         try:
+
             if path.stat().st_mtime < cutoff:
-                path.unlink(missing_ok=True)
+
+                path.unlink(
+                    missing_ok=True
+                )
+
                 deleted += 1
+
         except Exception as exc:
+
             logger.warning(
                 "Could not delete %s: %s",
                 path,
@@ -1165,18 +1020,14 @@ def cleanup_old_audio() -> int:
     return deleted
 
 
-# ============================================================
-# ROUTES
-# ============================================================
-
 @app.get("/")
-def root() -> Dict[str, Any]:
+def root():
+
     return {
         "service": APP_NAME,
         "version": APP_VERSION,
         "status": "ready",
-        "main_py_modified": False,
-        "vision_py_modified": False,
+        "port": PORT,
         "features": [
             "speech_to_text",
             "text_to_speech",
@@ -1185,14 +1036,14 @@ def root() -> Dict[str, Any]:
             "provider_router",
             "cache",
             "failover_ready",
-            "future_realtime_ready",
-            "future_provider_ready",
+            "realtime_ready",
+            "live_translation_ready",
         ],
     }
 
 
 @app.get("/health")
-def health() -> Dict[str, Any]:
+def health():
 
     return {
         "status": "healthy",
@@ -1201,6 +1052,7 @@ def health() -> Dict[str, Any]:
         "openai_configured": bool(
             OPENAI_API_KEY
         ),
+        "port": PORT,
         "stt_model": STT_MODEL,
         "tts_model": TTS_MODEL,
         "translation_model": TRANSLATION_MODEL,
@@ -1210,7 +1062,7 @@ def health() -> Dict[str, Any]:
 
 
 @app.get("/voice/languages")
-def languages() -> Dict[str, Any]:
+def languages():
 
     conn = db_connection()
 
@@ -1236,7 +1088,9 @@ def languages() -> Dict[str, Any]:
                 "code": row["language_code"],
                 "name": row["language_name"],
                 "metadata": (
-                    json.loads(row["metadata_json"])
+                    json.loads(
+                        row["metadata_json"]
+                    )
                     if row["metadata_json"]
                     else {}
                 ),
@@ -1246,43 +1100,45 @@ def languages() -> Dict[str, Any]:
     }
 
 
-@app.post("/voice/transcribe")
-async def transcribe(
-    file: UploadFile = File(...),
-    language: Optional[str] = Form(None),
-) -> Dict[str, Any]:
+async def _save_upload(
+    file: UploadFile,
+    request_id: str,
+) -> Path:
 
-    request_id = make_id("req")
-
-    original_name = validate_audio_filename(
+    name = safe_filename(
         file.filename
     )
 
-    suffix = audio_extension(
-        original_name,
-        file.content_type,
-    )
-
-    file_path = (
-        MEDIA_DIR /
-        f"{request_id}{suffix}"
+    path = (
+        MEDIA_DIR
+        / f"{request_id}"
+        f"{audio_extension(name, file.content_type)}"
     )
 
     size = 0
 
     try:
-        with file_path.open("wb") as output:
+
+        with path.open("wb") as output:
 
             while True:
 
-                chunk = await file.read(1024 * 1024)
+                chunk = await file.read(
+                    1024 * 1024
+                )
 
                 if not chunk:
                     break
 
                 size += len(chunk)
 
-                if size > MAX_AUDIO_MB * 1024 * 1024:
+                if (
+                    size
+                    > MAX_AUDIO_MB
+                    * 1024
+                    * 1024
+                ):
+
                     raise HTTPException(
                         status_code=413,
                         detail="Audio file is too large.",
@@ -1290,20 +1146,54 @@ async def transcribe(
 
                 output.write(chunk)
 
+        if size == 0:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Audio file is empty.",
+            )
+
+        return path
+
+    except Exception:
+
+        path.unlink(
+            missing_ok=True
+        )
+
+        raise
+
+
+async def _transcribe_upload(
+    file: UploadFile,
+    language: Optional[str],
+):
+
+    request_id = make_id("req")
+
+    path = await _save_upload(
+        file,
+        request_id,
+    )
+
+    language = normalize_language(
+        language
+    )
+
+    try:
+
         record_request(
             request_id,
             "transcribe",
             "openai",
-            normalize_language(language),
+            language,
             None,
-            sha256_text(
-                str(file_path)
-            ),
+            None,
             "processing",
         )
 
         result = openai_transcribe(
-            file_path,
+            path,
             language,
         )
 
@@ -1323,28 +1213,22 @@ async def transcribe(
             "result": result,
         }
 
-    except HTTPException:
-        raise
-
     except Exception as exc:
 
-        logger.exception(
-            "Transcription failed."
+        record_request(
+            request_id,
+            "transcribe",
+            "openai",
+            language,
+            None,
+            None,
+            "error",
+            str(exc),
         )
 
-        try:
-            record_request(
-                request_id,
-                "transcribe",
-                "openai",
-                normalize_language(language),
-                None,
-                None,
-                "error",
-                str(exc),
-            )
-        except Exception:
-            pass
+        logger.exception(
+            "Transcription failed"
+        )
 
         raise HTTPException(
             status_code=502,
@@ -1353,10 +1237,121 @@ async def transcribe(
 
     finally:
 
-        try:
-            file_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+        path.unlink(
+            missing_ok=True
+        )
+
+
+@app.post("/voice/transcribe")
+async def transcribe(
+    file: UploadFile = File(...),
+    language: Optional[str] = Form(None),
+):
+
+    return await _transcribe_upload(
+        file,
+        language,
+    )
+
+
+@app.post("/voice/process")
+async def voice_process(
+    file: Optional[UploadFile] = File(None),
+    language: Optional[str] = Form(None),
+    text: Optional[str] = Form(None),
+    operation: Optional[str] = Form(None),
+    target_language: Optional[str] = Form(None),
+):
+
+    operation_value = (
+        operation or ""
+    ).strip().lower()
+
+    if (
+        file is not None
+        or operation_value
+        in {
+            "transcribe",
+            "stt",
+            "speech_to_text",
+        }
+    ):
+
+        if file is None:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Audio file is required.",
+            )
+
+        return await _transcribe_upload(
+            file,
+            language,
+        )
+
+    if text:
+
+        text = validate_text(
+            text
+        )
+
+        if operation_value in {
+            "detect",
+            "detect_language",
+            "language_detection",
+        }:
+
+            return {
+                "status": "success",
+                **detect_language_ai(text),
+            }
+
+        if (
+            operation_value
+            in {
+                "translate",
+                "translation",
+            }
+            or target_language
+        ):
+
+            target = normalize_language(
+                target_language
+            )
+
+            if not target:
+
+                raise HTTPException(
+                    status_code=400,
+                    detail="Target language is required.",
+                )
+
+            result = openai_translate(
+                text,
+                target,
+                normalize_language(
+                    language
+                ),
+                True,
+            )
+
+            return {
+                "status": "success",
+                **result,
+            }
+
+        return {
+            "status": "success",
+            "text": text,
+            "language": detect_language_heuristic(
+                text
+            ),
+        }
+
+    raise HTTPException(
+        status_code=400,
+        detail="Voice process requires audio or text.",
+    )
 
 
 @app.post("/voice/speak")
@@ -1372,17 +1367,17 @@ def speak(
 
     try:
 
-        file_path = openai_speak(
-            text=text,
-            voice=request.voice,
-            response_format=request.response_format,
+        path = openai_speak(
+            text,
+            request.voice,
+            request.response_format,
         )
 
         audio_id = make_id("aud")
 
-        expires_at = (
-            now() +
-            TEMP_FILE_TTL_SECONDS
+        expires = (
+            now()
+            + TEMP_FILE_TTL_SECONDS
         )
 
         conn = db_connection()
@@ -1408,16 +1403,29 @@ def speak(
                 normalize_language(
                     request.language
                 ),
-                request.voice or DEFAULT_TTS_VOICE,
+                request.voice
+                or DEFAULT_TTS_VOICE,
                 "openai",
-                str(file_path),
+                str(path),
                 now(),
-                expires_at,
+                expires,
             ),
         )
 
         conn.commit()
         conn.close()
+
+        record_request(
+            request_id,
+            "speak",
+            "openai",
+            normalize_language(
+                request.language
+            ),
+            None,
+            sha256_text(text),
+            "success",
+        )
 
         return {
             "request_id": request_id,
@@ -1434,8 +1442,21 @@ def speak(
 
     except Exception as exc:
 
+        record_request(
+            request_id,
+            "speak",
+            "openai",
+            normalize_language(
+                request.language
+            ),
+            None,
+            sha256_text(text),
+            "error",
+            str(exc),
+        )
+
         logger.exception(
-            "TTS failed."
+            "TTS failed"
         )
 
         raise HTTPException(
@@ -1445,7 +1466,9 @@ def speak(
 
 
 @app.get("/voice/audio/{audio_id}")
-def audio(audio_id: str):
+def audio(
+    audio_id: str,
+):
 
     conn = db_connection()
 
@@ -1461,39 +1484,48 @@ def audio(audio_id: str):
     conn.close()
 
     if not row:
+
         raise HTTPException(
             status_code=404,
             detail="Audio not found.",
         )
 
-    file_path = Path(
+    path = Path(
         row["file_path"]
-    )
+    ).resolve()
 
-    if not file_path.exists():
+    media_root = MEDIA_DIR.resolve()
+
+    if media_root not in path.parents:
+
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid audio path.",
+        )
+
+    if not path.exists():
+
         raise HTTPException(
             status_code=404,
             detail="Audio file no longer exists.",
         )
 
-    media_type = (
-        mimetypes.guess_type(
-            str(file_path)
-        )[0]
-        or "application/octet-stream"
-    )
-
     return FileResponse(
-        path=file_path,
-        media_type=media_type,
-        filename=file_path.name,
+        path=path,
+        media_type=(
+            mimetypes.guess_type(
+                str(path)
+            )[0]
+            or "application/octet-stream"
+        ),
+        filename=path.name,
     )
 
 
 @app.post("/voice/detect-language")
 def detect_language(
     request: DetectLanguageRequest,
-) -> Dict[str, Any]:
+):
 
     text = validate_text(
         request.text
@@ -1504,6 +1536,7 @@ def detect_language(
     )
 
     if heuristic:
+
         return {
             "status": "success",
             "language_code": heuristic,
@@ -1512,6 +1545,7 @@ def detect_language(
         }
 
     try:
+
         return {
             "status": "success",
             **detect_language_ai(text),
@@ -1530,37 +1564,39 @@ def detect_language(
 @app.post("/voice/translate")
 def translate(
     request: TranslateRequest,
-) -> Dict[str, Any]:
+):
 
     text = validate_text(
         request.text
     )
 
-    target_language = normalize_language(
+    target = normalize_language(
         request.target_language
     )
 
-    if not target_language:
+    source = normalize_language(
+        request.source_language
+    )
+
+    if not target:
+
         raise HTTPException(
             status_code=400,
             detail="Invalid target language.",
         )
 
-    source_language = normalize_language(
-        request.source_language
-    )
-
-    cache_key = translation_cache_key(
+    key = translation_cache_key(
         text,
-        source_language,
-        target_language,
+        source,
+        target,
     )
 
     cached = get_translation_cache(
-        cache_key
+        key
     )
 
     if cached:
+
         return {
             "status": "success",
             "cached": True,
@@ -1581,27 +1617,27 @@ def translate(
     try:
 
         result = openai_translate(
-            text=text,
-            target_language=target_language,
-            source_language=source_language,
-            preserve_format=request.preserve_format,
+            text,
+            target,
+            source,
+            request.preserve_format,
         )
 
         save_translation_cache(
-            cache_key=cache_key,
-            source_language=source_language,
-            target_language=target_language,
-            source_text=text,
-            translated_text=result["text"],
-            provider=result["provider"],
+            key,
+            source,
+            target,
+            text,
+            result["text"],
+            result["provider"],
         )
 
         record_request(
             request_id,
             "translate",
             result["provider"],
-            source_language,
-            target_language,
+            source,
+            target,
             sha256_text(text),
             "success",
         )
@@ -1619,8 +1655,8 @@ def translate(
             request_id,
             "translate",
             "openai",
-            source_language,
-            target_language,
+            source,
+            target,
             sha256_text(text),
             "error",
             str(exc),
@@ -1632,12 +1668,8 @@ def translate(
         )
 
 
-# ============================================================
-# OWNER / PROVIDER MANAGEMENT
-# ============================================================
-
 @app.get("/voice/providers")
-def providers() -> Dict[str, Any]:
+def providers():
 
     conn = db_connection()
 
@@ -1654,7 +1686,7 @@ def providers() -> Dict[str, Any]:
             created_at,
             updated_at
         FROM providers
-        ORDER BY priority ASC, id ASC
+        ORDER BY priority, id
         """
     ).fetchall()
 
@@ -1671,9 +1703,10 @@ def providers() -> Dict[str, Any]:
 @app.post("/voice/providers/register")
 def register_provider(
     provider: ProviderRegistration,
-) -> Dict[str, Any]:
+):
 
     if not ALLOW_EXTERNAL_PROVIDERS:
+
         raise HTTPException(
             status_code=403,
             detail=(
@@ -1686,12 +1719,15 @@ def register_provider(
         r"^[a-zA-Z0-9_.-]{2,80}$",
         provider.provider_key,
     ):
+
         raise HTTPException(
             status_code=400,
             detail="Invalid provider key.",
         )
 
     conn = db_connection()
+
+    current_time = now()
 
     conn.execute(
         """
@@ -1723,8 +1759,8 @@ def register_provider(
                 provider.config,
                 ensure_ascii=False,
             ),
-            now(),
-            now(),
+            current_time,
+            current_time,
         ),
     )
 
@@ -1737,91 +1773,64 @@ def register_provider(
     }
 
 
-# ============================================================
-# MAINTENANCE
-# ============================================================
-
 @app.post("/voice/maintenance/cleanup")
-def cleanup() -> Dict[str, Any]:
-
-    deleted = cleanup_old_audio()
+def cleanup():
 
     return {
         "status": "success",
-        "deleted_files": deleted,
+        "deleted_files": cleanup_old_audio(),
     }
 
 
 @app.get("/voice/status")
-def service_status() -> Dict[str, Any]:
+def service_status():
 
     conn = db_connection()
 
-    request_count = conn.execute(
-        "SELECT COUNT(*) AS count FROM requests"
-    ).fetchone()["count"]
+    requests_count = conn.execute(
+        "SELECT COUNT(*) c FROM requests"
+    ).fetchone()["c"]
 
-    translation_count = conn.execute(
-        "SELECT COUNT(*) AS count FROM translations"
-    ).fetchone()["count"]
+    translations = conn.execute(
+        "SELECT COUNT(*) c FROM translations"
+    ).fetchone()["c"]
 
-    audio_count = conn.execute(
-        "SELECT COUNT(*) AS count FROM generated_audio"
-    ).fetchone()["count"]
+    audio = conn.execute(
+        "SELECT COUNT(*) c FROM generated_audio"
+    ).fetchone()["c"]
 
     conn.close()
 
     return {
         "service": APP_NAME,
         "version": APP_VERSION,
+        "port": PORT,
         "database": DB_PATH,
         "media_directory": str(MEDIA_DIR),
-        "requests": request_count,
-        "translation_cache": translation_count,
-        "generated_audio_records": audio_count,
+        "requests": requests_count,
+        "translation_cache": translations,
+        "generated_audio_records": audio,
         "providers": [
-            p.key
-            for p in get_providers()
+            provider.key
+            for provider in get_providers()
         ],
     }
 
 
-# ============================================================
-# STARTUP
-# ============================================================
-
 @app.on_event("startup")
-def startup_event() -> None:
+def startup_event():
 
     init_db()
 
     cleanup_old_audio()
 
     logger.info(
-        "%s v%s started.",
+        "%s v%s started on port %s",
         APP_NAME,
         APP_VERSION,
+        PORT,
     )
 
-    logger.info(
-        "STT model: %s",
-        STT_MODEL,
-    )
-
-    logger.info(
-        "TTS model: %s",
-        TTS_MODEL,
-    )
-
-    logger.info(
-        "Translation model: %s",
-        TRANSLATION_MODEL,
-    )
-
-
-# ============================================================
-# LOCAL RUN
-# ============================================================
 
 if __name__ == "__main__":
 
