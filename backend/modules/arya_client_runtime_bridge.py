@@ -1,4 +1,4 @@
-"""
+
 ARYA AgriDoctor
 Client Runtime Bridge
 Version: 1.0.0
