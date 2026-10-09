@@ -1129,20 +1129,12 @@ def validate_wallet_address(address: str) -> bool:
         re.fullmatch(r"[A-Za-z0-9]+", clean)
         or re.fullmatch(r"0x[a-fA-F0-9]{40}", clean)
     )
-
-
+ 
 # ===============================================================
 # DEFAULT PLANS
 # ===============================================================
 
 def seed_default_plans() -> None:
-    existing = fetch_one(
-        "SELECT id FROM payment_plans LIMIT 1"
-    )
-
-    if existing:
-        return
-
     plans = [
         ("IR_100", "Iran First 100", "IR", "IRR", 500000, 100),
         ("IR_500", "Iran Next 500", "IR", "IRR", 800000, 500),
@@ -1155,6 +1147,7 @@ def seed_default_plans() -> None:
     conn = get_db()
 
     try:
+        conn.execute("BEGIN IMMEDIATE")
         now = utc_iso()
 
         for plan in plans:
@@ -1172,6 +1165,10 @@ def seed_default_plans() -> None:
             )
 
         conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
 
     finally:
         conn.close()
@@ -1192,7 +1189,7 @@ def get_active_bank_account(
         ORDER BY id DESC
         LIMIT 1
         """,
-        (currency,),
+        (currency.strip().upper(),),
     )
 
 
@@ -1210,9 +1207,14 @@ def get_active_wallet(
         ORDER BY id DESC
         LIMIT 1
         """,
-        (network, currency),
+        (
+            network.strip().upper(),
+            currency.strip().upper(),
+        ),
     )
- # ===============================================================
+
+
+# ===============================================================
 # OWNER LOGIN / LOGOUT
 # ===============================================================
 
@@ -1224,6 +1226,9 @@ def get_security_user(user_id: str) -> Optional[sqlite3.Row]:
 
 
 def ensure_security_user(user_id: str) -> None:
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise ValueError("user_id must be a non-empty string")
+
     now = utc_iso()
 
     execute(
@@ -1232,7 +1237,7 @@ def ensure_security_user(user_id: str) -> None:
         (user_id, created_at, updated_at)
         VALUES (?, ?, ?)
         """,
-        (user_id, now, now),
+        (user_id.strip(), now, now),
     )
 
 
@@ -1243,47 +1248,102 @@ def check_owner_lockout() -> None:
         raise HTTPException(
             status_code=429,
             detail="OWNER login temporarily locked",
+            headers={"Retry-After": "900"},
         )
 
 
 def record_owner_login_failure() -> None:
-    ensure_security_user("OWNER")
+    """
+    Atomically increments failed login attempts and applies a
+    temporary lock after five failures.
+    """
+    conn = get_db()
 
-    row = get_security_user("OWNER")
-    attempts = int(row["failed_attempts"] or 0) + 1
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = utc_iso()
 
-    locked_until = None
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO security_users
+                (user_id, created_at, updated_at)
+            VALUES ('OWNER', ?, ?)
+            """,
+            (now, now),
+        )
 
-    if attempts >= 5:
-        locked_until = (
-            utc_now() + timedelta(minutes=15)
-        ).isoformat()
+        row = conn.execute(
+            """
+            SELECT failed_attempts, locked_until
+            FROM security_users
+            WHERE user_id = 'OWNER'
+            """
+        ).fetchone()
 
-    execute(
-        """
-        UPDATE security_users
-        SET failed_attempts = ?,
-            locked_until = ?,
-            updated_at = ?
-        WHERE user_id = 'OWNER'
-        """,
-        (attempts, locked_until, utc_iso()),
-    )
+        attempts = int(row["failed_attempts"] or 0) + 1
+        locked_until = row["locked_until"]
+
+        if attempts >= 5:
+            locked_until = (
+                utc_now() + timedelta(minutes=15)
+            ).isoformat()
+
+        conn.execute(
+            """
+            UPDATE security_users
+            SET failed_attempts = ?,
+                locked_until = ?,
+                updated_at = ?
+            WHERE user_id = 'OWNER'
+            """,
+            (attempts, locked_until, now),
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
 
 def reset_owner_login_failures() -> None:
-    ensure_security_user("OWNER")
+    conn = get_db()
 
-    execute(
-        """
-        UPDATE security_users
-        SET failed_attempts = 0,
-            locked_until = NULL,
-            updated_at = ?
-        WHERE user_id = 'OWNER'
-        """,
-        (utc_iso(),),
-    )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        now = utc_iso()
+
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO security_users
+                (user_id, created_at, updated_at)
+            VALUES ('OWNER', ?, ?)
+            """,
+            (now, now),
+        )
+
+        conn.execute(
+            """
+            UPDATE security_users
+            SET failed_attempts = 0,
+                locked_until = NULL,
+                updated_at = ?
+            WHERE user_id = 'OWNER'
+            """,
+            (now,),
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
 
 @app.post("/owner/login")
@@ -1299,8 +1359,10 @@ def owner_login(
 
     check_owner_lockout()
 
+    supplied_email = payload.email.strip().lower()
+
     valid_email = constant_compare(
-        payload.email.strip().lower(),
+        supplied_email,
         OWNER_EMAIL.lower(),
     )
 
@@ -1316,12 +1378,17 @@ def owner_login(
             "owner_login_failed",
             actor_id="OWNER",
             actor_role="OWNER",
-            ip_address=request.client.host if request.client else None,
+            ip_address=(
+                request.client.host
+                if request.client
+                else None
+            ),
         )
 
         raise HTTPException(
             status_code=401,
             detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     security_row = get_security_user("OWNER")
@@ -1350,7 +1417,11 @@ def owner_login(
                 "owner_mfa_failed",
                 actor_id="OWNER",
                 actor_role="OWNER",
-                ip_address=request.client.host if request.client else None,
+                ip_address=(
+                    request.client.host
+                    if request.client
+                    else None
+                ),
             )
 
             raise HTTPException(
@@ -1366,7 +1437,11 @@ def owner_login(
         "owner_login_success",
         actor_id="OWNER",
         actor_role="OWNER",
-        ip_address=request.client.host if request.client else None,
+        ip_address=(
+            request.client.host
+            if request.client
+            else None
+        ),
     )
 
     return {
@@ -1382,26 +1457,60 @@ def owner_logout(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     identity: Dict[str, str] = Depends(owner_required),
 ):
-    if not credentials:
+    if not credentials or not credentials.credentials:
         raise HTTPException(
             status_code=401,
             detail="Authentication required",
         )
 
-    execute(
-        """
-        UPDATE sessions
-        SET revoked = 1
-        WHERE token_hash = ?
-        """,
-        (sha256_text(credentials.credentials),),
-    )
+    token_hash = sha256_text(credentials.credentials)
+
+    conn = get_db()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        cur = conn.execute(
+            """
+            UPDATE sessions
+            SET revoked = 1
+            WHERE token_hash = ?
+              AND user_id = ?
+              AND role = 'OWNER'
+              AND revoked = 0
+            """,
+            (
+                token_hash,
+                identity["user_id"],
+            ),
+        )
+
+        if cur.rowcount != 1:
+            conn.rollback()
+            raise HTTPException(
+                status_code=401,
+                detail="Session is already revoked or invalid",
+            )
+
+        conn.commit()
+
+    except HTTPException:
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     audit(
         "owner_logout",
         actor_id=identity["user_id"],
         actor_role="OWNER",
-        ip_address=request.client.host if request.client else None,
+        ip_address=(
+            request.client.host
+            if request.client
+            else None
+        ),
     )
 
     return {"success": True}
@@ -1429,7 +1538,11 @@ def health():
         database_status = "error"
 
     return {
-        "status": "ok" if database_status == "ok" else "degraded",
+        "status": (
+            "ok"
+            if database_status == "ok"
+            else "degraded"
+        ),
         "database": database_status,
         "version": APP_VERSION,
     }
@@ -1459,7 +1572,7 @@ def create_bank_account(
     if not validate_iban(payload.iban):
         raise HTTPException(
             status_code=400,
-            detail="Invalid Iranian IBAN format",
+            detail="Invalid Iranian IBAN or checksum",
         )
 
     currency = payload.currency.strip().upper()
@@ -1470,10 +1583,20 @@ def create_bank_account(
             detail="Bank transfer currency must be IRR",
         )
 
+    bank_name = payload.bank_name.strip()
+    account_holder = payload.account_holder.strip()
+
+    if not bank_name or not account_holder:
+        raise HTTPException(
+            status_code=400,
+            detail="Bank name and account holder are required",
+        )
+
     conn = get_db()
 
     try:
         conn.execute("BEGIN IMMEDIATE")
+        now = utc_iso()
 
         conn.execute(
             """
@@ -1481,7 +1604,7 @@ def create_bank_account(
             SET active = 0, disabled_at = ?
             WHERE active = 1 AND currency = ?
             """,
-            (utc_iso(), currency),
+            (now, currency),
         )
 
         cur = conn.execute(
@@ -1495,15 +1618,23 @@ def create_bank_account(
             VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
             (
-                payload.bank_name.strip(),
-                payload.account_holder.strip(),
+                bank_name,
+                account_holder,
                 normalize_iban(payload.iban),
-                payload.account_number,
-                payload.card_number,
+                (
+                    payload.account_number.strip()
+                    if payload.account_number
+                    else None
+                ),
+                (
+                    payload.card_number.strip()
+                    if payload.card_number
+                    else None
+                ),
                 currency,
-                payload.label,
-                utc_iso(),
-                utc_iso(),
+                payload.label.strip() if payload.label else None,
+                now,
+                now,
             ),
         )
 
@@ -1523,7 +1654,11 @@ def create_bank_account(
         actor_role="OWNER",
         target_type="bank_account",
         target_id=str(account_id),
-        ip_address=request.client.host if request.client else None,
+        ip_address=(
+            request.client.host
+            if request.client
+            else None
+        ),
     )
 
     return {
@@ -1553,25 +1688,43 @@ def disable_bank_account(
     request: Request,
     identity: Dict[str, str] = Depends(owner_required),
 ):
-    row = fetch_one(
-        "SELECT id FROM bank_accounts WHERE id = ?",
-        (account_id,),
-    )
+    conn = get_db()
 
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail="Bank account not found",
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = conn.execute(
+            "SELECT id, active FROM bank_accounts WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Bank account not found",
+            )
+
+        now = utc_iso()
+
+        conn.execute(
+            """
+            UPDATE bank_accounts
+            SET active = 0, disabled_at = ?
+            WHERE id = ?
+            """,
+            (now, account_id),
         )
 
-    execute(
-        """
-        UPDATE bank_accounts
-        SET active = 0, disabled_at = ?
-        WHERE id = ?
-        """,
-        (utc_iso(), account_id),
-    )
+        conn.commit()
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     audit(
         "bank_account_disabled",
@@ -1579,7 +1732,11 @@ def disable_bank_account(
         actor_role="OWNER",
         target_type="bank_account",
         target_id=str(account_id),
-        ip_address=request.client.host if request.client else None,
+        ip_address=(
+            request.client.host
+            if request.client
+            else None
+        ),
     )
 
     return {"success": True}
@@ -1619,11 +1776,12 @@ def create_wallet_destination(
     if not validate_wallet_address(payload.address):
         raise HTTPException(
             status_code=400,
-            detail="Invalid wallet address length",
+            detail="Invalid wallet address format",
         )
 
     currency = payload.currency.strip().upper()
     network = payload.network.strip().upper()
+    address = payload.address.strip()
 
     if currency != "USDT":
         raise HTTPException(
@@ -1631,10 +1789,17 @@ def create_wallet_destination(
             detail="Only USDT destinations are supported",
         )
 
+    if not network:
+        raise HTTPException(
+            status_code=400,
+            detail="Wallet network is required",
+        )
+
     conn = get_db()
 
     try:
         conn.execute("BEGIN IMMEDIATE")
+        now = utc_iso()
 
         conn.execute(
             """
@@ -1644,7 +1809,7 @@ def create_wallet_destination(
               AND currency = ?
               AND network = ?
             """,
-            (utc_iso(), currency, network),
+            (now, currency, network),
         )
 
         cur = conn.execute(
@@ -1659,10 +1824,10 @@ def create_wallet_destination(
             (
                 network,
                 currency,
-                payload.address.strip(),
-                payload.label,
-                utc_iso(),
-                utc_iso(),
+                address,
+                payload.label.strip() if payload.label else None,
+                now,
+                now,
             ),
         )
 
@@ -1682,8 +1847,15 @@ def create_wallet_destination(
         actor_role="OWNER",
         target_type="wallet_destination",
         target_id=str(destination_id),
-        ip_address=request.client.host if request.client else None,
-        details={"network": network, "currency": currency},
+        ip_address=(
+            request.client.host
+            if request.client
+            else None
+        ),
+        details={
+            "network": network,
+            "currency": currency,
+        },
     )
 
     return {
@@ -1713,25 +1885,41 @@ def disable_wallet_destination(
     request: Request,
     identity: Dict[str, str] = Depends(owner_required),
 ):
-    row = fetch_one(
-        "SELECT id FROM wallet_destinations WHERE id = ?",
-        (destination_id,),
-    )
+    conn = get_db()
 
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail="Wallet destination not found",
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = conn.execute(
+            "SELECT id FROM wallet_destinations WHERE id = ?",
+            (destination_id,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Wallet destination not found",
+            )
+
+        conn.execute(
+            """
+            UPDATE wallet_destinations
+            SET active = 0, disabled_at = ?
+            WHERE id = ?
+            """,
+            (utc_iso(), destination_id),
         )
 
-    execute(
-        """
-        UPDATE wallet_destinations
-        SET active = 0, disabled_at = ?
-        WHERE id = ?
-        """,
-        (utc_iso(), destination_id),
-    )
+        conn.commit()
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     audit(
         "wallet_destination_disabled",
@@ -1739,7 +1927,11 @@ def disable_wallet_destination(
         actor_role="OWNER",
         target_type="wallet_destination",
         target_id=str(destination_id),
-        ip_address=request.client.host if request.client else None,
+        ip_address=(
+            request.client.host
+            if request.client
+            else None
+        ),
     )
 
     return {"success": True}
@@ -1777,6 +1969,8 @@ def create_payment_plan(
 ):
     market = payload.market.strip().upper()
     currency = payload.currency.strip().upper()
+    code = payload.code.strip()
+    name = payload.name.strip()
 
     if market not in {"IR", "INT"}:
         raise HTTPException(
@@ -1792,6 +1986,12 @@ def create_payment_plan(
             detail="Currency does not match market",
         )
 
+    if not code or not name:
+        raise HTTPException(
+            status_code=400,
+            detail="Plan code and name are required",
+        )
+
     try:
         plan_id = execute(
             """
@@ -1804,13 +2004,17 @@ def create_payment_plan(
             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
             """,
             (
-                payload.code.strip(),
-                payload.name.strip(),
+                code,
+                name,
                 market,
                 currency,
                 payload.amount,
                 payload.max_users,
-                json.dumps(payload.metadata, ensure_ascii=False),
+                json.dumps(
+                    payload.metadata,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                ),
                 utc_iso(),
                 utc_iso(),
             ),
@@ -1821,6 +2025,11 @@ def create_payment_plan(
             status_code=409,
             detail="Plan code already exists",
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Plan metadata contains invalid numeric values",
+        ) from exc
 
     audit(
         "payment_plan_created",
@@ -1828,7 +2037,11 @@ def create_payment_plan(
         actor_role="OWNER",
         target_type="payment_plan",
         target_id=str(plan_id),
-        ip_address=request.client.host if request.client else None,
+        ip_address=(
+            request.client.host
+            if request.client
+            else None
+        ),
     )
 
     return {
@@ -1913,25 +2126,41 @@ def disable_payment_plan(
     request: Request,
     identity: Dict[str, str] = Depends(owner_required),
 ):
-    row = fetch_one(
-        "SELECT code FROM payment_plans WHERE code = ?",
-        (plan_code,),
-    )
+    conn = get_db()
 
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail="Payment plan not found",
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = conn.execute(
+            "SELECT code FROM payment_plans WHERE code = ?",
+            (plan_code,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Payment plan not found",
+            )
+
+        conn.execute(
+            """
+            UPDATE payment_plans
+            SET active = 0, updated_at = ?
+            WHERE code = ?
+            """,
+            (utc_iso(), plan_code),
         )
 
-    execute(
-        """
-        UPDATE payment_plans
-        SET active = 0, updated_at = ?
-        WHERE code = ?
-        """,
-        (utc_iso(), plan_code),
-    )
+        conn.commit()
+
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
     audit(
         "payment_plan_disabled",
@@ -1939,7 +2168,11 @@ def disable_payment_plan(
         actor_role="OWNER",
         target_type="payment_plan",
         target_id=plan_code,
-        ip_address=request.client.host if request.client else None,
+        ip_address=(
+            request.client.host
+            if request.client
+            else None
+        ),
     )
 
     return {"success": True}
@@ -2002,6 +2235,9 @@ def get_destination_snapshot(
     network: Optional[str],
     currency: str,
 ) -> tuple:
+    method = method.strip().upper()
+    currency = currency.strip().upper()
+
     if method == "BANK_TRANSFER":
         row = conn.execute(
             """
@@ -2021,7 +2257,7 @@ def get_destination_snapshot(
             )
 
         snapshot = {
-            "id": row["id"],
+            "id": int(row["id"]),
             "bank_name": row["bank_name"],
             "account_holder": row["account_holder"],
             "iban": row["iban"],
@@ -2031,14 +2267,26 @@ def get_destination_snapshot(
             "label": row["label"],
         }
 
-        return "BANK_ACCOUNT", int(row["id"]), snapshot
+        # payment_transactions.destination_id currently has a
+        # foreign key referencing wallet_destinations(id) only.
+        # Store the bank account ID in the immutable snapshot and
+        # leave destination_id NULL to avoid an invalid FK reference.
+        return "BANK_ACCOUNT", None, snapshot
 
     if method == "CRYPTO":
-        if not network:
+        if not network or not network.strip():
             raise HTTPException(
                 status_code=400,
                 detail="Crypto network is required",
             )
+
+        if currency != "USDT":
+            raise HTTPException(
+                status_code=400,
+                detail="Crypto payments currently support USDT only",
+            )
+
+        normalized_network = network.strip().upper()
 
         row = conn.execute(
             """
@@ -2050,7 +2298,7 @@ def get_destination_snapshot(
             ORDER BY id DESC
             LIMIT 1
             """,
-            (currency, network.strip().upper()),
+            (currency, normalized_network),
         ).fetchone()
 
         if not row:
@@ -2060,7 +2308,7 @@ def get_destination_snapshot(
             )
 
         snapshot = {
-            "id": row["id"],
+            "id": int(row["id"]),
             "network": row["network"],
             "currency": row["currency"],
             "address": row["address"],
@@ -2074,7 +2322,6 @@ def get_destination_snapshot(
         detail="Unsupported payment method",
     )
 
-
 # ===============================================================
 # CUSTOMER PAYMENT CREATION
 # ===============================================================
@@ -2087,12 +2334,15 @@ def create_payment(
 ):
     require_payments()
 
-    require_same_user(
-        payload.user_id,
-        identity,
-    )
+    require_same_user(payload.user_id, identity)
 
     method = payload.method.strip().upper()
+
+    if method not in {"BANK_TRANSFER", "CRYPTO"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported payment method",
+        )
 
     if method == "BANK_TRANSFER" and not get_control(
         "bank_transfer_enabled"
@@ -2110,10 +2360,9 @@ def create_payment(
             detail="Crypto payments are disabled",
         )
 
-    if not re.fullmatch(
-        r"[A-Za-z0-9._:-]{8,200}",
-        payload.idempotency_key,
-    ):
+    idempotency_key = payload.idempotency_key.strip()
+
+    if not re.fullmatch(r"[A-Za-z0-9._:-]{8,200}", idempotency_key):
         raise HTTPException(
             status_code=400,
             detail="Invalid idempotency key",
@@ -2121,6 +2370,7 @@ def create_payment(
 
     conn = get_db()
     payment_row = None
+    created_new = False
 
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -2131,12 +2381,24 @@ def create_payment(
             FROM payment_transactions
             WHERE user_id = ? AND idempotency_key = ?
             """,
-            (identity["user_id"], payload.idempotency_key),
+            (identity["user_id"], idempotency_key),
         ).fetchone()
 
         if existing:
-            conn.commit()
+            if (
+                existing["plan_code"] != payload.plan_code
+                or existing["method"] != method
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Idempotency key has already been used "
+                        "for a different payment request"
+                    ),
+                )
+
             payment_row = existing
+            conn.commit()
 
         else:
             plan = get_active_plan_in_transaction(
@@ -2156,13 +2418,19 @@ def create_payment(
                     detail="Payment method does not match plan market",
                 )
 
-            if plan["market"] == "IR":
-                if plan["currency"] != "IRR":
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Invalid domestic plan currency",
-                    )
-            elif plan["currency"] != "USDT":
+            if (
+                plan["market"] == "IR"
+                and plan["currency"] != "IRR"
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid domestic plan currency",
+                )
+
+            if (
+                plan["market"] != "IR"
+                and plan["currency"] != "USDT"
+            ):
                 raise HTTPException(
                     status_code=400,
                     detail="Invalid international plan currency",
@@ -2180,6 +2448,30 @@ def create_payment(
             transaction_id = random_id("pay")
             created_at = utc_iso()
             expires_at = future_iso(PAYMENT_EXPIRY_HOURS)
+
+            metadata = (
+                payload.metadata
+                if isinstance(payload.metadata, dict)
+                else {}
+            )
+
+            metadata_json = json.dumps(
+                metadata,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+
+            snapshot_json = json.dumps(
+                snapshot,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+
+            provider = (
+                payload.provider.strip()
+                if payload.provider
+                else None
+            )
 
             conn.execute(
                 """
@@ -2205,10 +2497,10 @@ def create_payment(
                     plan["amount"],
                     destination_type,
                     destination_id,
-                    json.dumps(snapshot, ensure_ascii=False),
-                    payload.provider,
-                    payload.idempotency_key,
-                    json.dumps(payload.metadata, ensure_ascii=False),
+                    snapshot_json,
+                    provider,
+                    idempotency_key,
+                    metadata_json,
                     created_at,
                     expires_at,
                 ),
@@ -2224,6 +2516,7 @@ def create_payment(
             ).fetchone()
 
             conn.commit()
+            created_new = True
 
     except HTTPException:
         conn.rollback()
@@ -2234,16 +2527,35 @@ def create_payment(
 
         existing = get_existing_idempotent_payment(
             identity["user_id"],
-            payload.idempotency_key,
+            idempotency_key,
         )
 
         if existing:
+            if (
+                existing["plan_code"] != payload.plan_code
+                or existing["method"] != method
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Idempotency key has already been used "
+                        "for a different payment request"
+                    ),
+                ) from exc
+
             payment_row = existing
         else:
             raise HTTPException(
                 status_code=409,
                 detail="Payment creation conflict",
             ) from exc
+
+    except (TypeError, ValueError) as exc:
+        conn.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid payment metadata or destination snapshot",
+        ) from exc
 
     except Exception:
         conn.rollback()
@@ -2258,14 +2570,15 @@ def create_payment(
             detail="Unable to create payment",
         )
 
-    audit(
-        "payment_created_or_reused",
-        actor_id=identity["user_id"],
-        actor_role=identity["role"],
-        target_type="payment",
-        target_id=str(payment_row["transaction_id"]),
-        ip_address=request.client.host if request.client else None,
-    )
+    if created_new:
+        audit(
+            "payment_created",
+            actor_id=identity["user_id"],
+            actor_role=identity["role"],
+            target_type="payment",
+            target_id=str(payment_row["transaction_id"]),
+            ip_address=request.client.host if request.client else None,
+        )
 
     return serialize_payment(payment_row)
 
@@ -2308,6 +2621,22 @@ def list_payments(
     limit = max(1, min(int(limit), 500))
 
     if status:
+        normalized_status = status.strip().upper()
+
+        allowed_statuses = {
+            "PENDING",
+            "VERIFIED",
+            "EXPIRED",
+            "REJECTED",
+            "CANCELLED",
+        }
+
+        if normalized_status not in allowed_statuses:
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported payment status filter",
+            )
+
         rows = fetch_all(
             """
             SELECT *
@@ -2316,7 +2645,7 @@ def list_payments(
             ORDER BY id DESC
             LIMIT ?
             """,
-            (status.strip().upper(), limit),
+            (normalized_status, limit),
         )
     else:
         rows = fetch_all(
@@ -2350,6 +2679,10 @@ def activate_subscription(
 
     now = utc_now()
     subscription_id = random_id("sub")
+    starts_at = now.isoformat()
+    expires_at = (
+        now + timedelta(days=SUBSCRIPTION_DAYS)
+    ).isoformat()
 
     cur = conn.execute(
         """
@@ -2365,11 +2698,11 @@ def activate_subscription(
             subscription_id,
             transaction["user_id"],
             transaction["plan_code"],
-            now.isoformat(),
-            (now + timedelta(days=SUBSCRIPTION_DAYS)).isoformat(),
+            starts_at,
+            expires_at,
             transaction["transaction_id"],
-            now.isoformat(),
-            now.isoformat(),
+            starts_at,
+            starts_at,
         ),
     )
 
@@ -2391,6 +2724,7 @@ def verify_payment(
     identity: Dict[str, str] = Depends(owner_required),
 ):
     provider_reference = payload.provider_reference.strip()
+    provider = payload.provider.strip()
 
     if not provider_reference:
         raise HTTPException(
@@ -2398,9 +2732,16 @@ def verify_payment(
             detail="Provider reference is required",
         )
 
+    if not provider:
+        raise HTTPException(
+            status_code=400,
+            detail="Provider is required",
+        )
+
     conn = get_db()
     subscription = None
     result_status = None
+    already_verified = False
 
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -2431,26 +2772,22 @@ def verify_payment(
             ).fetchone()
 
             conn.commit()
+            already_verified = True
+            result_status = "VERIFIED"
 
-            return {
-                "success": True,
-                "status": "VERIFIED",
-                "already_verified": True,
-                "subscription": dict(subscription) if subscription else None,
-            }
-
-        if transaction["status"] != "PENDING":
+        elif transaction["status"] != "PENDING":
             raise HTTPException(
                 status_code=409,
                 detail=f"Payment status is {transaction['status']}",
             )
 
-        if not is_future(transaction["expires_at"]):
+        elif not is_future(transaction["expires_at"]):
             conn.execute(
                 """
                 UPDATE payment_transactions
                 SET status = 'EXPIRED'
                 WHERE transaction_id = ?
+                  AND status = 'PENDING'
                 """,
                 (transaction_id,),
             )
@@ -2475,21 +2812,26 @@ def verify_payment(
             result_status = "EXPIRED"
 
         else:
-            if payload.observed_destination:
+            observed_destination = (
+                payload.observed_destination.strip()
+                if payload.observed_destination
+                else None
+            )
+
+            if observed_destination:
                 snapshot = safe_json_object(
                     transaction["destination_snapshot"]
                 )
 
-                expected_destination = (
-                    snapshot.get("address")
-                    if transaction["destination_type"] == "WALLET"
-                    else snapshot.get("iban")
-                )
+                if transaction["destination_type"] == "WALLET":
+                    expected_destination = snapshot.get("address")
+                else:
+                    expected_destination = snapshot.get("iban")
 
                 if (
                     expected_destination
                     and not constant_compare(
-                        str(payload.observed_destination).strip(),
+                        observed_destination,
                         str(expected_destination).strip(),
                     )
                 ):
@@ -2497,6 +2839,26 @@ def verify_payment(
                         status_code=400,
                         detail="Observed destination does not match payment",
                     )
+
+                if not expected_destination:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Payment destination snapshot is incomplete",
+                    )
+
+            verification_details = {
+                "provider": provider,
+                "reference": provider_reference,
+                "note": payload.verification_note,
+            }
+
+            payload_hash = sha256_text(
+                json.dumps(
+                    verification_details,
+                    sort_keys=True,
+                    ensure_ascii=False,
+                )
+            )
 
             conn.execute(
                 """
@@ -2506,9 +2868,10 @@ def verify_payment(
                     provider_reference = ?,
                     verified_at = ?
                 WHERE transaction_id = ?
+                  AND status = 'PENDING'
                 """,
                 (
-                    payload.provider.strip(),
+                    provider,
                     provider_reference,
                     utc_iso(),
                     transaction_id,
@@ -2527,16 +2890,7 @@ def verify_payment(
                 (
                     transaction_id,
                     random_id("evt"),
-                    sha256_text(
-                        json.dumps(
-                            {
-                                "provider": payload.provider,
-                                "reference": provider_reference,
-                                "note": payload.verification_note,
-                            },
-                            sort_keys=True,
-                        )
-                    ),
+                    payload_hash,
                     utc_iso(),
                 ),
             )
@@ -2584,16 +2938,21 @@ def verify_payment(
         target_type="payment",
         target_id=transaction_id,
         ip_address=request.client.host if request.client else None,
-        details={"status": result_status},
+        details={
+            "status": result_status,
+            "already_verified": already_verified,
+        },
     )
 
     return {
         "success": result_status == "VERIFIED",
         "status": result_status,
+        "already_verified": already_verified,
         "subscription": dict(subscription) if subscription else None,
-    } 
- 
- # ===============================================================
+    }
+
+
+# ===============================================================
 # CUSTOMER SUBSCRIPTIONS
 # ===============================================================
 
@@ -2678,10 +3037,11 @@ def activate_device(
         )
 
     conn = get_db()
+    device_row = None
+    already_registered = False
 
     try:
         conn.execute("BEGIN IMMEDIATE")
-
         now = utc_now().isoformat()
 
         subscription = conn.execute(
@@ -2735,88 +3095,87 @@ def activate_device(
                 """
                 SELECT *
                 FROM devices
-                WHERE id = ?
+                WHERE id = ? AND user_id = ?
                 """,
-                (existing_device["id"],),
+                (
+                    existing_device["id"],
+                    identity["user_id"],
+                ),
             ).fetchone()
 
             conn.commit()
+            already_registered = True
 
-            return {
-                "success": True,
-                "device": dict(device_row),
-                "already_registered": True,
-            }
+        else:
+            active_count_row = conn.execute(
+                """
+                SELECT COUNT(*) AS total
+                FROM devices
+                WHERE user_id = ? AND active = 1
+                """,
+                (identity["user_id"],),
+            ).fetchone()
 
-        active_count_row = conn.execute(
-            """
-            SELECT COUNT(*) AS total
-            FROM devices
-            WHERE user_id = ? AND active = 1
-            """,
-            (identity["user_id"],),
-        ).fetchone()
+            active_count = int(active_count_row["total"])
 
-        active_count = int(active_count_row["total"])
+            control_row = conn.execute(
+                """
+                SELECT value
+                FROM system_controls
+                WHERE key = 'device_limit'
+                """
+            ).fetchone()
 
-        control_row = conn.execute(
-            """
-            SELECT value
-            FROM system_controls
-            WHERE key = 'device_limit'
-            """
-        ).fetchone()
+            try:
+                device_limit = (
+                    int(control_row["value"])
+                    if control_row
+                    else DEFAULT_DEVICE_LIMIT
+                )
+            except (TypeError, ValueError):
+                device_limit = DEFAULT_DEVICE_LIMIT
 
-        try:
-            device_limit = (
-                int(control_row["value"])
-                if control_row
-                else DEFAULT_DEVICE_LIMIT
+            device_limit = max(1, device_limit)
+
+            if active_count >= device_limit:
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "message": "Device limit reached",
+                        "device_limit": device_limit,
+                        "active_devices": active_count,
+                    },
+                )
+
+            conn.execute(
+                """
+                INSERT INTO devices
+                (
+                    device_id, user_id, device_name,
+                    platform, active, first_seen_at, last_seen_at
+                )
+                VALUES (?, ?, ?, ?, 1, ?, ?)
+                """,
+                (
+                    device_id,
+                    identity["user_id"],
+                    payload.device_name,
+                    payload.platform,
+                    now,
+                    now,
+                ),
             )
-        except (TypeError, ValueError):
-            device_limit = DEFAULT_DEVICE_LIMIT
 
-        device_limit = max(1, device_limit)
+            device_row = conn.execute(
+                """
+                SELECT *
+                FROM devices
+                WHERE user_id = ? AND device_id = ?
+                """,
+                (identity["user_id"], device_id),
+            ).fetchone()
 
-        if active_count >= device_limit:
-            raise HTTPException(
-                status_code=403,
-                detail={
-                    "message": "Device limit reached",
-                    "device_limit": device_limit,
-                    "active_devices": active_count,
-                },
-            )
-
-        conn.execute(
-            """
-            INSERT INTO devices
-            (
-                device_id, user_id, device_name,
-                platform, active, first_seen_at, last_seen_at
-            )
-            VALUES (?, ?, ?, ?, 1, ?, ?)
-            """,
-            (
-                device_id,
-                identity["user_id"],
-                payload.device_name,
-                payload.platform,
-                now,
-                now,
-            ),
-        )
-
-        device_row = conn.execute(
-            """
-            SELECT *
-            FROM devices
-            WHERE user_id = ? AND device_id = ?
-            """,
-            (identity["user_id"], device_id),
-        ).fetchone()
-
-        conn.commit()
+            conn.commit()
 
     except HTTPException:
         conn.rollback()
@@ -2837,19 +3196,20 @@ def activate_device(
     finally:
         conn.close()
 
-    audit(
-        "device_activated",
-        actor_id=identity["user_id"],
-        actor_role=identity["role"],
-        target_type="device",
-        target_id=device_id,
-        ip_address=request.client.host if request.client else None,
-    )
+    if not already_registered:
+        audit(
+            "device_activated",
+            actor_id=identity["user_id"],
+            actor_role=identity["role"],
+            target_type="device",
+            target_id=device_id,
+            ip_address=request.client.host if request.client else None,
+        )
 
     return {
         "success": True,
         "device": dict(device_row),
-        "already_registered": False,
+        "already_registered": already_registered,
     }
 
 
@@ -2913,50 +3273,75 @@ def disable_device(
     user_id: Optional[str] = None,
     identity: Dict[str, str] = Depends(owner_required),
 ):
-    if user_id:
-        row = fetch_one(
-            """
-            SELECT id, user_id, device_id
-            FROM devices
-            WHERE device_id = ? AND user_id = ?
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (device_id, user_id),
-        )
-    else:
-        matches = fetch_all(
-            """
-            SELECT id, user_id, device_id
-            FROM devices
-            WHERE device_id = ? AND active = 1
-            ORDER BY id DESC
-            """,
-            (device_id,),
-        )
+    conn = get_db()
+    row = None
 
-        if len(matches) > 1:
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        if user_id:
+            row = conn.execute(
+                """
+                SELECT id, user_id, device_id, active
+                FROM devices
+                WHERE device_id = ? AND user_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (device_id, user_id),
+            ).fetchone()
+        else:
+            matches = conn.execute(
+                """
+                SELECT id, user_id, device_id, active
+                FROM devices
+                WHERE device_id = ? AND active = 1
+                ORDER BY id DESC
+                """,
+                (device_id,),
+            ).fetchall()
+
+            if len(matches) > 1:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Multiple devices match; provide user_id",
+                )
+
+            row = matches[0] if matches else None
+
+        if not row:
             raise HTTPException(
-                status_code=409,
-                detail="Multiple devices match; provide user_id",
+                status_code=404,
+                detail="Device not found",
             )
 
-        row = matches[0] if matches else None
+        if not int(row["active"]):
+            raise HTTPException(
+                status_code=409,
+                detail="Device is already disabled",
+            )
 
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail="Active device not found",
+        conn.execute(
+            """
+            UPDATE devices
+            SET active = 0
+            WHERE id = ?
+            """,
+            (row["id"],),
         )
 
-    execute(
-        """
-        UPDATE devices
-        SET active = 0
-        WHERE id = ?
-        """,
-        (row["id"],),
-    )
+        conn.commit()
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
     audit(
         "device_disabled",
@@ -2983,6 +3368,7 @@ def enable_device(
     identity: Dict[str, str] = Depends(owner_required),
 ):
     conn = get_db()
+    changed = False
 
     try:
         conn.execute("BEGIN IMMEDIATE")
@@ -3031,16 +3417,24 @@ def enable_device(
             except (ValueError, TypeError):
                 limit = DEFAULT_DEVICE_LIMIT
 
-            if int(count_row["total"]) >= max(1, limit):
+            limit = max(1, limit)
+
+            if int(count_row["total"]) >= limit:
                 raise HTTPException(
                     status_code=403,
                     detail="Device limit reached",
                 )
 
             conn.execute(
-                "UPDATE devices SET active = 1 WHERE id = ?",
-                (row["id"],),
+                """
+                UPDATE devices
+                SET active = 1
+                WHERE id = ? AND user_id = ? AND active = 0
+                """,
+                (row["id"], user_id),
             )
+
+            changed = True
 
         conn.commit()
 
@@ -3055,17 +3449,23 @@ def enable_device(
     finally:
         conn.close()
 
-    audit(
-        "device_enabled",
-        actor_id=identity["user_id"],
-        actor_role="OWNER",
-        target_type="device",
-        target_id=device_id,
-        ip_address=request.client.host if request.client else None,
-        details={"user_id": user_id},
-    )
+    if changed:
+        audit(
+            "device_enabled",
+            actor_id=identity["user_id"],
+            actor_role="OWNER",
+            target_type="device",
+            target_id=device_id,
+            ip_address=request.client.host if request.client else None,
+            details={"user_id": user_id},
+        )
 
-    return {"success": True}
+    return {
+        "success": True,
+        "device_id": device_id,
+        "user_id": user_id,
+        "already_enabled": not changed,
+    }
 
 
 # ===============================================================
@@ -3091,33 +3491,47 @@ def setup_owner_mfa(
         )
 
     try:
-        normalize_base32_secret(payload.secret)
+        normalized_secret = normalize_base32_secret(payload.secret)
     except Exception as exc:
         raise HTTPException(
             status_code=400,
             detail="Invalid TOTP secret",
         ) from exc
 
-    if not verify_totp(payload.secret, payload.verification_code):
+    if not verify_totp(normalized_secret, payload.verification_code):
         raise HTTPException(
             status_code=400,
             detail="MFA verification failed",
         )
 
-    encrypted_secret = encrypt_mfa_secret(payload.secret)
+    encrypted_secret = encrypt_mfa_secret(normalized_secret)
 
     ensure_security_user("OWNER")
 
-    execute(
-        """
-        UPDATE security_users
-        SET mfa_secret_encrypted = ?,
-            mfa_enabled = 1,
-            updated_at = ?
-        WHERE user_id = 'OWNER'
-        """,
-        (encrypted_secret, utc_iso()),
-    )
+    conn = get_db()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        conn.execute(
+            """
+            UPDATE security_users
+            SET mfa_secret_encrypted = ?,
+                mfa_enabled = 1,
+                updated_at = ?
+            WHERE user_id = 'OWNER'
+            """,
+            (encrypted_secret, utc_iso()),
+        )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
     audit(
         "owner_mfa_enabled",
@@ -3170,16 +3584,52 @@ def disable_owner_mfa(
             detail="Invalid MFA code",
         )
 
-    execute(
-        """
-        UPDATE security_users
-        SET mfa_enabled = 0,
-            mfa_secret_encrypted = NULL,
-            updated_at = ?
-        WHERE user_id = 'OWNER'
-        """,
-        (utc_iso(),),
-    )
+    conn = get_db()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        current = conn.execute(
+            """
+            SELECT mfa_enabled, mfa_secret_encrypted
+            FROM security_users
+            WHERE user_id = 'OWNER'
+            """
+        ).fetchone()
+
+        if (
+            not current
+            or not int(current["mfa_enabled"] or 0)
+            or current["mfa_secret_encrypted"] != encrypted_secret
+        ):
+            raise HTTPException(
+                status_code=409,
+                detail="OWNER MFA configuration changed; retry",
+            )
+
+        conn.execute(
+            """
+            UPDATE security_users
+            SET mfa_enabled = 0,
+                mfa_secret_encrypted = NULL,
+                updated_at = ?
+            WHERE user_id = 'OWNER'
+            """,
+            (utc_iso(),),
+        )
+
+        conn.commit()
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
     audit(
         "owner_mfa_disabled",
@@ -3250,7 +3700,7 @@ def create_owner_recovery_token(
         actor_id=identity["user_id"],
         actor_role="OWNER",
         target_type="recovery_token",
-        target_id=sha256_text(raw_token)[:16],
+        target_id=token_hash[:16],
         ip_address=request.client.host if request.client else None,
     )
 
@@ -3314,6 +3764,10 @@ def find_sensitive_config_keys(
                 or normalized.endswith("apikey")
                 or normalized.endswith("accesstoken")
                 or normalized.endswith("accesskey")
+                or normalized.endswith("mnemonic")
+                or normalized.endswith("seedphrase")
+                or normalized.endswith("authorization")
+                or normalized.endswith("credential")
             )
 
             child_path = (
@@ -3354,6 +3808,22 @@ def create_provider(
     request: Request,
     identity: Dict[str, str] = Depends(owner_required),
 ):
+    provider_code = payload.provider_code.strip()
+    provider_type = payload.provider_type.strip()
+    provider_name = payload.name.strip()
+
+    if not provider_code or not provider_type or not provider_name:
+        raise HTTPException(
+            status_code=400,
+            detail="Provider code, type, and name are required",
+        )
+
+    if payload.secret_ref is not None and not payload.secret_ref.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="secret_ref must not be empty",
+        )
+
     sensitive_keys = find_sensitive_config_keys(payload.config)
 
     if sensitive_keys:
@@ -3371,6 +3841,18 @@ def create_provider(
     now = utc_iso()
 
     try:
+        config_json = json.dumps(
+            payload.config,
+            ensure_ascii=False,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid provider configuration",
+        ) from exc
+
+    try:
         provider_id = execute(
             """
             INSERT INTO providers
@@ -3382,12 +3864,12 @@ def create_provider(
             VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
             """,
             (
-                payload.provider_code.strip(),
-                payload.provider_type.strip(),
-                payload.name.strip(),
+                provider_code,
+                provider_type,
+                provider_name,
                 payload.priority,
-                json.dumps(payload.config, ensure_ascii=False),
-                payload.secret_ref,
+                config_json,
+                payload.secret_ref.strip() if payload.secret_ref else None,
                 now,
                 now,
             ),
@@ -3446,40 +3928,66 @@ def disable_provider(
     request: Request,
     identity: Dict[str, str] = Depends(owner_required),
 ):
-    row = fetch_one(
-        """
-        SELECT provider_code
-        FROM providers
-        WHERE provider_code = ?
-        """,
-        (provider_code,),
-    )
+    conn = get_db()
+    changed = False
 
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail="Provider not found",
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = conn.execute(
+            """
+            SELECT active
+            FROM providers
+            WHERE provider_code = ?
+            """,
+            (provider_code,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Provider not found",
+            )
+
+        if int(row["active"]):
+            conn.execute(
+                """
+                UPDATE providers
+                SET active = 0, updated_at = ?
+                WHERE provider_code = ?
+                """,
+                (utc_iso(), provider_code),
+            )
+            changed = True
+
+        conn.commit()
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    if changed:
+        audit(
+            "provider_disabled",
+            actor_id=identity["user_id"],
+            actor_role="OWNER",
+            target_type="provider",
+            target_id=provider_code,
+            ip_address=request.client.host if request.client else None,
         )
 
-    execute(
-        """
-        UPDATE providers
-        SET active = 0, updated_at = ?
-        WHERE provider_code = ?
-        """,
-        (utc_iso(), provider_code),
-    )
-
-    audit(
-        "provider_disabled",
-        actor_id=identity["user_id"],
-        actor_role="OWNER",
-        target_type="provider",
-        target_id=provider_code,
-        ip_address=request.client.host if request.client else None,
-    )
-
-    return {"success": True}
+    return {
+        "success": True,
+        "provider_code": provider_code,
+        "already_disabled": not changed,
+    }
 
 
 @app.post("/owner/providers/{provider_code}/enable")
@@ -3488,40 +3996,66 @@ def enable_provider(
     request: Request,
     identity: Dict[str, str] = Depends(owner_required),
 ):
-    row = fetch_one(
-        """
-        SELECT provider_code
-        FROM providers
-        WHERE provider_code = ?
-        """,
-        (provider_code,),
-    )
+    conn = get_db()
+    changed = False
 
-    if not row:
-        raise HTTPException(
-            status_code=404,
-            detail="Provider not found",
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        row = conn.execute(
+            """
+            SELECT active
+            FROM providers
+            WHERE provider_code = ?
+            """,
+            (provider_code,),
+        ).fetchone()
+
+        if not row:
+            raise HTTPException(
+                status_code=404,
+                detail="Provider not found",
+            )
+
+        if not int(row["active"]):
+            conn.execute(
+                """
+                UPDATE providers
+                SET active = 1, updated_at = ?
+                WHERE provider_code = ?
+                """,
+                (utc_iso(), provider_code),
+            )
+            changed = True
+
+        conn.commit()
+
+    except HTTPException:
+        conn.rollback()
+        raise
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
+
+    if changed:
+        audit(
+            "provider_enabled",
+            actor_id=identity["user_id"],
+            actor_role="OWNER",
+            target_type="provider",
+            target_id=provider_code,
+            ip_address=request.client.host if request.client else None,
         )
 
-    execute(
-        """
-        UPDATE providers
-        SET active = 1, updated_at = ?
-        WHERE provider_code = ?
-        """,
-        (utc_iso(), provider_code),
-    )
-
-    audit(
-        "provider_enabled",
-        actor_id=identity["user_id"],
-        actor_role="OWNER",
-        target_type="provider",
-        target_id=provider_code,
-        ip_address=request.client.host if request.client else None,
-    )
-
-    return {"success": True}
+    return {
+        "success": True,
+        "provider_code": provider_code,
+        "already_enabled": not changed,
+    }
 
 
 # ===============================================================
@@ -3561,7 +4095,7 @@ def list_controls(
             except (TypeError, ValueError):
                 item["value"] = DEFAULT_DEVICE_LIMIT
         else:
-            item["value"] = str(item["value"]).lower() == "true"
+            item["value"] = str(item["value"]).strip().lower() == "true"
 
         result.append(item)
 
@@ -3604,9 +4138,35 @@ def emergency_disable_commerce(
     request: Request,
     identity: Dict[str, str] = Depends(owner_required),
 ):
-    set_control("commerce_enabled", False)
-    set_control("payments_enabled", False)
-    set_control("new_device_activation_enabled", False)
+    conn = get_db()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        for key in (
+            "commerce_enabled",
+            "payments_enabled",
+            "new_device_activation_enabled",
+        ):
+            conn.execute(
+                """
+                INSERT INTO system_controls (key, value, updated_at)
+                VALUES (?, 'false', ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = 'false',
+                    updated_at = excluded.updated_at
+                """,
+                (key, utc_iso()),
+            )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
     audit(
         "emergency_commerce_disabled",
@@ -3630,9 +4190,35 @@ def emergency_enable_commerce(
     request: Request,
     identity: Dict[str, str] = Depends(owner_required),
 ):
-    set_control("commerce_enabled", True)
-    set_control("payments_enabled", True)
-    set_control("new_device_activation_enabled", True)
+    conn = get_db()
+
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        for key in (
+            "commerce_enabled",
+            "payments_enabled",
+            "new_device_activation_enabled",
+        ):
+            conn.execute(
+                """
+                INSERT INTO system_controls (key, value, updated_at)
+                VALUES (?, 'true', ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = 'true',
+                    updated_at = excluded.updated_at
+                """,
+                (key, utc_iso()),
+            )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
     audit(
         "emergency_commerce_enabled",
@@ -3657,11 +4243,46 @@ def kill_switch(
     request: Request = None,
     identity: Dict[str, str] = Depends(owner_required),
 ):
-    set_control("maintenance_mode", enabled)
+    conn = get_db()
 
-    if enabled:
-        set_control("payments_enabled", False)
-        set_control("new_device_activation_enabled", False)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        conn.execute(
+            """
+            INSERT INTO system_controls (key, value, updated_at)
+            VALUES ('maintenance_mode', ?, ?)
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (str(enabled).lower(), utc_iso()),
+        )
+
+        if enabled:
+            for key in (
+                "payments_enabled",
+                "new_device_activation_enabled",
+            ):
+                conn.execute(
+                    """
+                    INSERT INTO system_controls (key, value, updated_at)
+                    VALUES (?, 'false', ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = 'false',
+                        updated_at = excluded.updated_at
+                    """,
+                    (key, utc_iso()),
+                )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
     audit(
         "kill_switch_updated",
@@ -3835,6 +4456,12 @@ async def payment_webhook(
     if supplied_signature.lower().startswith("sha256="):
         supplied_signature = supplied_signature[7:]
 
+    if not re.fullmatch(r"[0-9a-fA-F]{64}", supplied_signature):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid webhook signature format",
+        )
+
     expected_signature = hmac.new(
         PAYMENT_WEBHOOK_SECRET.encode("utf-8"),
         body,
@@ -3843,14 +4470,18 @@ async def payment_webhook(
 
     if not hmac.compare_digest(
         expected_signature,
-        supplied_signature,
+        supplied_signature.lower(),
     ):
         audit(
             "webhook_signature_failed",
             actor_id="WEBHOOK",
             actor_role="SYSTEM",
             ip_address=request.client.host if request.client else None,
-            details={"payload_hash": sha256_text(body.decode("utf-8", errors="replace"))},
+            details={
+                "payload_hash": sha256_text(
+                    body.decode("utf-8", errors="replace")
+                )
+            },
         )
 
         raise HTTPException(
