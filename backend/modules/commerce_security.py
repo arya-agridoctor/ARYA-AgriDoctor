@@ -83,8 +83,6 @@ PAYMENT_WEBHOOK_SECRET = os.getenv(
     "",
 ).strip()
 
-# Required for encrypting MFA secrets at rest.
-# Configure a strong, persistent key before enabling MFA.
 MFA_ENCRYPTION_KEY = os.getenv(
     "ARYA_MFA_ENCRYPTION_KEY",
     "",
@@ -176,7 +174,7 @@ def parse_utc(value: Optional[str]) -> Optional[datetime]:
 
         return parsed.astimezone(timezone.utc)
 
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
 
 
@@ -492,6 +490,12 @@ def pbkdf2_hash(
     password: str,
     iterations: int = 310000,
 ) -> str:
+    if not isinstance(password, str) or not password:
+        raise ValueError("Password must be a non-empty string")
+
+    if not isinstance(iterations, int) or not 100000 <= iterations <= 2000000:
+        raise ValueError("PBKDF2 iterations must be between 100000 and 2000000")
+
     salt = secrets.token_bytes(16)
 
     digest = hashlib.pbkdf2_hmac(
@@ -513,6 +517,9 @@ def verify_secret(
     supplied: str,
     stored: str,
 ) -> bool:
+    if not isinstance(supplied, str) or not isinstance(stored, str):
+        return False
+
     if not stored:
         return False
 
@@ -528,13 +535,20 @@ def verify_secret(
             if iterations < 100000 or iterations > 2000000:
                 return False
 
-            salt = base64.urlsafe_b64decode(
-                parts[2].encode()
+            salt = base64.b64decode(
+                parts[2].encode(),
+                altchars=b"-_",
+                validate=True,
             )
 
-            expected = base64.urlsafe_b64decode(
-                parts[3].encode()
+            expected = base64.b64decode(
+                parts[3].encode(),
+                altchars=b"-_",
+                validate=True,
             )
+
+            if len(salt) != 16 or len(expected) != 32:
+                return False
 
             actual = hashlib.pbkdf2_hmac(
                 "sha256",
@@ -545,7 +559,7 @@ def verify_secret(
 
             return hmac.compare_digest(actual, expected)
 
-        except (ValueError, TypeError, IndexError):
+        except (ValueError, TypeError, IndexError, OverflowError):
             return False
 
     # Backward compatibility with a SHA-256 environment hash.
@@ -560,18 +574,37 @@ def verify_secret(
 # ===============================================================
 
 def normalize_base32_secret(secret: str) -> bytes:
+    if not isinstance(secret, str):
+        raise ValueError("TOTP secret must be a string")
+
     clean = (
         secret.replace(" ", "")
         .replace("-", "")
         .upper()
     )
 
-    padding = "=" * ((8 - len(clean) % 8) % 8)
+    if not clean or not re.fullmatch(r"[A-Z2-7]+=*", clean):
+        raise ValueError("Invalid Base32 TOTP secret")
 
-    return base64.b32decode(
-        clean + padding,
-        casefold=True,
-    )
+    unpadded = clean.rstrip("=")
+
+    if "=" in unpadded:
+        raise ValueError("Invalid Base32 padding")
+
+    padding = "=" * ((8 - len(unpadded) % 8) % 8)
+
+    try:
+        decoded = base64.b32decode(
+            unpadded + padding,
+            casefold=False,
+        )
+    except (ValueError, base64.binascii.Error) as exc:
+        raise ValueError("Invalid Base32 TOTP secret") from exc
+
+    if len(decoded) < 10:
+        raise ValueError("TOTP secret is too short")
+
+    return decoded
 
 
 def totp_code(
@@ -580,6 +613,9 @@ def totp_code(
 ) -> str:
     if timestamp is None:
         timestamp = int(time.time())
+
+    if not isinstance(timestamp, int) or timestamp < 0:
+        raise ValueError("Invalid TOTP timestamp")
 
     counter = timestamp // TOTP_STEP_SECONDS
     key = normalize_base32_secret(secret)
@@ -610,18 +646,29 @@ def verify_totp(
     secret: str,
     supplied_code: str,
 ) -> bool:
+    if not isinstance(supplied_code, str):
+        return False
+
     code = supplied_code.strip()
 
     if not re.fullmatch(r"\d{6}", code):
         return False
 
+    try:
+        normalize_base32_secret(secret)
+    except (TypeError, ValueError):
+        return False
+
     now = int(time.time())
 
     for offset in (-1, 0, 1):
-        expected = totp_code(
-            secret,
-            now + offset * TOTP_STEP_SECONDS,
-        )
+        try:
+            expected = totp_code(
+                secret,
+                now + offset * TOTP_STEP_SECONDS,
+            )
+        except (TypeError, ValueError, OverflowError):
+            return False
 
         if hmac.compare_digest(expected, code):
             return True
@@ -648,8 +695,18 @@ def _mfa_fernet():
         )
 
     try:
-        from cryptography.fernet import Fernet
-        return Fernet(MFA_ENCRYPTION_KEY.encode("utf-8"))
+        from cryptography.fernet import Fernet, InvalidToken
+
+        key_bytes = MFA_ENCRYPTION_KEY.encode("ascii")
+
+        # Validate key format before constructing the provider.
+        if len(key_bytes) != 44:
+            raise ValueError("Invalid Fernet key length")
+
+        return Fernet(key_bytes)
+
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(
             status_code=503,
@@ -658,12 +715,24 @@ def _mfa_fernet():
 
 
 def encrypt_mfa_secret(secret: str) -> str:
+    if not isinstance(secret, str) or not secret:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid MFA secret",
+        )
+
     return _mfa_fernet().encrypt(
         secret.encode("utf-8")
     ).decode("ascii")
 
 
 def decrypt_mfa_secret(encrypted: str) -> str:
+    if not isinstance(encrypted, str) or not encrypted:
+        raise HTTPException(
+            status_code=503,
+            detail="Stored MFA secret is invalid",
+        )
+
     try:
         return _mfa_fernet().decrypt(
             encrypted.encode("ascii")
@@ -782,6 +851,12 @@ def create_session(
     user_id: str,
     role: str,
 ) -> str:
+    if not isinstance(user_id, str) or not user_id.strip():
+        raise ValueError("user_id must be a non-empty string")
+
+    if not isinstance(role, str) or not role.strip():
+        raise ValueError("role must be a non-empty string")
+
     raw_token = secrets.token_urlsafe(48)
     token_hash = sha256_text(raw_token)
 
@@ -796,8 +871,8 @@ def create_session(
         """,
         (
             token_hash,
-            user_id,
-            role,
+            user_id.strip(),
+            role.strip().upper(),
             future_iso(SESSION_HOURS),
             utc_iso(),
         ),
@@ -809,10 +884,15 @@ def create_session(
 def authenticate(
     credentials: Optional[HTTPAuthorizationCredentials],
 ) -> Dict[str, str]:
-    if not credentials or not credentials.credentials:
+    if (
+        not credentials
+        or not credentials.credentials
+        or credentials.scheme.lower() != "bearer"
+    ):
         raise HTTPException(
             status_code=401,
             detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     token_hash = sha256_text(credentials.credentials)
@@ -830,12 +910,14 @@ def authenticate(
         raise HTTPException(
             status_code=401,
             detail="Invalid session",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     if not is_future(row["expires_at"]):
         raise HTTPException(
             status_code=401,
             detail="Session expired",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     return {
@@ -866,10 +948,10 @@ def user_required(
     """
     Validates a session issued by this commerce service.
 
-    Important: tokens issued by backend/main.py are not assumed
-    to be valid commerce sessions. Integration with that service's
-    actual token validator must be explicitly implemented before
-    main.py-issued customer tokens can use these endpoints.
+    Tokens issued by backend/main.py are not assumed to be valid
+    commerce sessions. Integration with that service's actual
+    token validator must be explicitly implemented before its
+    customer tokens can use these endpoints.
     """
     identity = authenticate(credentials)
 
@@ -991,6 +1073,9 @@ class RecoveryCreate(BaseModel):
 # ===============================================================
 
 def normalize_iban(iban: str) -> str:
+    if not isinstance(iban, str):
+        return ""
+
     return (
         iban.replace(" ", "")
         .replace("-", "")
@@ -999,18 +1084,51 @@ def normalize_iban(iban: str) -> str:
 
 
 def validate_iban(iban: str) -> bool:
+    """
+    Validates Iranian IBAN format and MOD-97 checksum.
+    Iran IBANs consist of IR followed by 24 digits.
+    """
     normalized = normalize_iban(iban)
 
-    return (
-        normalized.startswith("IR")
-        and len(normalized) == 26
-        and normalized[2:].isdigit()
-    )
+    if not re.fullmatch(r"IR\d{24}", normalized):
+        return False
+
+    rearranged = normalized[4:] + normalized[:4]
+
+    numeric_parts = []
+
+    for character in rearranged:
+        if character.isdigit():
+            numeric_parts.append(character)
+        elif "A" <= character <= "Z":
+            numeric_parts.append(str(ord(character) - ord("A") + 10))
+        else:
+            return False
+
+    remainder = 0
+
+    for digit in "".join(numeric_parts):
+        remainder = (remainder * 10 + int(digit)) % 97
+
+    return remainder == 1
 
 
 def validate_wallet_address(address: str) -> bool:
+    if not isinstance(address, str):
+        return False
+
     clean = address.strip()
-    return 20 <= len(clean) <= 200
+
+    if not 20 <= len(clean) <= 200:
+        return False
+
+    if any(character.isspace() for character in clean):
+        return False
+
+    return bool(
+        re.fullmatch(r"[A-Za-z0-9]+", clean)
+        or re.fullmatch(r"0x[a-fA-F0-9]{40}", clean)
+    )
 
 
 # ===============================================================
