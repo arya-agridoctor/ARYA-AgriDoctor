@@ -3171,6 +3171,7 @@ def create_provider(
     }
 
 
+
 @app.get(
     "/owner/providers"
 )
@@ -3178,7 +3179,6 @@ def list_providers(
     identity: Dict[str, str] =
         Depends(owner_required),
 ):
-
     rows = fetch_all(
         """
         SELECT
@@ -3189,7 +3189,6 @@ def list_providers(
             active,
             priority,
             config_json,
-            secret_ref,
             created_at,
             updated_at
         FROM providers
@@ -3197,10 +3196,29 @@ def list_providers(
         """
     )
 
-    return [
-        dict(row)
-        for row in rows
-    ]
+    result = []
+
+    for row in rows:
+        item = dict(row)
+
+        # Keep secret references out of API responses.
+        config_raw = item.get("config_json")
+
+        if config_raw:
+            try:
+                config = json.loads(config_raw)
+                if not isinstance(config, dict):
+                    config = {}
+            except (TypeError, ValueError):
+                config = {}
+        else:
+            config = {}
+
+        item["config_json"] = config
+        result.append(item)
+
+    return result
+
 
 
 # ===============================================================
