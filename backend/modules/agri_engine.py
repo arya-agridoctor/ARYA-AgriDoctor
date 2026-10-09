@@ -45,7 +45,7 @@ APP_NAME = "ARYA Agri Engine"
 APP_VERSION = "1.0.0"
 
 HOST = os.getenv("ARYA_AGRI_HOST", "0.0.0.0")
-PORT = int(os.getenv("ARYA_AGRI_PORT", "8002"))
+PORT = int(os.getenv("ARYA_AGRI_PORT", "8003"))
 
 BASE_DIR = Path(__file__).resolve().parent
 
