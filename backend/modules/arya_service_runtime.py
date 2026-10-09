@@ -42,7 +42,7 @@ from fastapi.responses import JSONResponse
 # ============================================================
 
 APP_NAME = "ARYA Service Runtime"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 HOST = os.getenv(
     "ARYA_RUNTIME_HOST",
@@ -127,12 +127,18 @@ def env_port(
     default: int,
 ) -> int:
     try:
-        return int(
+        value = int(
             os.getenv(
                 name,
                 str(default),
             )
         )
+
+        if not 1 <= value <= 65535:
+            return default
+
+        return value
+
     except (TypeError, ValueError):
         return default
 
@@ -189,8 +195,7 @@ class ServiceProcess:
 # Service Registry
 # ============================================================
 #
-# IMPORTANT:
-# These defaults are reconciled with the current ARYA modules.
+# Defaults used by the runtime service registry:
 #
 # 8000  main.py
 # 8001  vision
@@ -198,25 +203,30 @@ class ServiceProcess:
 # 8003  agri_engine
 # 8010  orchestrator
 # 8011  data_update
-# 8013  commerce
-# 8014  owner_manager
-# 8015  owner_integration
-# 8016  owner_runtime_gateway
-# 8017  orchestrator/runtime bridge
-# 8019  owner_provider_control
-# 8020  internal security
-# 8021  client gateway
-# 8022  main bridge
+# 8013  commerce security
+# 8015  owner integration
+# 8016  owner runtime gateway
+# 8017  orchestrator runtime bridge
+# 8018  runtime data provider bridge
+# 8019  owner provider control
+# 8020  internal service security
+# 8021  client API gateway
+# 8022  main API bridge
 # 8023  unified API
 # 8024  this runtime
-# 8025  central/scheduler conflict is handled by env override
+# 8025  automatic update scheduler
 # 8027  final integration
 # 8028  client runtime bridge
-# 8030  master/final deployment conflict is handled by env override
+# 8029  runtime configuration bridge
 # 8095  external providers
-# 8096  owner manager legacy/alternate
+# 8096  owner manager
 #
-# No existing service implementation is changed here.
+# Important:
+# - Port 8029 must match arya_runtime_config_bridge.py.
+# - Port 8025 remains assigned to the scheduler in this registry.
+# - The central configuration module must not be started on 8025
+#   without resolving its port conflict.
+# - No existing service implementation is modified here.
 # ============================================================
 
 SERVICES: List[ServiceDefinition] = [
@@ -422,7 +432,7 @@ SERVICES: List[ServiceDefinition] = [
     ServiceDefinition(
         service_id="client_api_gateway",
         name="ARYA Client API Gateway",
-        module="modules.arya_client_api_gateway:app",
+        module="modules.client_api_gateway:app",
         host="127.0.0.1",
         port=env_port(
             "ARYA_CLIENT_API_GATEWAY_PORT",
@@ -490,6 +500,29 @@ SERVICES: List[ServiceDefinition] = [
         ),
         critical=False,
         startup_order=80,
+    ),
+
+    # --------------------------------------------------------
+    # Runtime Configuration Bridge
+    # --------------------------------------------------------
+    #
+    # The default port is 8029 to match the revised
+    # arya_runtime_config_bridge.py.
+    #
+    # Override with ARYA_RUNTIME_CONFIG_BRIDGE_PORT if required.
+    # --------------------------------------------------------
+
+    ServiceDefinition(
+        service_id="arya_runtime_config_bridge",
+        name="ARYA Runtime Configuration Bridge",
+        module="modules.arya_runtime_config_bridge:app",
+        host="127.0.0.1",
+        port=env_port(
+            "ARYA_RUNTIME_CONFIG_BRIDGE_PORT",
+            8029,
+        ),
+        critical=False,
+        startup_order=85,
     ),
 
     # --------------------------------------------------------
@@ -642,7 +675,12 @@ def verify_runtime_request(
         or ""
     )
 
-    if provided != RUNTIME_SECRET:
+    import hmac
+
+    if not hmac.compare_digest(
+        provided,
+        RUNTIME_SECRET,
+    ):
         raise HTTPException(
             status_code=401,
             detail="Runtime authentication required",
@@ -739,7 +777,9 @@ class ServiceManager:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    start_new_session=True,
+                    start_new_session=(
+                        os.name != "nt"
+                    ),
                 )
 
             except Exception as exc:
@@ -871,7 +911,7 @@ class ServiceManager:
         definition = runtime.definition
 
         deadline = (
-            time.time()
+            time.monotonic()
             + START_TIMEOUT
         )
 
@@ -880,7 +920,7 @@ class ServiceManager:
             follow_redirects=False,
         ) as client:
 
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
 
                 if (
                     runtime.process is not None
@@ -908,7 +948,7 @@ class ServiceManager:
                         runtime.state = "healthy"
                         return True
 
-                except Exception:
+                except httpx.HTTPError:
                     pass
 
                 await asyncio.sleep(1)
@@ -960,10 +1000,8 @@ class ServiceManager:
                     response.status_code < 500
                 )
 
-        except Exception as exc:
-            runtime.last_error = (
-                str(exc)
-            )
+        except httpx.HTTPError as exc:
+            runtime.last_error = str(exc)
 
         if api_healthy:
             runtime.state = "healthy"
@@ -1143,6 +1181,9 @@ async def supervisor_loop():
                 await asyncio.sleep(
                     RESTART_DELAY
                 )
+
+                if SHUTDOWN_EVENT.is_set():
+                    break
 
                 try:
                     await SERVICE_MANAGER.start(
@@ -1555,6 +1596,7 @@ async def system_map():
             "arya_client_runtime_bridge",
             "arya_main_api_bridge",
             "arya_unified_api",
+            "arya_runtime_config_bridge",
         ],
 
         "runtime_services": [
@@ -1667,6 +1709,11 @@ async def runtime_contract():
             "arya_client_runtime_bridge": env_port(
                 "ARYA_CLIENT_RUNTIME_BRIDGE_PORT",
                 8028,
+            ),
+
+            "arya_runtime_config_bridge": env_port(
+                "ARYA_RUNTIME_CONFIG_BRIDGE_PORT",
+                8029,
             ),
         },
 
