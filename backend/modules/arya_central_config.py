@@ -100,107 +100,140 @@ app = FastAPI(
 # ============================================================
 
 def db() -> sqlite3.Connection:
+    """
+    Create a database connection.
+
+    SQLite connections are configured with a row factory
+    so query results can be accessed by column name.
+    """
+    database_path = Path(DB_PATH).expanduser()
+
+    if str(database_path.parent) not in ("", "."):
+        database_path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
     connection = sqlite3.connect(
-        DB_PATH,
+        str(database_path),
         check_same_thread=False,
+        timeout=30,
     )
+
     connection.row_factory = sqlite3.Row
+
+    connection.execute(
+        "PRAGMA busy_timeout = 30000"
+    )
+
     return connection
 
 
 def init_db() -> None:
     connection = db()
 
-    connection.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS settings (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            value_type TEXT NOT NULL DEFAULT 'string',
-            category TEXT NOT NULL DEFAULT 'general',
-            secret INTEGER NOT NULL DEFAULT 0,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            description TEXT,
-            updated_at INTEGER NOT NULL,
-            updated_by TEXT
-        );
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                value_type TEXT NOT NULL DEFAULT 'string',
+                category TEXT NOT NULL DEFAULT 'general',
+                secret INTEGER NOT NULL DEFAULT 0,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                description TEXT,
+                updated_at INTEGER NOT NULL,
+                updated_by TEXT
+            );
 
-        CREATE TABLE IF NOT EXISTS services (
-            service_id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            url TEXT NOT NULL,
-            health_url TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            critical INTEGER NOT NULL DEFAULT 0,
-            priority INTEGER NOT NULL DEFAULT 100,
-            timeout REAL NOT NULL DEFAULT 30,
-            retry_count INTEGER NOT NULL DEFAULT 2,
-            metadata_json TEXT NOT NULL DEFAULT '{}',
-            updated_at INTEGER NOT NULL,
-            updated_by TEXT
-        );
+            CREATE TABLE IF NOT EXISTS services (
+                service_id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                url TEXT NOT NULL,
+                health_url TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                critical INTEGER NOT NULL DEFAULT 0,
+                priority INTEGER NOT NULL DEFAULT 100,
+                timeout REAL NOT NULL DEFAULT 30,
+                retry_count INTEGER NOT NULL DEFAULT 2,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL,
+                updated_by TEXT
+            );
 
-        CREATE TABLE IF NOT EXISTS providers (
-            provider_id TEXT PRIMARY KEY,
-            provider_type TEXT NOT NULL,
-            name TEXT NOT NULL,
-            base_url TEXT,
-            enabled INTEGER NOT NULL DEFAULT 1,
-            priority INTEGER NOT NULL DEFAULT 100,
-            timeout REAL NOT NULL DEFAULT 30,
-            secret_ref TEXT,
-            capabilities_json TEXT NOT NULL DEFAULT '[]',
-            metadata_json TEXT NOT NULL DEFAULT '{}',
-            updated_at INTEGER NOT NULL,
-            updated_by TEXT
-        );
+            CREATE TABLE IF NOT EXISTS providers (
+                provider_id TEXT PRIMARY KEY,
+                provider_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                base_url TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                priority INTEGER NOT NULL DEFAULT 100,
+                timeout REAL NOT NULL DEFAULT 30,
+                secret_ref TEXT,
+                capabilities_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL,
+                updated_by TEXT
+            );
 
-        CREATE TABLE IF NOT EXISTS feature_flags (
-            feature_id TEXT PRIMARY KEY,
-            enabled INTEGER NOT NULL DEFAULT 0,
-            description TEXT,
-            updated_at INTEGER NOT NULL,
-            updated_by TEXT
-        );
+            CREATE TABLE IF NOT EXISTS feature_flags (
+                feature_id TEXT PRIMARY KEY,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                description TEXT,
+                updated_at INTEGER NOT NULL,
+                updated_by TEXT
+            );
 
-        CREATE TABLE IF NOT EXISTS config_versions (
-            version_id TEXT PRIMARY KEY,
-            version_number INTEGER NOT NULL,
-            snapshot_json TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            created_by TEXT,
-            note TEXT
-        );
+            CREATE TABLE IF NOT EXISTS config_versions (
+                version_id TEXT PRIMARY KEY,
+                version_number INTEGER NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                created_by TEXT,
+                note TEXT
+            );
 
-        CREATE TABLE IF NOT EXISTS sessions (
-            session_id TEXT PRIMARY KEY,
-            token_hash TEXT NOT NULL,
-            owner_email TEXT NOT NULL,
-            created_at INTEGER NOT NULL,
-            expires_at INTEGER NOT NULL,
-            revoked INTEGER NOT NULL DEFAULT 0
-        );
+            CREATE TABLE IF NOT EXISTS sessions (
+                session_id TEXT PRIMARY KEY,
+                token_hash TEXT NOT NULL,
+                owner_email TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS audit_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            event_id TEXT NOT NULL,
-            action TEXT NOT NULL,
-            target TEXT,
-            actor TEXT,
-            details_json TEXT,
-            created_at INTEGER NOT NULL
-        );
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id TEXT NOT NULL,
+                action TEXT NOT NULL,
+                target TEXT,
+                actor TEXT,
+                details_json TEXT,
+                created_at INTEGER NOT NULL
+            );
 
-        CREATE INDEX IF NOT EXISTS idx_audit_created
-        ON audit_logs(created_at);
+            CREATE INDEX IF NOT EXISTS idx_audit_created
+            ON audit_logs(created_at);
 
-        CREATE INDEX IF NOT EXISTS idx_sessions_token
-        ON sessions(token_hash);
-        """
-    )
+            CREATE INDEX IF NOT EXISTS idx_sessions_token
+            ON sessions(token_hash);
 
-    connection.commit()
-    connection.close()
+            CREATE INDEX IF NOT EXISTS idx_sessions_expiry
+            ON sessions(expires_at);
+
+            CREATE INDEX IF NOT EXISTS idx_services_priority
+            ON services(priority, service_id);
+
+            CREATE INDEX IF NOT EXISTS idx_providers_priority
+            ON providers(provider_type, priority, provider_id);
+            """
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
 
 
 init_db()
@@ -232,41 +265,44 @@ def audit(
 ) -> None:
     connection = db()
 
-    connection.execute(
-        """
-        INSERT INTO audit_logs
-        (
-            event_id,
-            action,
-            target,
-            actor,
-            details_json,
-            created_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            uuid.uuid4().hex,
-            action,
-            target,
-            actor,
-            json.dumps(
-                details or {},
-                ensure_ascii=False,
+    try:
+        connection.execute(
+            """
+            INSERT INTO audit_logs
+            (
+                event_id,
+                action,
+                target,
+                actor,
+                details_json,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                action,
+                target,
+                actor,
+                json.dumps(
+                    details or {},
+                    ensure_ascii=False,
+                    default=str,
+                ),
+                now(),
             ),
-            now(),
-        ),
-    )
+        )
 
-    connection.commit()
-    connection.close()
+        connection.commit()
+
+    finally:
+        connection.close()
 
 
 def parse_value(
     value: str,
     value_type: str,
 ) -> Any:
-
     if value_type == "integer":
         return int(value)
 
@@ -274,7 +310,7 @@ def parse_value(
         return float(value)
 
     if value_type == "boolean":
-        return value.lower() in {
+        return value.strip().lower() in {
             "1",
             "true",
             "yes",
@@ -291,7 +327,6 @@ def serialize_value(
     value: Any,
     value_type: str,
 ) -> str:
-
     if value_type == "json":
         return json.dumps(
             value,
@@ -299,13 +334,122 @@ def serialize_value(
         )
 
     if value_type == "boolean":
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+
+            if normalized in {"1", "true", "yes", "on"}:
+                return "true"
+
+            if normalized in {"0", "false", "no", "off"}:
+                return "false"
+
+            raise ValueError(
+                "Invalid boolean value"
+            )
+
         return (
             "true"
             if bool(value)
             else "false"
         )
 
+    if value_type == "integer":
+        if isinstance(value, bool):
+            raise ValueError(
+                "Boolean is not a valid integer setting"
+            )
+
+        return str(int(value))
+
+    if value_type == "float":
+        return str(float(value))
+
+    if value is None:
+        return ""
+
+    if isinstance(value, (dict, list)):
+        raise ValueError(
+            "Dictionary and list values require value_type='json'"
+        )
+
     return str(value)
+
+
+def validate_http_url(
+    value: Optional[str],
+    field_name: str,
+) -> None:
+    if value is None:
+        return
+
+    value = value.strip()
+
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} cannot be empty",
+        )
+
+    if not (
+        value.startswith("http://")
+        or value.startswith("https://")
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must use HTTP or HTTPS",
+        )
+
+
+def validate_identifier(
+    value: str,
+    field_name: str,
+) -> str:
+    value = value.strip()
+
+    if not value:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} cannot be empty",
+        )
+
+    if len(value) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} is too long",
+        )
+
+    return value
+
+
+def validate_positive_number(
+    value: float,
+    field_name: str,
+    maximum: float = 3600,
+) -> None:
+    if value <= 0 or value > maximum:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{field_name} must be greater than 0 "
+                f"and at most {maximum}"
+            ),
+        )
+
+
+def validate_json_serializable(
+    value: Any,
+    field_name: str,
+) -> None:
+    try:
+        json.dumps(
+            value,
+            ensure_ascii=False,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{field_name} must contain valid JSON data",
+        ) from exc
 
 
 # ============================================================
@@ -315,40 +459,39 @@ def serialize_value(
 def create_session(
     email: str,
 ) -> Dict[str, Any]:
-
     raw_token = secrets.token_urlsafe(48)
 
     created = now()
-    expires = (
-        created
-        + CONFIG_SESSION_TTL
-    )
+    expires = created + CONFIG_SESSION_TTL
 
     connection = db()
 
-    connection.execute(
-        """
-        INSERT INTO sessions
-        (
-            session_id,
-            token_hash,
-            owner_email,
-            created_at,
-            expires_at
+    try:
+        connection.execute(
+            """
+            INSERT INTO sessions
+            (
+                session_id,
+                token_hash,
+                owner_email,
+                created_at,
+                expires_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                hash_token(raw_token),
+                email,
+                created,
+                expires,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (
-            uuid.uuid4().hex,
-            hash_token(raw_token),
-            email,
-            created,
-            expires,
-        ),
-    )
 
-    connection.commit()
-    connection.close()
+        connection.commit()
+
+    finally:
+        connection.close()
 
     return {
         "token": raw_token,
@@ -359,57 +502,59 @@ def create_session(
 def owner_from_token(
     authorization: Optional[str],
 ) -> str:
-
     if not authorization:
         raise HTTPException(
             status_code=401,
             detail="OWNER authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if not authorization.lower().startswith(
-        "bearer "
+    scheme, separator, token = authorization.partition(" ")
+
+    if (
+        not separator
+        or scheme.lower() != "bearer"
+        or not token.strip()
     ):
         raise HTTPException(
             status_code=401,
             detail="Invalid authorization scheme",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-    token = authorization[7:].strip()
-
-    if not token:
-        raise HTTPException(
-            status_code=401,
-            detail="Missing session token",
-        )
-
+    token = token.strip()
     token_hash = hash_token(token)
 
     connection = db()
 
-    row = connection.execute(
-        """
-        SELECT *
-        FROM sessions
-        WHERE token_hash = ?
-        AND revoked = 0
-        ORDER BY created_at DESC
-        LIMIT 1
-        """,
-        (token_hash,),
-    ).fetchone()
+    try:
+        row = connection.execute(
+            """
+            SELECT owner_email, expires_at
+            FROM sessions
+            WHERE token_hash = ?
+              AND revoked = 0
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (token_hash,),
+        ).fetchone()
 
-    connection.close()
+    finally:
+        connection.close()
 
     if row is None:
         raise HTTPException(
             status_code=401,
             detail="Invalid OWNER session",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
-    if row["expires_at"] < now():
+    if int(row["expires_at"]) <= now():
         raise HTTPException(
             status_code=401,
             detail="OWNER session expired",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     return row["owner_email"]
@@ -420,12 +565,21 @@ def owner_from_token(
 # ============================================================
 
 class OwnerLogin(BaseModel):
-    email: str
-    secret: str
+    email: str = Field(
+        min_length=3,
+        max_length=320,
+    )
+    secret: str = Field(
+        min_length=1,
+        max_length=4096,
+    )
 
 
 class SettingInput(BaseModel):
-    key: str
+    key: str = Field(
+        min_length=1,
+        max_length=200,
+    )
     value: Any
     value_type: str = "string"
     category: str = "general"
@@ -435,29 +589,76 @@ class SettingInput(BaseModel):
 
 
 class ServiceInput(BaseModel):
-    service_id: str
-    name: str
-    url: str
-    health_url: Optional[str] = None
+    service_id: str = Field(
+        min_length=1,
+        max_length=200,
+    )
+    name: str = Field(
+        min_length=1,
+        max_length=200,
+    )
+    url: str = Field(
+        min_length=1,
+        max_length=2048,
+    )
+    health_url: Optional[str] = Field(
+        default=None,
+        max_length=2048,
+    )
     enabled: bool = True
     critical: bool = False
-    priority: int = 100
-    timeout: float = 30
-    retry_count: int = 2
+    priority: int = Field(
+        default=100,
+        ge=0,
+        le=100000,
+    )
+    timeout: float = Field(
+        default=30,
+        gt=0,
+        le=3600,
+    )
+    retry_count: int = Field(
+        default=2,
+        ge=0,
+        le=20,
+    )
     metadata: Dict[str, Any] = Field(
         default_factory=dict
     )
 
 
 class ProviderInput(BaseModel):
-    provider_id: str
-    provider_type: str
-    name: str
-    base_url: Optional[str] = None
+    provider_id: str = Field(
+        min_length=1,
+        max_length=200,
+    )
+    provider_type: str = Field(
+        min_length=1,
+        max_length=100,
+    )
+    name: str = Field(
+        min_length=1,
+        max_length=200,
+    )
+    base_url: Optional[str] = Field(
+        default=None,
+        max_length=2048,
+    )
     enabled: bool = True
-    priority: int = 100
-    timeout: float = 30
-    secret_ref: Optional[str] = None
+    priority: int = Field(
+        default=100,
+        ge=0,
+        le=100000,
+    )
+    timeout: float = Field(
+        default=30,
+        gt=0,
+        le=3600,
+    )
+    secret_ref: Optional[str] = Field(
+        default=None,
+        max_length=500,
+    )
     capabilities: list[str] = Field(
         default_factory=list
     )
@@ -467,13 +668,19 @@ class ProviderInput(BaseModel):
 
 
 class FeatureInput(BaseModel):
-    feature_id: str
+    feature_id: str = Field(
+        min_length=1,
+        max_length=200,
+    )
     enabled: bool
     description: Optional[str] = None
 
 
 class SnapshotInput(BaseModel):
-    note: Optional[str] = None
+    note: Optional[str] = Field(
+        default=None,
+        max_length=2000,
+    )
 
 
 # ============================================================
@@ -495,19 +702,25 @@ async def root():
 async def health():
     connection = db()
 
-    settings = connection.execute(
-        "SELECT COUNT(*) AS c FROM settings"
-    ).fetchone()["c"]
+    try:
+        settings = connection.execute(
+            "SELECT COUNT(*) AS c FROM settings"
+        ).fetchone()["c"]
 
-    services = connection.execute(
-        "SELECT COUNT(*) AS c FROM services"
-    ).fetchone()["c"]
+        services = connection.execute(
+            "SELECT COUNT(*) AS c FROM services"
+        ).fetchone()["c"]
 
-    providers = connection.execute(
-        "SELECT COUNT(*) AS c FROM providers"
-    ).fetchone()["c"]
+        providers = connection.execute(
+            "SELECT COUNT(*) AS c FROM providers"
+        ).fetchone()["c"]
 
-    connection.close()
+        features = connection.execute(
+            "SELECT COUNT(*) AS c FROM feature_flags"
+        ).fetchone()["c"]
+
+    finally:
+        connection.close()
 
     return {
         "status": "healthy",
@@ -516,6 +729,7 @@ async def health():
         "settings": settings,
         "services": services,
         "providers": providers,
+        "features": features,
         "timestamp": now(),
     }
 
@@ -540,8 +754,12 @@ async def owner_login(
             detail="ARYA_MASTER_SECRET is not configured",
         )
 
-    if data.email.strip().lower() != (
-        MASTER_EMAIL.strip().lower()
+    supplied_email = data.email.strip().lower()
+    configured_email = MASTER_EMAIL.strip().lower()
+
+    if not hmac.compare_digest(
+        supplied_email,
+        configured_email,
     ):
         raise HTTPException(
             status_code=401,
@@ -584,21 +802,26 @@ async def owner_logout(
         authorization
     )
 
-    token = authorization[7:].strip()
+    _, _, token = authorization.partition(" ")
+    token = token.strip()
 
     connection = db()
 
-    connection.execute(
-        """
-        UPDATE sessions
-        SET revoked = 1
-        WHERE token_hash = ?
-        """,
-        (hash_token(token),),
-    )
+    try:
+        connection.execute(
+            """
+            UPDATE sessions
+            SET revoked = 1
+            WHERE token_hash = ?
+              AND revoked = 0
+            """,
+            (hash_token(token),),
+        )
 
-    connection.commit()
-    connection.close()
+        connection.commit()
+
+    finally:
+        connection.close()
 
     audit(
         "owner_logout",
@@ -627,27 +850,26 @@ async def list_settings(
 
     connection = db()
 
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM settings
-        ORDER BY category, key
-        """
-    ).fetchall()
+    try:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM settings
+            ORDER BY category, key
+            """
+        ).fetchall()
 
-    connection.close()
+    finally:
+        connection.close()
 
     result = []
 
     for row in rows:
-
         item = {
             "key": row["key"],
             "value_type": row["value_type"],
             "category": row["category"],
-            "enabled": bool(
-                row["enabled"]
-            ),
+            "enabled": bool(row["enabled"]),
             "description": row["description"],
             "updated_at": row["updated_at"],
         }
@@ -655,12 +877,18 @@ async def list_settings(
         if row["secret"]:
             item["secret"] = True
             item["value"] = None
+
         else:
             item["secret"] = False
-            item["value"] = parse_value(
-                row["value"],
-                row["value_type"],
-            )
+
+            try:
+                item["value"] = parse_value(
+                    row["value"],
+                    row["value_type"],
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                item["value"] = None
+                item["value_error"] = True
 
         result.append(item)
 
@@ -686,6 +914,11 @@ async def upsert_setting(
         authorization
     )
 
+    key = validate_identifier(
+        data.key,
+        "key",
+    )
+
     allowed_types = {
         "string",
         "integer",
@@ -700,64 +933,96 @@ async def upsert_setting(
             detail="Unsupported value_type",
         )
 
-    serialized = serialize_value(
-        data.value,
-        data.value_type,
-    )
+    try:
+        serialized = serialize_value(
+            data.value,
+            data.value_type,
+        )
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid setting value: {exc}",
+        ) from exc
+
+    if len(serialized) > 1_000_000:
+        raise HTTPException(
+            status_code=413,
+            detail="Setting value is too large",
+        )
+
+    if data.category and len(data.category) > 200:
+        raise HTTPException(
+            status_code=400,
+            detail="Category is too long",
+        )
+
+    if data.description and len(data.description) > 4000:
+        raise HTTPException(
+            status_code=400,
+            detail="Description is too long",
+        )
 
     connection = db()
 
-    connection.execute(
-        """
-        INSERT INTO settings
-        (
-            key,
-            value,
-            value_type,
-            category,
-            secret,
-            enabled,
-            description,
-            updated_at,
-            updated_by
+    try:
+        connection.execute(
+            """
+            INSERT INTO settings
+            (
+                key,
+                value,
+                value_type,
+                category,
+                secret,
+                enabled,
+                description,
+                updated_at,
+                updated_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(key)
+            DO UPDATE SET
+                value = excluded.value,
+                value_type = excluded.value_type,
+                category = excluded.category,
+                secret = excluded.secret,
+                enabled = excluded.enabled,
+                description = excluded.description,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by
+            """,
+            (
+                key,
+                serialized,
+                data.value_type,
+                data.category,
+                bool_int(data.secret),
+                bool_int(data.enabled),
+                data.description,
+                now(),
+                owner,
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(key)
-        DO UPDATE SET
-            value = excluded.value,
-            value_type = excluded.value_type,
-            category = excluded.category,
-            secret = excluded.secret,
-            enabled = excluded.enabled,
-            description = excluded.description,
-            updated_at = excluded.updated_at,
-            updated_by = excluded.updated_by
-        """,
-        (
-            data.key,
-            serialized,
-            data.value_type,
-            data.category,
-            bool_int(data.secret),
-            bool_int(data.enabled),
-            data.description,
-            now(),
-            owner,
-        ),
-    )
 
-    connection.commit()
-    connection.close()
+        connection.commit()
+
+    finally:
+        connection.close()
 
     audit(
         "setting_upsert",
-        data.key,
+        key,
         owner,
+        {
+            "value_type": data.value_type,
+            "secret": data.secret,
+            "enabled": data.enabled,
+        },
     )
 
     return {
         "status": "updated",
-        "key": data.key,
+        "key": key,
     }
 
 
@@ -777,36 +1042,39 @@ async def list_services(
 
     connection = db()
 
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM services
-        ORDER BY priority, service_id
-        """
-    ).fetchall()
+    try:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM services
+            ORDER BY priority, service_id
+            """
+        ).fetchall()
 
-    connection.close()
+    finally:
+        connection.close()
 
     result = []
 
     for row in rows:
+        try:
+            metadata = json.loads(
+                row["metadata_json"] or "{}"
+            )
+        except json.JSONDecodeError:
+            metadata = {}
+
         result.append({
             "service_id": row["service_id"],
             "name": row["name"],
             "url": row["url"],
             "health_url": row["health_url"],
-            "enabled": bool(
-                row["enabled"]
-            ),
-            "critical": bool(
-                row["critical"]
-            ),
+            "enabled": bool(row["enabled"]),
+            "critical": bool(row["critical"]),
             "priority": row["priority"],
             "timeout": row["timeout"],
             "retry_count": row["retry_count"],
-            "metadata": json.loads(
-                row["metadata_json"]
-            ),
+            "metadata": metadata,
             "updated_at": row["updated_at"],
             "updated_by": row["updated_by"],
         })
@@ -833,84 +1101,99 @@ async def upsert_service(
         authorization
     )
 
-    if not (
-        data.url.startswith("http://")
-        or data.url.startswith("https://")
-    ):
-        raise HTTPException(
-            status_code=400,
-            detail="Service URL must use HTTP or HTTPS",
-        )
+    service_id = validate_identifier(
+        data.service_id,
+        "service_id",
+    )
+
+    validate_http_url(
+        data.url,
+        "url",
+    )
+
+    validate_http_url(
+        data.health_url,
+        "health_url",
+    )
+
+    validate_json_serializable(
+        data.metadata,
+        "metadata",
+    )
 
     connection = db()
 
-    connection.execute(
-        """
-        INSERT INTO services
-        (
-            service_id,
-            name,
-            url,
-            health_url,
-            enabled,
-            critical,
-            priority,
-            timeout,
-            retry_count,
-            metadata_json,
-            updated_at,
-            updated_by
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(service_id)
-        DO UPDATE SET
-            name = excluded.name,
-            url = excluded.url,
-            health_url = excluded.health_url,
-            enabled = excluded.enabled,
-            critical = excluded.critical,
-            priority = excluded.priority,
-            timeout = excluded.timeout,
-            retry_count = excluded.retry_count,
-            metadata_json = excluded.metadata_json,
-            updated_at = excluded.updated_at,
-            updated_by = excluded.updated_by
-        """,
-        (
-            data.service_id,
-            data.name,
-            data.url,
-            data.health_url,
-            bool_int(data.enabled),
-            bool_int(data.critical),
-            data.priority,
-            data.timeout,
-            data.retry_count,
-            json.dumps(
-                data.metadata,
-                ensure_ascii=False,
+    try:
+        connection.execute(
+            """
+            INSERT INTO services
+            (
+                service_id,
+                name,
+                url,
+                health_url,
+                enabled,
+                critical,
+                priority,
+                timeout,
+                retry_count,
+                metadata_json,
+                updated_at,
+                updated_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(service_id)
+            DO UPDATE SET
+                name = excluded.name,
+                url = excluded.url,
+                health_url = excluded.health_url,
+                enabled = excluded.enabled,
+                critical = excluded.critical,
+                priority = excluded.priority,
+                timeout = excluded.timeout,
+                retry_count = excluded.retry_count,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by
+            """,
+            (
+                service_id,
+                data.name.strip(),
+                data.url.strip(),
+                data.health_url.strip() if data.health_url else None,
+                bool_int(data.enabled),
+                bool_int(data.critical),
+                data.priority,
+                data.timeout,
+                data.retry_count,
+                json.dumps(
+                    data.metadata,
+                    ensure_ascii=False,
+                ),
+                now(),
+                owner,
             ),
-            now(),
-            owner,
-        ),
-    )
+        )
 
-    connection.commit()
-    connection.close()
+        connection.commit()
+
+    finally:
+        connection.close()
 
     audit(
         "service_upsert",
-        data.service_id,
+        service_id,
         owner,
         {
             "url": data.url,
             "enabled": data.enabled,
+            "critical": data.critical,
         },
     )
 
     return {
         "status": "updated",
-        "service_id": data.service_id,
+        "service_id": service_id,
     }
 
 
@@ -953,26 +1236,30 @@ async def set_service_state(
 
     connection = db()
 
-    cursor = connection.execute(
-        """
-        UPDATE services
-        SET enabled = ?,
-            updated_at = ?,
-            updated_by = ?
-        WHERE service_id = ?
-        """,
-        (
-            bool_int(enabled),
-            now(),
-            owner,
-            service_id,
-        ),
-    )
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE services
+            SET enabled = ?,
+                updated_at = ?,
+                updated_by = ?
+            WHERE service_id = ?
+            """,
+            (
+                bool_int(enabled),
+                now(),
+                owner,
+                service_id,
+            ),
+        )
 
-    connection.commit()
-    connection.close()
+        connection.commit()
+        affected = cursor.rowcount
 
-    if cursor.rowcount == 0:
+    finally:
+        connection.close()
+
+    if affected == 0:
         raise HTTPException(
             status_code=404,
             detail="Service not found",
@@ -1009,36 +1296,46 @@ async def list_providers(
 
     connection = db()
 
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM providers
-        ORDER BY provider_type, priority, provider_id
-        """
-    ).fetchall()
+    try:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM providers
+            ORDER BY provider_type, priority, provider_id
+            """
+        ).fetchall()
 
-    connection.close()
+    finally:
+        connection.close()
 
     result = []
 
     for row in rows:
+        try:
+            capabilities = json.loads(
+                row["capabilities_json"] or "[]"
+            )
+        except json.JSONDecodeError:
+            capabilities = []
+
+        try:
+            metadata = json.loads(
+                row["metadata_json"] or "{}"
+            )
+        except json.JSONDecodeError:
+            metadata = {}
+
         result.append({
             "provider_id": row["provider_id"],
             "provider_type": row["provider_type"],
             "name": row["name"],
             "base_url": row["base_url"],
-            "enabled": bool(
-                row["enabled"]
-            ),
+            "enabled": bool(row["enabled"]),
             "priority": row["priority"],
             "timeout": row["timeout"],
             "secret_ref": row["secret_ref"],
-            "capabilities": json.loads(
-                row["capabilities_json"]
-            ),
-            "metadata": json.loads(
-                row["metadata_json"]
-            ),
+            "capabilities": capabilities,
+            "metadata": metadata,
             "updated_at": row["updated_at"],
             "updated_by": row["updated_by"],
         })
@@ -1065,68 +1362,92 @@ async def upsert_provider(
         authorization
     )
 
-    connection = db()
-
-    connection.execute(
-        """
-        INSERT INTO providers
-        (
-            provider_id,
-            provider_type,
-            name,
-            base_url,
-            enabled,
-            priority,
-            timeout,
-            secret_ref,
-            capabilities_json,
-            metadata_json,
-            updated_at,
-            updated_by
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(provider_id)
-        DO UPDATE SET
-            provider_type = excluded.provider_type,
-            name = excluded.name,
-            base_url = excluded.base_url,
-            enabled = excluded.enabled,
-            priority = excluded.priority,
-            timeout = excluded.timeout,
-            secret_ref = excluded.secret_ref,
-            capabilities_json = excluded.capabilities_json,
-            metadata_json = excluded.metadata_json,
-            updated_at = excluded.updated_at,
-            updated_by = excluded.updated_by
-        """,
-        (
-            data.provider_id,
-            data.provider_type,
-            data.name,
-            data.base_url,
-            bool_int(data.enabled),
-            data.priority,
-            data.timeout,
-            data.secret_ref,
-            json.dumps(
-                data.capabilities,
-                ensure_ascii=False,
-            ),
-            json.dumps(
-                data.metadata,
-                ensure_ascii=False,
-            ),
-            now(),
-            owner,
-        ),
+    provider_id = validate_identifier(
+        data.provider_id,
+        "provider_id",
     )
 
-    connection.commit()
-    connection.close()
+    if data.base_url:
+        validate_http_url(
+            data.base_url,
+            "base_url",
+        )
+
+    validate_json_serializable(
+        data.capabilities,
+        "capabilities",
+    )
+
+    validate_json_serializable(
+        data.metadata,
+        "metadata",
+    )
+
+    connection = db()
+
+    try:
+        connection.execute(
+            """
+            INSERT INTO providers
+            (
+                provider_id,
+                provider_type,
+                name,
+                base_url,
+                enabled,
+                priority,
+                timeout,
+                secret_ref,
+                capabilities_json,
+                metadata_json,
+                updated_at,
+                updated_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider_id)
+            DO UPDATE SET
+                provider_type = excluded.provider_type,
+                name = excluded.name,
+                base_url = excluded.base_url,
+                enabled = excluded.enabled,
+                priority = excluded.priority,
+                timeout = excluded.timeout,
+                secret_ref = excluded.secret_ref,
+                capabilities_json = excluded.capabilities_json,
+                metadata_json = excluded.metadata_json,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by
+            """,
+            (
+                provider_id,
+                data.provider_type.strip(),
+                data.name.strip(),
+                data.base_url.strip() if data.base_url else None,
+                bool_int(data.enabled),
+                data.priority,
+                data.timeout,
+                data.secret_ref,
+                json.dumps(
+                    data.capabilities,
+                    ensure_ascii=False,
+                ),
+                json.dumps(
+                    data.metadata,
+                    ensure_ascii=False,
+                ),
+                now(),
+                owner,
+            ),
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
 
     audit(
         "provider_upsert",
-        data.provider_id,
+        provider_id,
         owner,
         {
             "provider_type": data.provider_type,
@@ -1137,7 +1458,7 @@ async def upsert_provider(
 
     return {
         "status": "updated",
-        "provider_id": data.provider_id,
+        "provider_id": provider_id,
     }
 
 
@@ -1180,26 +1501,30 @@ async def set_provider_state(
 
     connection = db()
 
-    cursor = connection.execute(
-        """
-        UPDATE providers
-        SET enabled = ?,
-            updated_at = ?,
-            updated_by = ?
-        WHERE provider_id = ?
-        """,
-        (
-            bool_int(enabled),
-            now(),
-            owner,
-            provider_id,
-        ),
-    )
+    try:
+        cursor = connection.execute(
+            """
+            UPDATE providers
+            SET enabled = ?,
+                updated_at = ?,
+                updated_by = ?
+            WHERE provider_id = ?
+            """,
+            (
+                bool_int(enabled),
+                now(),
+                owner,
+                provider_id,
+            ),
+        )
 
-    connection.commit()
-    connection.close()
+        connection.commit()
+        affected = cursor.rowcount
 
-    if cursor.rowcount == 0:
+    finally:
+        connection.close()
+
+    if affected == 0:
         raise HTTPException(
             status_code=404,
             detail="Provider not found",
@@ -1230,29 +1555,29 @@ async def list_features(
         default=None
     ),
 ):
-    owner = owner_from_token(
+    owner_from_token(
         authorization
     )
 
     connection = db()
 
-    rows = connection.execute(
-        """
-        SELECT *
-        FROM feature_flags
-        ORDER BY feature_id
-        """
-    ).fetchall()
+    try:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM feature_flags
+            ORDER BY feature_id
+            """
+        ).fetchall()
 
-    connection.close()
+    finally:
+        connection.close()
 
     return {
         "features": [
             {
                 "feature_id": row["feature_id"],
-                "enabled": bool(
-                    row["enabled"]
-                ),
+                "enabled": bool(row["enabled"]),
                 "description": row["description"],
                 "updated_at": row["updated_at"],
                 "updated_by": row["updated_by"],
@@ -1273,41 +1598,49 @@ async def upsert_feature(
         authorization
     )
 
-    connection = db()
-
-    connection.execute(
-        """
-        INSERT INTO feature_flags
-        (
-            feature_id,
-            enabled,
-            description,
-            updated_at,
-            updated_by
-        )
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(feature_id)
-        DO UPDATE SET
-            enabled = excluded.enabled,
-            description = excluded.description,
-            updated_at = excluded.updated_at,
-            updated_by = excluded.updated_by
-        """,
-        (
-            data.feature_id,
-            bool_int(data.enabled),
-            data.description,
-            now(),
-            owner,
-        ),
+    feature_id = validate_identifier(
+        data.feature_id,
+        "feature_id",
     )
 
-    connection.commit()
-    connection.close()
+    connection = db()
+
+    try:
+        connection.execute(
+            """
+            INSERT INTO feature_flags
+            (
+                feature_id,
+                enabled,
+                description,
+                updated_at,
+                updated_by
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(feature_id)
+            DO UPDATE SET
+                enabled = excluded.enabled,
+                description = excluded.description,
+                updated_at = excluded.updated_at,
+                updated_by = excluded.updated_by
+            """,
+            (
+                feature_id,
+                bool_int(data.enabled),
+                data.description,
+                now(),
+                owner,
+            ),
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
 
     audit(
         "feature_upsert",
-        data.feature_id,
+        feature_id,
         owner,
         {
             "enabled": data.enabled
@@ -1316,7 +1649,7 @@ async def upsert_feature(
 
     return {
         "status": "updated",
-        "feature_id": data.feature_id,
+        "feature_id": feature_id,
         "enabled": data.enabled,
     }
 
@@ -1328,44 +1661,46 @@ async def upsert_feature(
 def build_snapshot() -> Dict[str, Any]:
     connection = db()
 
-    settings = connection.execute(
-        """
-        SELECT
-            key,
-            value,
-            value_type,
-            category,
-            secret,
-            enabled,
-            description,
-            updated_at,
-            updated_by
-        FROM settings
-        """
-    ).fetchall()
+    try:
+        settings = connection.execute(
+            """
+            SELECT
+                key,
+                value,
+                value_type,
+                category,
+                secret,
+                enabled,
+                description,
+                updated_at,
+                updated_by
+            FROM settings
+            """
+        ).fetchall()
 
-    services = connection.execute(
-        """
-        SELECT *
-        FROM services
-        """
-    ).fetchall()
+        services = connection.execute(
+            """
+            SELECT *
+            FROM services
+            """
+        ).fetchall()
 
-    providers = connection.execute(
-        """
-        SELECT *
-        FROM providers
-        """
-    ).fetchall()
+        providers = connection.execute(
+            """
+            SELECT *
+            FROM providers
+            """
+        ).fetchall()
 
-    features = connection.execute(
-        """
-        SELECT *
-        FROM feature_flags
-        """
-    ).fetchall()
+        features = connection.execute(
+            """
+            SELECT *
+            FROM feature_flags
+            """
+        ).fetchall()
 
-    connection.close()
+    finally:
+        connection.close()
 
     snapshot_settings = {}
 
@@ -1373,71 +1708,83 @@ def build_snapshot() -> Dict[str, Any]:
         if row["secret"]:
             continue
 
-        snapshot_settings[
-            row["key"]
-        ] = {
-            "value": parse_value(
+        try:
+            parsed_value = parse_value(
                 row["value"],
                 row["value_type"],
-            ),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            parsed_value = None
+
+        snapshot_settings[row["key"]] = {
+            "value": parsed_value,
             "value_type": row["value_type"],
             "category": row["category"],
-            "enabled": bool(
-                row["enabled"]
-            ),
+            "enabled": bool(row["enabled"]),
         }
+
+    snapshot_services = []
+
+    for row in services:
+        try:
+            metadata = json.loads(
+                row["metadata_json"] or "{}"
+            )
+        except json.JSONDecodeError:
+            metadata = {}
+
+        snapshot_services.append({
+            "service_id": row["service_id"],
+            "name": row["name"],
+            "url": row["url"],
+            "health_url": row["health_url"],
+            "enabled": bool(row["enabled"]),
+            "critical": bool(row["critical"]),
+            "priority": row["priority"],
+            "timeout": row["timeout"],
+            "retry_count": row["retry_count"],
+            "metadata": metadata,
+        })
+
+    snapshot_providers = []
+
+    for row in providers:
+        try:
+            capabilities = json.loads(
+                row["capabilities_json"] or "[]"
+            )
+        except json.JSONDecodeError:
+            capabilities = []
+
+        try:
+            metadata = json.loads(
+                row["metadata_json"] or "{}"
+            )
+        except json.JSONDecodeError:
+            metadata = {}
+
+        snapshot_providers.append({
+            "provider_id": row["provider_id"],
+            "provider_type": row["provider_type"],
+            "name": row["name"],
+            "base_url": row["base_url"],
+            "enabled": bool(row["enabled"]),
+            "priority": row["priority"],
+            "timeout": row["timeout"],
+            "secret_ref": row["secret_ref"],
+            "capabilities": capabilities,
+            "metadata": metadata,
+        })
 
     return {
         "created_at": now(),
         "settings": snapshot_settings,
-        "services": [
-            {
-                "service_id": row["service_id"],
-                "name": row["name"],
-                "url": row["url"],
-                "health_url": row["health_url"],
-                "enabled": bool(
-                    row["enabled"]
-                ),
-                "critical": bool(
-                    row["critical"]
-                ),
-                "priority": row["priority"],
-                "timeout": row["timeout"],
-                "retry_count": row["retry_count"],
-                "metadata": json.loads(
-                    row["metadata_json"]
-                ),
-            }
-            for row in services
-        ],
-        "providers": [
-            {
-                "provider_id": row["provider_id"],
-                "provider_type": row["provider_type"],
-                "name": row["name"],
-                "base_url": row["base_url"],
-                "enabled": bool(
-                    row["enabled"]
-                ),
-                "priority": row["priority"],
-                "timeout": row["timeout"],
-                "secret_ref": row["secret_ref"],
-                "capabilities": json.loads(
-                    row["capabilities_json"]
-                ),
-                "metadata": json.loads(
-                    row["metadata_json"]
-                ),
-            }
-            for row in providers
-        ],
+        "services": snapshot_services,
+        "providers": snapshot_providers,
         "features": [
             {
                 "feature_id": row["feature_id"],
-                "enabled": bool(
-                    row["enabled"]
-                ),
+                "enabled": bool(row["enabled"]),
                 "description": row["description"],
             }
             for row in features
@@ -1460,52 +1807,52 @@ async def create_snapshot(
 
     connection = db()
 
-    row = connection.execute(
-        """
-        SELECT
-            COALESCE(
-                MAX(version_number),
-                0
-            ) AS version
-        FROM config_versions
-        """
-    ).fetchone()
+    try:
+        row = connection.execute(
+            """
+            SELECT
+                COALESCE(
+                    MAX(version_number),
+                    0
+                ) AS version
+            FROM config_versions
+            """
+        ).fetchone()
 
-    next_version = (
-        int(row["version"])
-        + 1
-    )
+        next_version = int(row["version"]) + 1
+        version_id = uuid.uuid4().hex
+        created_at = now()
 
-    version_id = uuid.uuid4().hex
-
-    connection.execute(
-        """
-        INSERT INTO config_versions
-        (
-            version_id,
-            version_number,
-            snapshot_json,
-            created_at,
-            created_by,
-            note
-        )
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (
-            version_id,
-            next_version,
-            json.dumps(
-                snapshot,
-                ensure_ascii=False,
+        connection.execute(
+            """
+            INSERT INTO config_versions
+            (
+                version_id,
+                version_number,
+                snapshot_json,
+                created_at,
+                created_by,
+                note
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                version_id,
+                next_version,
+                json.dumps(
+                    snapshot,
+                    ensure_ascii=False,
+                ),
+                created_at,
+                owner,
+                data.note,
             ),
-            now(),
-            owner,
-            data.note,
-        ),
-    )
+        )
 
-    connection.commit()
-    connection.close()
+        connection.commit()
+
+    finally:
+        connection.close()
 
     audit(
         "config_snapshot_created",
@@ -1520,7 +1867,7 @@ async def create_snapshot(
         "status": "created",
         "version_id": version_id,
         "version": next_version,
-        "created_at": now(),
+        "created_at": created_at,
     }
 
 
@@ -1530,26 +1877,28 @@ async def list_snapshots(
         default=None
     ),
 ):
-    owner = owner_from_token(
+    owner_from_token(
         authorization
     )
 
     connection = db()
 
-    rows = connection.execute(
-        """
-        SELECT
-            version_id,
-            version_number,
-            created_at,
-            created_by,
-            note
-        FROM config_versions
-        ORDER BY version_number DESC
-        """
-    ).fetchall()
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                version_id,
+                version_number,
+                created_at,
+                created_by,
+                note
+            FROM config_versions
+            ORDER BY version_number DESC
+            """
+        ).fetchall()
 
-    connection.close()
+    finally:
+        connection.close()
 
     return {
         "snapshots": [
@@ -1562,6 +1911,64 @@ async def list_snapshots(
             }
             for row in rows
         ]
+    }
+
+
+@app.get("/config/snapshots/{version_id}")
+async def get_snapshot(
+    version_id: str,
+    authorization: Optional[str] = Header(
+        default=None
+    ),
+):
+    owner_from_token(
+        authorization
+    )
+
+    connection = db()
+
+    try:
+        row = connection.execute(
+            """
+            SELECT
+                version_id,
+                version_number,
+                snapshot_json,
+                created_at,
+                created_by,
+                note
+            FROM config_versions
+            WHERE version_id = ?
+            """,
+            (version_id,),
+        ).fetchone()
+
+    finally:
+        connection.close()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Configuration snapshot not found",
+        )
+
+    try:
+        snapshot = json.loads(
+            row["snapshot_json"]
+        )
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="Stored snapshot is invalid",
+        ) from exc
+
+    return {
+        "version_id": row["version_id"],
+        "version": row["version_number"],
+        "created_at": row["created_at"],
+        "created_by": row["created_by"],
+        "note": row["note"],
+        "snapshot": snapshot,
     }
 
 
@@ -1613,39 +2020,47 @@ async def owner_audit(
 
     connection = db()
 
-    rows = connection.execute(
-        """
-        SELECT
-            event_id,
-            action,
-            target,
-            actor,
-            details_json,
-            created_at
-        FROM audit_logs
-        ORDER BY id DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
+    try:
+        rows = connection.execute(
+            """
+            SELECT
+                event_id,
+                action,
+                target,
+                actor,
+                details_json,
+                created_at
+            FROM audit_logs
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
 
-    connection.close()
+    finally:
+        connection.close()
+
+    result = []
+
+    for row in rows:
+        try:
+            details = json.loads(
+                row["details_json"] or "{}"
+            )
+        except json.JSONDecodeError:
+            details = {}
+
+        result.append({
+            "event_id": row["event_id"],
+            "action": row["action"],
+            "target": row["target"],
+            "actor": row["actor"],
+            "details": details,
+            "created_at": row["created_at"],
+        })
 
     return {
-        "audit": [
-            {
-                "event_id": row["event_id"],
-                "action": row["action"],
-                "target": row["target"],
-                "actor": row["actor"],
-                "details": json.loads(
-                    row["details_json"]
-                    or "{}"
-                ),
-                "created_at": row["created_at"],
-            }
-            for row in rows
-        ]
+        "audit": result
     }
 
 
@@ -1665,49 +2080,37 @@ async def system_map(
 
     connection = db()
 
-    service_count = connection.execute(
-        "SELECT COUNT(*) AS c FROM services"
-    ).fetchone()["c"]
+    try:
+        service_count = connection.execute(
+            "SELECT COUNT(*) AS c FROM services"
+        ).fetchone()["c"]
 
-    provider_count = connection.execute(
-        "SELECT COUNT(*) AS c FROM providers"
-    ).fetchone()["c"]
+        provider_count = connection.execute(
+            "SELECT COUNT(*) AS c FROM providers"
+        ).fetchone()["c"]
 
-    setting_count = connection.execute(
-        "SELECT COUNT(*) AS c FROM settings"
-    ).fetchone()["c"]
+        setting_count = connection.execute(
+            "SELECT COUNT(*) AS c FROM settings"
+        ).fetchone()["c"]
 
-    feature_count = connection.execute(
-        "SELECT COUNT(*) AS c FROM feature_flags"
-    ).fetchone()["c"]
+        feature_count = connection.execute(
+            "SELECT COUNT(*) AS c FROM feature_flags"
+        ).fetchone()["c"]
 
-    connection.close()
+    finally:
+        connection.close()
 
     return {
         "service": APP_NAME,
         "version": APP_VERSION,
         "architecture": {
-            "configuration": (
-                "arya_central_config"
-            ),
-            "runtime": (
-                "arya_service_runtime"
-            ),
-            "unified_api": (
-                "arya_unified_api"
-            ),
-            "client_gateway": (
-                "client_api_gateway"
-            ),
-            "runtime_gateway": (
-                "owner_runtime_gateway"
-            ),
-            "main_bridge": (
-                "arya_main_api_bridge"
-            ),
-            "legacy_core": (
-                "main.py"
-            ),
+            "configuration": "arya_central_config",
+            "runtime": "arya_service_runtime",
+            "unified_api": "arya_unified_api",
+            "client_gateway": "client_api_gateway",
+            "runtime_gateway": "owner_runtime_gateway",
+            "main_bridge": "arya_main_api_bridge",
+            "legacy_core": "main.py",
         },
         "database": {
             "services": service_count,
@@ -1742,41 +2145,50 @@ async def cleanup(
         )
     )
 
+    current_time = now()
+
     connection = db()
 
-    audit_result = connection.execute(
-        """
-        DELETE FROM audit_logs
-        WHERE created_at < ?
-        """,
-        (cutoff,),
-    )
+    try:
+        audit_result = connection.execute(
+            """
+            DELETE FROM audit_logs
+            WHERE created_at < ?
+            """,
+            (cutoff,),
+        )
 
-    session_result = connection.execute(
-        """
-        DELETE FROM sessions
-        WHERE expires_at < ?
-        OR revoked = 1
-        """,
-    )
+        session_result = connection.execute(
+            """
+            DELETE FROM sessions
+            WHERE expires_at < ?
+               OR revoked = 1
+            """,
+            (current_time,),
+        )
 
-    connection.commit()
-    connection.close()
+        audit_deleted = audit_result.rowcount
+        sessions_deleted = session_result.rowcount
+
+        connection.commit()
+
+    finally:
+        connection.close()
 
     audit(
         "maintenance_cleanup",
         "central_configuration",
         owner,
         {
-            "audit_deleted": audit_result.rowcount,
-            "sessions_deleted": session_result.rowcount,
+            "audit_deleted": audit_deleted,
+            "sessions_deleted": sessions_deleted,
         },
     )
 
     return {
         "status": "completed",
-        "audit_deleted": audit_result.rowcount,
-        "sessions_deleted": session_result.rowcount,
+        "audit_deleted": audit_deleted,
+        "sessions_deleted": sessions_deleted,
     }
 
 
@@ -1791,6 +2203,8 @@ async def contract():
         "version": APP_VERSION,
         "port": PORT,
         "endpoints": {
+            "root": "GET /",
+            "health": "GET /health",
             "owner_login": "POST /owner/login",
             "owner_logout": "POST /owner/logout",
             "settings": "GET/POST /config/settings",
@@ -1810,14 +2224,17 @@ async def contract():
             ),
             "features": "GET/POST /config/features",
             "snapshots": "GET/POST /config/snapshots",
+            "snapshot_detail": "GET /config/snapshots/{version_id}",
             "runtime": "GET /config/runtime",
             "audit": "GET /owner/audit",
             "cleanup": "POST /owner/maintenance/cleanup",
             "system_map": "GET /config/system-map",
+            "contract": "GET /config/contract",
         },
         "security": {
             "owner_authentication": True,
             "bearer_sessions": True,
+            "session_tokens_stored_as_hashes": True,
             "secret_values_hidden": True,
             "audit_logging": True,
         },
