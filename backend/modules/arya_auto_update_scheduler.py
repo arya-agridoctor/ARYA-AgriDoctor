@@ -53,9 +53,11 @@ DATABASE = os.getenv(
     os.path.join(os.path.dirname(__file__), "arya_auto_update_scheduler.db"),
 )
 
+# The data_update service is registered on port 8011.
+# The scheduler itself continues to run on port 8025.
 DATA_UPDATE_URL = os.getenv(
     "ARYA_DATA_UPDATE_URL",
-    "http://127.0.0.1:8026",
+    "http://127.0.0.1:8011",
 ).rstrip("/")
 
 HTTP_TIMEOUT = float(os.getenv("ARYA_AUTO_UPDATE_HTTP_TIMEOUT", "30"))
@@ -120,11 +122,18 @@ def get_connection() -> sqlite3.Connection:
         check_same_thread=False,
     )
     connection.row_factory = sqlite3.Row
+
+    # SQLite foreign-key enforcement is connection-specific.
+    # Enable it on every connection, not only during initialization.
+    connection.execute("PRAGMA foreign_keys=ON")
+
     return connection
 
 
 def init_database() -> None:
-    os.makedirs(os.path.dirname(DATABASE), exist_ok=True)
+    # Support both an absolute/relative directory path and a bare filename.
+    database_dir = os.path.dirname(os.path.abspath(DATABASE))
+    os.makedirs(database_dir, exist_ok=True)
 
     with DB_LOCK:
         connection = get_connection()
@@ -958,11 +967,21 @@ def initialize_default_schedule() -> None:
 async def lifespan(app: FastAPI):
     init_database()
     initialize_default_schedule()
-    set_scheduler_enabled(
-        scheduler_enabled_from_db()
+
+    # Preserve a previously stored setting. On first startup only,
+    # initialize the database setting from the environment variable.
+    stored_setting = db_fetchone(
+        """
+        SELECT value
+        FROM runtime_state
+        WHERE key = 'scheduler_enabled'
+        """
     )
 
-    if SCHEDULER_ENABLED:
+    if stored_setting is None:
+        set_scheduler_enabled(SCHEDULER_ENABLED)
+
+    if scheduler_enabled_from_db():
         await scheduler.start()
 
     yield
