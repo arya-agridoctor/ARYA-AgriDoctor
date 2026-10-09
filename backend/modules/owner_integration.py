@@ -1,130 +1,365 @@
 """
+===============================================================
 ARYA AgriDoctor
 OWNER Integration Layer
-Version: 1.0.0
+Version: 1.1.0
+===============================================================
 
 Purpose:
 - Connect OWNER Manager with service/provider configuration.
 - Provide centralized runtime configuration.
-- Keep provider/service settings persistent.
+- Persist service, provider, and setting configuration in SQLite.
 - Allow OWNER-controlled enable/disable state.
 - Support API secret references without exposing secret values.
 - Provide configuration snapshots and audit information.
-- Do NOT modify backend/main.py or existing modules.
+- Protect OWNER and internal endpoints.
+- Avoid modifying backend/main.py or unrelated modules.
+
+Environment variables:
+- ARYA_OWNER_INTEGRATION_HOST
+- ARYA_OWNER_INTEGRATION_PORT
+- ARYA_OWNER_INTEGRATION_DB
+- ARYA_MASTER_EMAIL
+- ARYA_MASTER_SECRET
+- ARYA_OWNER_INTERNAL_TOKEN
+- ARYA_VISION_URL
+- ARYA_VOICE_LANGUAGE_URL
+- ARYA_AGRI_ENGINE_URL
+- ARYA_COMMERCE_SECURITY_URL
+- ARYA_ORCHESTRATOR_URL
+
+IMPORTANT:
+Set ARYA_MASTER_EMAIL and ARYA_MASTER_SECRET before using OWNER routes.
+Set ARYA_OWNER_INTERNAL_TOKEN to a long, random value before allowing
+other backend services to call internal/runtime endpoints.
 """
 
 from __future__ import annotations
 
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
+# ===============================================================
+# APPLICATION CONFIGURATION
+# ===============================================================
 
-SERVICE_NAME = "ARYA Owner Integration"
-SERVICE_VERSION = "1.0.0"
+APP_NAME = "ARYA OWNER Integration Layer"
+APP_VERSION = "1.1.0"
 
-HOST = os.getenv("ARYA_OWNER_INTEGRATION_HOST", "0.0.0.0")
-PORT = int(os.getenv("ARYA_OWNER_INTEGRATION_PORT", "8015"))
+HOST = os.getenv("ARYA_OWNER_INTEGRATION_HOST", "0.0.0.0").strip()
+
+try:
+    PORT = int(os.getenv("ARYA_OWNER_INTEGRATION_PORT", "8015"))
+except ValueError:
+    PORT = 8015
 
 DATABASE_PATH = os.getenv(
-    "ARYA_OWNER_INTEGRATION_DATABASE",
+    "ARYA_OWNER_INTEGRATION_DB",
     "owner_integration.db",
-)
+).strip() or "owner_integration.db"
 
-MASTER_EMAIL = os.getenv("ARYA_MASTER_EMAIL", "").strip()
+MASTER_EMAIL = os.getenv("ARYA_MASTER_EMAIL", "").strip().lower()
 MASTER_SECRET = os.getenv("ARYA_MASTER_SECRET", "").strip()
+INTERNAL_TOKEN = os.getenv("ARYA_OWNER_INTERNAL_TOKEN", "").strip()
 
-SESSION_TTL_SECONDS = int(
-    os.getenv("ARYA_OWNER_SESSION_TTL", str(12 * 60 * 60))
-)
+try:
+    SESSION_TTL_SECONDS = max(
+        300,
+        int(os.getenv("ARYA_OWNER_SESSION_TTL_SECONDS", str(12 * 60 * 60))),
+    )
+except ValueError:
+    SESSION_TTL_SECONDS = 12 * 60 * 60
 
-LOG_LEVEL = os.getenv("ARYA_OWNER_INTEGRATION_LOG_LEVEL", "INFO").upper()
+try:
+    LOGIN_MAX_ATTEMPTS = max(
+        3,
+        int(os.getenv("ARYA_OWNER_LOGIN_MAX_ATTEMPTS", "5")),
+    )
+except ValueError:
+    LOGIN_MAX_ATTEMPTS = 5
+
+try:
+    LOGIN_WINDOW_SECONDS = max(
+        30,
+        int(os.getenv("ARYA_OWNER_LOGIN_WINDOW_SECONDS", "300")),
+    )
+except ValueError:
+    LOGIN_WINDOW_SECONDS = 300
+
+try:
+    LOGIN_BLOCK_SECONDS = max(
+        30,
+        int(os.getenv("ARYA_OWNER_LOGIN_BLOCK_SECONDS", "300")),
+    )
+except ValueError:
+    LOGIN_BLOCK_SECONDS = 300
+
+DB_LOCK = threading.RLock()
+LOGIN_LOCK = threading.RLock()
+
+LOGIN_ATTEMPTS: dict[str, list[float]] = {}
+LOGIN_BLOCKED_UNTIL: dict[str, float] = {}
 
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=os.getenv("ARYA_OWNER_LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-logger = logging.getLogger(SERVICE_NAME)
-
-
-# ============================================================
-# APP
-# ============================================================
+logger = logging.getLogger("arya.owner_integration")
 
 app = FastAPI(
-    title=SERVICE_NAME,
-    version=SERVICE_VERSION,
-    description=(
-        "Central OWNER-controlled integration layer for "
-        "ARYA AgriDoctor services, providers and runtime configuration."
-    ),
+    title=APP_NAME,
+    version=APP_VERSION,
+    description="ARYA AgriDoctor OWNER Integration Layer",
 )
 
 
-# ============================================================
-# DATABASE
-# ============================================================
-
-_db_lock = threading.Lock()
-
+# ===============================================================
+# GENERAL HELPERS
+# ===============================================================
 
 def utc_now() -> str:
+    """Return an ISO-8601 UTC timestamp."""
     return datetime.now(timezone.utc).isoformat()
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(
-        DATABASE_PATH,
-        timeout=30,
-        check_same_thread=False,
+def constant_time_equal(left: str, right: str) -> bool:
+    """Compare strings without ordinary early-exit comparison."""
+    return hmac.compare_digest(
+        str(left).encode("utf-8"),
+        str(right).encode("utf-8"),
     )
-    conn.row_factory = sqlite3.Row
-    return conn
 
 
-def init_db() -> None:
-    with _db_lock:
-        conn = db()
+def sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
-        conn.executescript(
+
+def safe_json_loads(
+    value: Optional[str],
+    default: Any = None,
+) -> Any:
+    """Parse stored JSON safely."""
+    if value is None:
+        return default
+
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return default
+
+
+def owner_configured() -> bool:
+    return bool(MASTER_EMAIL and MASTER_SECRET)
+
+
+def internal_token_configured() -> bool:
+    return bool(INTERNAL_TOKEN)
+
+
+def validate_identifier(value: str, label: str = "identifier") -> str:
+    value = str(value or "").strip()
+
+    if not value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{label} is required",
+        )
+
+    if len(value) > 120:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{label} is too long",
+        )
+
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]+", value):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{label} contains invalid characters",
+        )
+
+    return value
+
+
+def validate_base_url(value: str) -> str:
+    """
+    Validate a service/provider base URL.
+
+    Loopback and private addresses are permitted because the architecture
+    intentionally uses local backend services. This function does not
+    perform network requests.
+    """
+    value = str(value or "").strip()
+
+    if not value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="base_url is required",
+        )
+
+    if len(value) > 2048:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="base_url is too long",
+        )
+
+    if any(ord(character) < 32 for character in value):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="base_url contains control characters",
+        )
+
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid base_url",
+        )
+
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="base_url must use HTTP or HTTPS",
+        )
+
+    if not parsed.hostname:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="base_url must include a hostname",
+        )
+
+    if parsed.username is not None or parsed.password is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Credentials must not be embedded in base_url",
+        )
+
+    if parsed.fragment:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="base_url must not contain a URL fragment",
+        )
+
+    try:
+        parsed.port
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="base_url contains an invalid port",
+        )
+
+    return value.rstrip("/")
+
+
+def validate_json_object(value: Any, label: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{label} must be a JSON object",
+        )
+
+    try:
+        json.dumps(value, ensure_ascii=False)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"{label} must contain JSON-compatible values",
+        )
+
+    return value
+
+
+def redact_provider(provider: dict[str, Any]) -> dict[str, Any]:
+    """
+    Avoid returning secret references through general provider listings.
+    The reference itself is not the secret value, but may disclose internal
+    configuration details.
+    """
+    result = dict(provider)
+    result.pop("secret_ref", None)
+    return result
+
+
+# ===============================================================
+# DATABASE
+# ===============================================================
+
+@contextmanager
+def db_connection():
+    """
+    Open and reliably close a SQLite connection.
+
+    A process-local lock helps threads in this process. SQLite's own locking
+    remains responsible for coordination between separate processes.
+    """
+    connection = None
+
+    with DB_LOCK:
+        try:
+            connection = sqlite3.connect(
+                DATABASE_PATH,
+                timeout=15,
+                check_same_thread=False,
+            )
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA busy_timeout = 15000")
+            connection.execute("PRAGMA foreign_keys = ON")
+            yield connection
+        except sqlite3.Error:
+            if connection is not None:
+                try:
+                    connection.rollback()
+                except sqlite3.Error:
+                    pass
+            raise
+        finally:
+            if connection is not None:
+                connection.close()
+
+
+def initialize_database() -> None:
+    with db_connection() as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+
+        connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS runtime_services (
-                service_id TEXT PRIMARY KEY,
-                service_name TEXT NOT NULL,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                service_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
                 base_url TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
-                timeout_seconds INTEGER NOT NULL DEFAULT 30,
-                retry_count INTEGER NOT NULL DEFAULT 2,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS runtime_providers (
-                provider_id TEXT PRIMARY KEY,
-                provider_name TEXT NOT NULL,
-                category TEXT NOT NULL,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_id TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                provider_type TEXT NOT NULL DEFAULT 'generic',
                 base_url TEXT NOT NULL,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 secret_ref TEXT,
-                timeout_seconds INTEGER NOT NULL DEFAULT 30,
-                retry_count INTEGER NOT NULL DEFAULT 2,
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -138,1142 +373,1121 @@ def init_db() -> None:
             );
 
             CREATE TABLE IF NOT EXISTS integration_sessions (
-                session_id TEXT PRIMARY KEY,
-                owner_email TEXT NOT NULL,
-                token_hash TEXT NOT NULL,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token_hash TEXT NOT NULL UNIQUE,
+                email TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                expires_at INTEGER NOT NULL,
+                expires_at REAL NOT NULL,
                 revoked INTEGER NOT NULL DEFAULT 0,
-                ip_address TEXT
+                last_seen_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS integration_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 actor TEXT NOT NULL,
                 action TEXT NOT NULL,
-                target_type TEXT,
-                target_id TEXT,
+                target TEXT,
                 details_json TEXT NOT NULL DEFAULT '{}',
-                ip_address TEXT,
                 created_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS integration_snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                snapshot_id TEXT UNIQUE NOT NULL,
-                snapshot_hash TEXT NOT NULL,
-                payload_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                created_by TEXT NOT NULL
+                snapshot_id TEXT NOT NULL UNIQUE,
+                created_by TEXT NOT NULL,
+                snapshot_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
             );
+
+            CREATE INDEX IF NOT EXISTS idx_owner_sessions_expiry
+            ON integration_sessions(expires_at);
+
+            CREATE INDEX IF NOT EXISTS idx_owner_audit_created
+            ON integration_audit(created_at);
+
+            CREATE INDEX IF NOT EXISTS idx_owner_snapshots_created
+            ON integration_snapshots(created_at);
             """
         )
 
-        conn.commit()
-        conn.close()
+        connection.commit()
+
+    seed_default_services()
 
 
-init_db()
-
-
-# ============================================================
-# DEFAULT SERVICES
-# ============================================================
-
-DEFAULT_SERVICES = [
-    {
-        "service_id": "vision",
-        "service_name": "ARYA Vision",
-        "base_url": os.getenv(
-            "ARYA_VISION_URL",
-            "http://127.0.0.1:8001",
+def seed_default_services() -> None:
+    defaults = [
+        (
+            "vision",
+            "ARYA Vision",
+            os.getenv("ARYA_VISION_URL", "http://127.0.0.1:8001"),
         ),
-    },
-    {
-        "service_id": "voice_language",
-        "service_name": "ARYA Voice Language",
-        "base_url": os.getenv(
-            "ARYA_VOICE_LANGUAGE_URL",
-            "http://127.0.0.1:8002",
+        (
+            "voice_language",
+            "ARYA Voice Language",
+            os.getenv(
+                "ARYA_VOICE_LANGUAGE_URL",
+                "http://127.0.0.1:8002",
+            ),
         ),
-    },
-    {
-        "service_id": "agri_engine",
-        "service_name": "ARYA Agricultural Engine",
-        "base_url": os.getenv(
-            "ARYA_AGRI_ENGINE_URL",
-            "http://127.0.0.1:8003",
+        (
+            "agri_engine",
+            "ARYA Agriculture Engine",
+            os.getenv(
+                "ARYA_AGRI_ENGINE_URL",
+                "http://127.0.0.1:8003",
+            ),
         ),
-    },
-    {
-        "service_id": "commerce_security",
-        "service_name": "ARYA Commerce Security",
-        "base_url": os.getenv(
-            "ARYA_COMMERCE_SECURITY_URL",
-            "http://127.0.0.1:8004",
+        (
+            "commerce_security",
+            "ARYA Commerce Security",
+            os.getenv(
+                "ARYA_COMMERCE_SECURITY_URL",
+                "http://127.0.0.1:8004",
+            ),
         ),
-    },
-    {
-        "service_id": "orchestrator",
-        "service_name": "ARYA Orchestrator",
-        "base_url": os.getenv(
-            "ARYA_ORCHESTRATOR_URL",
-            "http://127.0.0.1:8010",
+        (
+            "orchestrator",
+            "ARYA Runtime Orchestrator",
+            os.getenv(
+                "ARYA_ORCHESTRATOR_URL",
+                "http://127.0.0.1:8010",
+            ),
         ),
-    },
-]
+    ]
 
-
-def seed_defaults() -> None:
     now = utc_now()
 
-    with _db_lock:
-        conn = db()
-
-        for item in DEFAULT_SERVICES:
-            exists = conn.execute(
-                """
-                SELECT service_id
-                FROM runtime_services
-                WHERE service_id = ?
-                """,
-                (item["service_id"],),
-            ).fetchone()
-
-            if not exists:
-                conn.execute(
-                    """
-                    INSERT INTO runtime_services (
-                        service_id,
-                        service_name,
-                        base_url,
-                        enabled,
-                        timeout_seconds,
-                        retry_count,
-                        metadata_json,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (?, ?, ?, 1, 30, 2, '{}', ?, ?)
-                    """,
-                    (
-                        item["service_id"],
-                        item["service_name"],
-                        item["base_url"],
-                        now,
-                        now,
-                    ),
+    with db_connection() as connection:
+        for service_id, name, raw_url in defaults:
+            try:
+                base_url = validate_base_url(raw_url)
+            except HTTPException:
+                logger.warning(
+                    "Skipping invalid default URL for service %s",
+                    service_id,
                 )
+                continue
 
-        conn.commit()
-        conn.close()
-
-
-seed_defaults()
-
-
-# ============================================================
-# SECURITY
-# ============================================================
-
-def hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode("utf-8")).hexdigest()
-
-
-def constant_time_equal(a: str, b: str) -> bool:
-    return hmac.compare_digest(a, b)
-
-
-def owner_configured() -> bool:
-    return bool(MASTER_EMAIL and MASTER_SECRET)
-
-
-def create_session(
-    owner_email: str,
-    ip_address: Optional[str],
-) -> str:
-
-    raw_token = secrets.token_urlsafe(48)
-    token_hash = hash_token(raw_token)
-
-    session_id = secrets.token_hex(16)
-    now = int(time.time())
-    expires_at = now + SESSION_TTL_SECONDS
-
-    with _db_lock:
-        conn = db()
-
-        conn.execute(
-            """
-            INSERT INTO integration_sessions (
-                session_id,
-                owner_email,
-                token_hash,
-                created_at,
-                expires_at,
-                revoked,
-                ip_address
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO runtime_services
+                (
+                    service_id, name, base_url, enabled,
+                    metadata_json, created_at, updated_at
+                )
+                VALUES (?, ?, ?, 1, '{}', ?, ?)
+                """,
+                (service_id, name, base_url, now, now),
             )
-            VALUES (?, ?, ?, ?, ?, 0, ?)
-            """,
-            (
-                session_id,
-                owner_email,
-                token_hash,
-                utc_now(),
-                expires_at,
-                ip_address,
-            ),
+
+        connection.commit()
+
+
+# ===============================================================
+# AUDIT LOGGING
+# ===============================================================
+
+def write_audit(
+    actor: str,
+    action: str,
+    target: Optional[str] = None,
+    details: Optional[dict[str, Any]] = None,
+) -> None:
+    details = details or {}
+
+    try:
+        details_json = json.dumps(
+            details,
+            ensure_ascii=False,
+            separators=(",", ":"),
         )
+    except (TypeError, ValueError):
+        details_json = "{}"
 
-        conn.commit()
-        conn.close()
-
-    return raw_token
-
-
-def authenticate_owner(
-    email: str,
-    secret: str,
-) -> bool:
-
-    if not owner_configured():
-        return False
-
-    return (
-        constant_time_equal(email, MASTER_EMAIL)
-        and constant_time_equal(secret, MASTER_SECRET)
-    )
-
-
-def require_owner(
-    authorization: Optional[str] = Header(default=None),
-) -> Dict[str, Any]:
-
-    if not authorization:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OWNER authentication required",
-        )
-
-    if not authorization.lower().startswith("bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authorization scheme",
-        )
-
-    token = authorization[7:].strip()
-
-    if not token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid OWNER token",
-        )
-
-    token_hash = hash_token(token)
-
-    with _db_lock:
-        conn = db()
-
-        row = conn.execute(
+    with db_connection() as connection:
+        connection.execute(
             """
-            SELECT *
-            FROM integration_sessions
-            WHERE token_hash = ?
-              AND revoked = 0
-              AND expires_at > ?
-            ORDER BY created_at DESC
-            LIMIT 1
+            INSERT INTO integration_audit
+            (actor, action, target, details_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
-                token_hash,
-                int(time.time()),
+                actor[:200],
+                action[:200],
+                target[:300] if target else None,
+                details_json,
+                utc_now(),
             ),
-        ).fetchone()
-
-        conn.close()
-
-    if not row:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="OWNER session expired or invalid",
         )
-
-    return dict(row)
-
-
-# ============================================================
-# MODELS
-# ============================================================
-
-class OwnerLoginRequest(BaseModel):
-    email: str
-    secret: str
+        connection.commit()
 
 
-class ServiceConfig(BaseModel):
-    service_id: str = Field(min_length=1, max_length=100)
-    service_name: str = Field(min_length=1, max_length=200)
-    base_url: str = Field(min_length=1, max_length=1000)
+# ===============================================================
+# AUTHENTICATION AND SESSION MANAGEMENT
+# ===============================================================
+
+class OwnerLogin(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    secret: str = Field(min_length=1, max_length=4096)
+
+
+class ServiceCreate(BaseModel):
+    service_id: str = Field(min_length=1, max_length=120)
+    name: str = Field(min_length=1, max_length=200)
+    base_url: str = Field(min_length=1, max_length=2048)
     enabled: bool = True
-    timeout_seconds: int = Field(default=30, ge=1, le=300)
-    retry_count: int = Field(default=2, ge=0, le=10)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class ProviderConfig(BaseModel):
-    provider_id: str = Field(min_length=1, max_length=100)
-    provider_name: str = Field(min_length=1, max_length=200)
-    category: str = Field(min_length=1, max_length=100)
-    base_url: str = Field(min_length=1, max_length=1000)
+class ProviderCreate(BaseModel):
+    provider_id: str = Field(min_length=1, max_length=120)
+    name: str = Field(min_length=1, max_length=200)
+    provider_type: str = Field(default="generic", min_length=1, max_length=100)
+    base_url: str = Field(min_length=1, max_length=2048)
     enabled: bool = True
-    secret_ref: Optional[str] = None
-    timeout_seconds: int = Field(default=30, ge=1, le=300)
-    retry_count: int = Field(default=2, ge=0, le=10)
-    metadata: Dict[str, Any] = Field(default_factory=dict)
+    secret_ref: Optional[str] = Field(default=None, max_length=500)
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class SettingRequest(BaseModel):
+class SettingUpdate(BaseModel):
     key: str = Field(min_length=1, max_length=200)
     value: Any
     is_secret: bool = False
 
 
-class SnapshotRequest(BaseModel):
-    description: str = Field(default="", max_length=500)
+def get_client_key(request: Request) -> str:
+    """
+    Use the direct client address for rate limiting.
+    Do not trust X-Forwarded-For unless a trusted proxy is configured
+    separately in the deployment.
+    """
+    if request.client and request.client.host:
+        return request.client.host[:100]
+
+    return "unknown"
 
 
-# ============================================================
-# AUDIT
-# ============================================================
+def check_login_rate_limit(client_key: str) -> None:
+    now = time.time()
 
-def audit(
-    actor: str,
-    action: str,
-    target_type: Optional[str] = None,
-    target_id: Optional[str] = None,
-    details: Optional[Dict[str, Any]] = None,
-    ip_address: Optional[str] = None,
-) -> None:
+    with LOGIN_LOCK:
+        blocked_until = LOGIN_BLOCKED_UNTIL.get(client_key, 0)
 
-    with _db_lock:
-        conn = db()
-
-        conn.execute(
-            """
-            INSERT INTO integration_audit (
-                actor,
-                action,
-                target_type,
-                target_id,
-                details_json,
-                ip_address,
-                created_at
+        if blocked_until > now:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many login attempts. Try again later.",
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+
+        if blocked_until:
+            LOGIN_BLOCKED_UNTIL.pop(client_key, None)
+
+        attempts = LOGIN_ATTEMPTS.get(client_key, [])
+        attempts = [
+            timestamp
+            for timestamp in attempts
+            if now - timestamp <= LOGIN_WINDOW_SECONDS
+        ]
+        LOGIN_ATTEMPTS[client_key] = attempts
+
+        if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+            LOGIN_BLOCKED_UNTIL[client_key] = now + LOGIN_BLOCK_SECONDS
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many login attempts. Try again later.",
+            )
+
+
+def record_login_failure(client_key: str) -> None:
+    now = time.time()
+
+    with LOGIN_LOCK:
+        attempts = LOGIN_ATTEMPTS.get(client_key, [])
+        attempts = [
+            timestamp
+            for timestamp in attempts
+            if now - timestamp <= LOGIN_WINDOW_SECONDS
+        ]
+        attempts.append(now)
+        LOGIN_ATTEMPTS[client_key] = attempts
+
+        if len(attempts) >= LOGIN_MAX_ATTEMPTS:
+            LOGIN_BLOCKED_UNTIL[client_key] = now + LOGIN_BLOCK_SECONDS
+
+
+def clear_login_failures(client_key: str) -> None:
+    with LOGIN_LOCK:
+        LOGIN_ATTEMPTS.pop(client_key, None)
+        LOGIN_BLOCKED_UNTIL.pop(client_key, None)
+
+
+def create_session(email: str) -> tuple[str, float]:
+    raw_token = secrets.token_urlsafe(48)
+    token_hash = sha256_hex(raw_token)
+    expires_at = time.time() + SESSION_TTL_SECONDS
+
+    with db_connection() as connection:
+        connection.execute(
+            """
+            INSERT INTO integration_sessions
+            (token_hash, email, created_at, expires_at, revoked, last_seen_at)
+            VALUES (?, ?, ?, ?, 0, ?)
             """,
             (
-                actor,
-                action,
-                target_type,
-                target_id,
-                json.dumps(
-                    details or {},
-                    ensure_ascii=False,
-                    default=str,
-                ),
-                ip_address,
+                token_hash,
+                email,
+                utc_now(),
+                expires_at,
                 utc_now(),
             ),
         )
+        connection.commit()
 
-        conn.commit()
-        conn.close()
+    return raw_token, expires_at
 
 
-# ============================================================
-# ROOT / HEALTH
-# ============================================================
+def extract_bearer_token(authorization: Optional[str]) -> Optional[str]:
+    if not authorization:
+        return None
+
+    parts = authorization.strip().split(None, 1)
+
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+
+    token = parts[1].strip()
+    return token or None
+
+
+def require_owner(
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    if not owner_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="OWNER authentication is not configured",
+        )
+
+    raw_token = extract_bearer_token(authorization)
+
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OWNER authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token_hash = sha256_hex(raw_token)
+    now = time.time()
+
+    with db_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT id, email, expires_at, revoked
+            FROM integration_sessions
+            WHERE token_hash = ?
+            LIMIT 1
+            """,
+            (token_hash,),
+        ).fetchone()
+
+        if (
+            row is None
+            or row["revoked"]
+            or float(row["expires_at"]) <= now
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid or expired OWNER session",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        connection.execute(
+            """
+            UPDATE integration_sessions
+            SET last_seen_at = ?
+            WHERE id = ?
+            """,
+            (utc_now(), row["id"]),
+        )
+        connection.commit()
+
+    return {
+        "email": row["email"],
+        "session_id": row["id"],
+    }
+
+
+def require_internal_access(
+    authorization: Optional[str] = Header(default=None),
+    x_arya_internal_token: Optional[str] = Header(default=None),
+) -> dict[str, str]:
+    """
+    Internal endpoints require ARYA_OWNER_INTERNAL_TOKEN.
+
+    An OWNER session is also accepted, so a logged-in OWNER can inspect
+    runtime configuration without a second token.
+    """
+    raw_owner_token = extract_bearer_token(authorization)
+
+    if raw_owner_token:
+        try:
+            owner = require_owner(authorization)
+            return {"actor": owner["email"]}
+        except HTTPException:
+            pass
+
+    if not INTERNAL_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Internal API authentication is not configured",
+        )
+
+    supplied = x_arya_internal_token or ""
+
+    if not supplied and raw_owner_token:
+        supplied = raw_owner_token
+
+    if not supplied or not constant_time_equal(supplied, INTERNAL_TOKEN):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Internal API authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    return {"actor": "internal_service"}
+
+
+# ===============================================================
+# SERVICE AND PROVIDER CONFIGURATION
+# ===============================================================
+
+def service_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "service_id": row["service_id"],
+        "name": row["name"],
+        "base_url": row["base_url"],
+        "enabled": bool(row["enabled"]),
+        "metadata": safe_json_loads(row["metadata_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def provider_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "provider_id": row["provider_id"],
+        "name": row["name"],
+        "provider_type": row["provider_type"],
+        "base_url": row["base_url"],
+        "enabled": bool(row["enabled"]),
+        "secret_ref": row["secret_ref"],
+        "metadata": safe_json_loads(row["metadata_json"], {}),
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_service_config(service_id: str) -> Optional[dict[str, Any]]:
+    service_id = validate_identifier(service_id, "service_id")
+
+    with db_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM runtime_services
+            WHERE service_id = ?
+            LIMIT 1
+            """,
+            (service_id,),
+        ).fetchone()
+
+    return service_row_to_dict(row) if row else None
+
+
+def get_provider_config(provider_id: str) -> Optional[dict[str, Any]]:
+    provider_id = validate_identifier(provider_id, "provider_id")
+
+    with db_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM runtime_providers
+            WHERE provider_id = ?
+            LIMIT 1
+            """,
+            (provider_id,),
+        ).fetchone()
+
+    return provider_row_to_dict(row) if row else None
+
+
+def get_all_service_configs() -> list[dict[str, Any]]:
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM runtime_services
+            ORDER BY service_id ASC
+            """
+        ).fetchall()
+
+    return [service_row_to_dict(row) for row in rows]
+
+
+def get_all_provider_configs() -> list[dict[str, Any]]:
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM runtime_providers
+            ORDER BY provider_id ASC
+            """
+        ).fetchall()
+
+    return [provider_row_to_dict(row) for row in rows]
+
+
+# ===============================================================
+# PUBLIC ROUTES
+# ===============================================================
 
 @app.get("/")
-def root() -> Dict[str, Any]:
+def root() -> dict[str, Any]:
     return {
-        "service": SERVICE_NAME,
-        "version": SERVICE_VERSION,
+        "service": APP_NAME,
+        "version": APP_VERSION,
         "status": "running",
-        "owner_configured": owner_configured(),
     }
 
 
 @app.get("/health")
-def health() -> Dict[str, Any]:
-
+def health() -> dict[str, Any]:
     try:
-        with _db_lock:
-            conn = db()
-            conn.execute("SELECT 1").fetchone()
-            conn.close()
+        with db_connection() as connection:
+            connection.execute("SELECT 1").fetchone()
 
         return {
-            "status": "healthy",
-            "service": SERVICE_NAME,
-            "version": SERVICE_VERSION,
+            "status": "ok",
+            "service": APP_NAME,
+            "version": APP_VERSION,
             "database": "ok",
             "owner_configured": owner_configured(),
+            "internal_auth_configured": internal_token_configured(),
             "timestamp": utc_now(),
         }
 
-    except Exception as exc:
-        logger.exception("Health check failed")
+    except Exception:
+        logger.exception("OWNER Integration health check failed")
 
         return {
             "status": "degraded",
-            "service": SERVICE_NAME,
-            "database": "error",
-            "error": str(exc),
+            "service": APP_NAME,
+            "version": APP_VERSION,
+            "database": "unavailable",
             "timestamp": utc_now(),
         }
 
 
-# ============================================================
-# OWNER LOGIN
-# ============================================================
-
 @app.post("/owner/login")
 def owner_login(
-    payload: OwnerLoginRequest,
+    payload: OwnerLogin,
     request: Request,
-) -> Dict[str, Any]:
-
+) -> dict[str, Any]:
     if not owner_configured():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="OWNER credentials are not configured",
+            detail="OWNER authentication is not configured",
         )
 
-    if not authenticate_owner(
-        payload.email,
-        payload.secret,
-    ):
-        audit(
-            actor=payload.email or "unknown",
-            action="owner_login_failed",
-            ip_address=request.client.host if request.client else None,
-        )
+    client_key = get_client_key(request)
+    check_login_rate_limit(client_key)
+
+    supplied_email = payload.email.strip().lower()
+    supplied_secret = payload.secret
+
+    email_matches = constant_time_equal(supplied_email, MASTER_EMAIL)
+    secret_matches = constant_time_equal(supplied_secret, MASTER_SECRET)
+
+    if not (email_matches and secret_matches):
+        record_login_failure(client_key)
+
+        try:
+            write_audit(
+                actor="anonymous",
+                action="owner_login_failed",
+                target=client_key,
+            )
+        except Exception:
+            logger.exception("Could not write failed-login audit event")
 
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid OWNER credentials",
         )
 
-    token = create_session(
-        owner_email=payload.email,
-        ip_address=request.client.host if request.client else None,
-    )
+    clear_login_failures(client_key)
 
-    audit(
-        actor=payload.email,
-        action="owner_login",
-        ip_address=request.client.host if request.client else None,
-    )
+    token, expires_at = create_session(MASTER_EMAIL)
+
+    try:
+        write_audit(
+            actor=MASTER_EMAIL,
+            action="owner_login",
+            target=client_key,
+        )
+    except Exception:
+        logger.exception("Could not write successful-login audit event")
 
     return {
-        "authenticated": True,
-        "token": token,
+        "access_token": token,
+        "token_type": "bearer",
+        "expires_at": expires_at,
         "expires_in": SESSION_TTL_SECONDS,
-        "owner_email": payload.email,
     }
 
+
+# ===============================================================
+# OWNER SESSION ROUTES
+# ===============================================================
 
 @app.post("/owner/logout")
 def owner_logout(
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
+    request: Request,
+    owner: dict[str, Any] = Depends(require_owner),
+    authorization: Optional[str] = Header(default=None),
+) -> dict[str, Any]:
+    raw_token = extract_bearer_token(authorization)
 
-    with _db_lock:
-        conn = db()
+    if not raw_token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="OWNER authentication required",
+        )
 
-        conn.execute(
+    token_hash = sha256_hex(raw_token)
+
+    with db_connection() as connection:
+        connection.execute(
             """
             UPDATE integration_sessions
             SET revoked = 1
-            WHERE session_id = ?
+            WHERE token_hash = ?
             """,
-            (session["session_id"],),
+            (token_hash,),
         )
+        connection.commit()
 
-        conn.commit()
-        conn.close()
-
-    audit(
-        actor=session["owner_email"],
+    write_audit(
+        actor=owner["email"],
         action="owner_logout",
-        target_type="session",
-        target_id=session["session_id"],
+        target=get_client_key(request),
     )
 
-    return {
-        "success": True,
-        "message": "OWNER session revoked",
-    }
+    return {"status": "logged_out"}
 
 
-# ============================================================
-# SERVICES
-# ============================================================
+# ===============================================================
+# OWNER SERVICE MANAGEMENT
+# ===============================================================
 
 @app.get("/owner/services")
-def list_services(
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
-
-    with _db_lock:
-        conn = db()
-
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM runtime_services
-            ORDER BY service_id
-            """
-        ).fetchall()
-
-        conn.close()
-
-    services = []
-
-    for row in rows:
-        item = dict(row)
-
-        item["enabled"] = bool(item["enabled"])
-        item["metadata"] = json.loads(
-            item.get("metadata_json") or "{}"
-        )
-
-        item.pop("metadata_json", None)
-
-        services.append(item)
-
+def owner_list_services(
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
     return {
-        "count": len(services),
-        "services": services,
+        "services": get_all_service_configs(),
+        "count": len(get_all_service_configs()),
     }
 
 
 @app.post("/owner/services")
-def upsert_service(
-    payload: ServiceConfig,
-    request: Request,
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
+def owner_create_or_update_service(
+    payload: ServiceCreate,
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    service_id = validate_identifier(payload.service_id, "service_id")
+    name = payload.name.strip()
+    base_url = validate_base_url(payload.base_url)
+    metadata = validate_json_object(payload.metadata, "metadata")
+
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="name is required",
+        )
 
     now = utc_now()
+    metadata_json = json.dumps(metadata, ensure_ascii=False)
 
-    with _db_lock:
-        conn = db()
-
-        conn.execute(
+    with db_connection() as connection:
+        connection.execute(
             """
-            INSERT INTO runtime_services (
-                service_id,
-                service_name,
-                base_url,
-                enabled,
-                timeout_seconds,
-                retry_count,
-                metadata_json,
-                created_at,
-                updated_at
+            INSERT INTO runtime_services
+            (
+                service_id, name, base_url, enabled,
+                metadata_json, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(service_id)
-            DO UPDATE SET
-                service_name = excluded.service_name,
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(service_id) DO UPDATE SET
+                name = excluded.name,
                 base_url = excluded.base_url,
                 enabled = excluded.enabled,
-                timeout_seconds = excluded.timeout_seconds,
-                retry_count = excluded.retry_count,
                 metadata_json = excluded.metadata_json,
                 updated_at = excluded.updated_at
             """,
             (
-                payload.service_id,
-                payload.service_name,
-                payload.base_url,
+                service_id,
+                name,
+                base_url,
                 int(payload.enabled),
-                payload.timeout_seconds,
-                payload.retry_count,
-                json.dumps(
-                    payload.metadata,
-                    ensure_ascii=False,
-                    default=str,
-                ),
+                metadata_json,
                 now,
                 now,
             ),
         )
+        connection.commit()
 
-        conn.commit()
-        conn.close()
-
-    audit(
-        actor=session["owner_email"],
+    write_audit(
+        actor=owner["email"],
         action="service_upsert",
-        target_type="service",
-        target_id=payload.service_id,
-        details={
-            "enabled": payload.enabled,
-            "base_url": payload.base_url,
-        },
-        ip_address=request.client.host if request.client else None,
+        target=service_id,
+        details={"enabled": payload.enabled},
+    )
+
+    result = get_service_config(service_id)
+
+    return {
+        "status": "saved",
+        "service": result,
+    }
+
+
+def set_service_enabled(
+    service_id: str,
+    enabled: bool,
+    actor: str,
+) -> dict[str, Any]:
+    service_id = validate_identifier(service_id, "service_id")
+
+    with db_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE runtime_services
+            SET enabled = ?, updated_at = ?
+            WHERE service_id = ?
+            """,
+            (int(enabled), utc_now(), service_id),
+        )
+        connection.commit()
+
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Service not found",
+            )
+
+    write_audit(
+        actor=actor,
+        action="service_enabled" if enabled else "service_disabled",
+        target=service_id,
     )
 
     return {
-        "success": True,
-        "service_id": payload.service_id,
+        "status": "enabled" if enabled else "disabled",
+        "service": get_service_config(service_id),
     }
 
 
 @app.post("/owner/services/{service_id}/enable")
-def enable_service(
+def owner_enable_service(
     service_id: str,
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
-
-    return set_service_state(
-        service_id,
-        True,
-        session,
-    )
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    return set_service_enabled(service_id, True, owner["email"])
 
 
 @app.post("/owner/services/{service_id}/disable")
-def disable_service(
+def owner_disable_service(
     service_id: str,
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
-
-    return set_service_state(
-        service_id,
-        False,
-        session,
-    )
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    return set_service_enabled(service_id, False, owner["email"])
 
 
-def set_service_state(
-    service_id: str,
-    enabled: bool,
-    session: Dict[str, Any],
-) -> Dict[str, Any]:
-
-    with _db_lock:
-        conn = db()
-
-        cursor = conn.execute(
-            """
-            UPDATE runtime_services
-            SET enabled = ?,
-                updated_at = ?
-            WHERE service_id = ?
-            """,
-            (
-                int(enabled),
-                utc_now(),
-                service_id,
-            ),
-        )
-
-        conn.commit()
-        conn.close()
-
-    if cursor.rowcount == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Service not found",
-        )
-
-    audit(
-        actor=session["owner_email"],
-        action="service_state_change",
-        target_type="service",
-        target_id=service_id,
-        details={"enabled": enabled},
-    )
-
-    return {
-        "success": True,
-        "service_id": service_id,
-        "enabled": enabled,
-    }
-
-
-# ============================================================
-# PROVIDERS
-# ============================================================
+# ===============================================================
+# OWNER PROVIDER MANAGEMENT
+# ===============================================================
 
 @app.get("/owner/providers")
-def list_providers(
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
-
-    with _db_lock:
-        conn = db()
-
-        rows = conn.execute(
-            """
-            SELECT *
-            FROM runtime_providers
-            ORDER BY provider_id
-            """
-        ).fetchall()
-
-        conn.close()
-
-    providers = []
-
-    for row in rows:
-        item = dict(row)
-
-        item["enabled"] = bool(item["enabled"])
-
-        item["metadata"] = json.loads(
-            item.get("metadata_json") or "{}"
-        )
-
-        item.pop("metadata_json", None)
-
-        providers.append(item)
+def owner_list_providers(
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    providers = get_all_provider_configs()
 
     return {
-        "count": len(providers),
         "providers": providers,
+        "count": len(providers),
     }
 
 
 @app.post("/owner/providers")
-def upsert_provider(
-    payload: ProviderConfig,
-    request: Request,
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
+def owner_create_or_update_provider(
+    payload: ProviderCreate,
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    provider_id = validate_identifier(payload.provider_id, "provider_id")
+    name = payload.name.strip()
+    provider_type = payload.provider_type.strip()
+    base_url = validate_base_url(payload.base_url)
+    metadata = validate_json_object(payload.metadata, "metadata")
+
+    secret_ref = payload.secret_ref.strip() if payload.secret_ref else None
+
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="name is required",
+        )
+
+    if not provider_type:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="provider_type is required",
+        )
 
     now = utc_now()
+    metadata_json = json.dumps(metadata, ensure_ascii=False)
 
-    with _db_lock:
-        conn = db()
-
-        conn.execute(
+    with db_connection() as connection:
+        connection.execute(
             """
-            INSERT INTO runtime_providers (
-                provider_id,
-                provider_name,
-                category,
-                base_url,
-                enabled,
-                secret_ref,
-                timeout_seconds,
-                retry_count,
-                metadata_json,
-                created_at,
-                updated_at
+            INSERT INTO runtime_providers
+            (
+                provider_id, name, provider_type, base_url,
+                enabled, secret_ref, metadata_json,
+                created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(provider_id)
-            DO UPDATE SET
-                provider_name = excluded.provider_name,
-                category = excluded.category,
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(provider_id) DO UPDATE SET
+                name = excluded.name,
+                provider_type = excluded.provider_type,
                 base_url = excluded.base_url,
                 enabled = excluded.enabled,
                 secret_ref = excluded.secret_ref,
-                timeout_seconds = excluded.timeout_seconds,
-                retry_count = excluded.retry_count,
                 metadata_json = excluded.metadata_json,
                 updated_at = excluded.updated_at
             """,
             (
-                payload.provider_id,
-                payload.provider_name,
-                payload.category,
-                payload.base_url,
+                provider_id,
+                name,
+                provider_type,
+                base_url,
                 int(payload.enabled),
-                payload.secret_ref,
-                payload.timeout_seconds,
-                payload.retry_count,
-                json.dumps(
-                    payload.metadata,
-                    ensure_ascii=False,
-                    default=str,
-                ),
+                secret_ref,
+                metadata_json,
                 now,
                 now,
             ),
         )
+        connection.commit()
 
-        conn.commit()
-        conn.close()
-
-    audit(
-        actor=session["owner_email"],
+    write_audit(
+        actor=owner["email"],
         action="provider_upsert",
-        target_type="provider",
-        target_id=payload.provider_id,
+        target=provider_id,
         details={
-            "category": payload.category,
             "enabled": payload.enabled,
-            "base_url": payload.base_url,
-            "secret_ref": payload.secret_ref,
+            "has_secret_ref": bool(secret_ref),
         },
-        ip_address=request.client.host if request.client else None,
+    )
+
+    result = get_provider_config(provider_id)
+
+    return {
+        "status": "saved",
+        "provider": result,
+    }
+
+
+def set_provider_enabled(
+    provider_id: str,
+    enabled: bool,
+    actor: str,
+) -> dict[str, Any]:
+    provider_id = validate_identifier(provider_id, "provider_id")
+
+    with db_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE runtime_providers
+            SET enabled = ?, updated_at = ?
+            WHERE provider_id = ?
+            """,
+            (int(enabled), utc_now(), provider_id),
+        )
+        connection.commit()
+
+        if cursor.rowcount == 0:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Provider not found",
+            )
+
+    write_audit(
+        actor=actor,
+        action="provider_enabled" if enabled else "provider_disabled",
+        target=provider_id,
     )
 
     return {
-        "success": True,
-        "provider_id": payload.provider_id,
+        "status": "enabled" if enabled else "disabled",
+        "provider": get_provider_config(provider_id),
     }
 
 
 @app.post("/owner/providers/{provider_id}/enable")
-def enable_provider(
+def owner_enable_provider(
     provider_id: str,
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
-
-    return set_provider_state(
-        provider_id,
-        True,
-        session,
-    )
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    return set_provider_enabled(provider_id, True, owner["email"])
 
 
 @app.post("/owner/providers/{provider_id}/disable")
-def disable_provider(
+def owner_disable_provider(
     provider_id: str,
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
-
-    return set_provider_state(
-        provider_id,
-        False,
-        session,
-    )
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    return set_provider_enabled(provider_id, False, owner["email"])
 
 
-def set_provider_state(
-    provider_id: str,
-    enabled: bool,
-    session: Dict[str, Any],
-) -> Dict[str, Any]:
-
-    with _db_lock:
-        conn = db()
-
-        cursor = conn.execute(
-            """
-            UPDATE runtime_providers
-            SET enabled = ?,
-                updated_at = ?
-            WHERE provider_id = ?
-            """,
-            (
-                int(enabled),
-                utc_now(),
-                provider_id,
-            ),
-        )
-
-        conn.commit()
-        conn.close()
-
-    if cursor.rowcount == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Provider not found",
-        )
-
-    audit(
-        actor=session["owner_email"],
-        action="provider_state_change",
-        target_type="provider",
-        target_id=provider_id,
-        details={"enabled": enabled},
-    )
-
-    return {
-        "success": True,
-        "provider_id": provider_id,
-        "enabled": enabled,
-    }
-
-
-# ============================================================
-# SETTINGS
-# ============================================================
+# ===============================================================
+# OWNER SETTINGS
+# ===============================================================
 
 @app.get("/owner/settings")
-def list_settings(
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
-
-    with _db_lock:
-        conn = db()
-
-        rows = conn.execute(
+def owner_list_settings(
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    with db_connection() as connection:
+        rows = connection.execute(
             """
-            SELECT *
+            SELECT setting_key, setting_value, is_secret, updated_at
             FROM runtime_settings
-            ORDER BY setting_key
+            ORDER BY setting_key ASC
             """
         ).fetchall()
-
-        conn.close()
 
     settings = []
 
     for row in rows:
-        item = dict(row)
+        is_secret = bool(row["is_secret"])
 
-        if item["is_secret"]:
-            item["setting_value"] = "***REDACTED***"
-
-        item["is_secret"] = bool(item["is_secret"])
-
-        settings.append(item)
+        settings.append(
+            {
+                "key": row["setting_key"],
+                "value": (
+                    None
+                    if is_secret
+                    else safe_json_loads(row["setting_value"], row["setting_value"])
+                ),
+                "is_secret": is_secret,
+                "updated_at": row["updated_at"],
+            }
+        )
 
     return {
-        "count": len(settings),
         "settings": settings,
+        "count": len(settings),
     }
 
 
 @app.post("/owner/settings")
-def set_setting(
-    payload: SettingRequest,
-    request: Request,
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
+def owner_update_setting(
+    payload: SettingUpdate,
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    key = payload.key.strip()
 
-    now = utc_now()
+    if not key:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Setting key is required",
+        )
 
-    value = json.dumps(
-        payload.value,
-        ensure_ascii=False,
-        default=str,
-    )
+    if any(ord(character) < 32 for character in key):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Setting key contains invalid characters",
+        )
 
-    with _db_lock:
-        conn = db()
+    try:
+        value_json = json.dumps(
+            payload.value,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Setting value must be JSON-compatible",
+        )
 
-        conn.execute(
+    with db_connection() as connection:
+        connection.execute(
             """
-            INSERT INTO runtime_settings (
-                setting_key,
-                setting_value,
-                is_secret,
-                updated_at
-            )
+            INSERT INTO runtime_settings
+            (setting_key, setting_value, is_secret, updated_at)
             VALUES (?, ?, ?, ?)
-            ON CONFLICT(setting_key)
-            DO UPDATE SET
+            ON CONFLICT(setting_key) DO UPDATE SET
                 setting_value = excluded.setting_value,
                 is_secret = excluded.is_secret,
                 updated_at = excluded.updated_at
             """,
-            (
-                payload.key,
-                value,
-                int(payload.is_secret),
-                now,
-            ),
+            (key, value_json, int(payload.is_secret), utc_now()),
         )
+        connection.commit()
 
-        conn.commit()
-        conn.close()
-
-    audit(
-        actor=session["owner_email"],
-        action="setting_update",
-        target_type="setting",
-        target_id=payload.key,
-        details={
-            "is_secret": payload.is_secret,
-        },
-        ip_address=request.client.host if request.client else None,
+    write_audit(
+        actor=owner["email"],
+        action="setting_updated",
+        target=key,
+        details={"is_secret": payload.is_secret},
     )
 
     return {
-        "success": True,
-        "key": payload.key,
-        "stored": True,
-        "secret": payload.is_secret,
+        "status": "saved",
+        "key": key,
+        "is_secret": payload.is_secret,
+        "value": None if payload.is_secret else payload.value,
     }
 
 
-# ============================================================
+# ===============================================================
 # SNAPSHOTS
-# ============================================================
+# ===============================================================
 
-def collect_snapshot() -> Dict[str, Any]:
+def create_snapshot_data() -> dict[str, Any]:
+    with db_connection() as connection:
+        services = connection.execute(
+            """
+            SELECT service_id, name, base_url, enabled,
+                   metadata_json, created_at, updated_at
+            FROM runtime_services
+            ORDER BY service_id ASC
+            """
+        ).fetchall()
 
-    with _db_lock:
-        conn = db()
+        providers = connection.execute(
+            """
+            SELECT provider_id, name, provider_type, base_url,
+                   enabled, secret_ref, metadata_json,
+                   created_at, updated_at
+            FROM runtime_providers
+            ORDER BY provider_id ASC
+            """
+        ).fetchall()
 
-        services = [
-            dict(row)
-            for row in conn.execute(
-                """
-                SELECT *
-                FROM runtime_services
-                ORDER BY service_id
-                """
-            ).fetchall()
-        ]
-
-        providers = [
-            dict(row)
-            for row in conn.execute(
-                """
-                SELECT *
-                FROM runtime_providers
-                ORDER BY provider_id
-                """
-            ).fetchall()
-        ]
-
-        settings = [
-            dict(row)
-            for row in conn.execute(
-                """
-                SELECT setting_key, is_secret, updated_at
-                FROM runtime_settings
-                ORDER BY setting_key
-                """
-            ).fetchall()
-        ]
-
-        conn.close()
+        settings = connection.execute(
+            """
+            SELECT setting_key, is_secret, updated_at
+            FROM runtime_settings
+            ORDER BY setting_key ASC
+            """
+        ).fetchall()
 
     return {
-        "generated_at": utc_now(),
-        "services": services,
-        "providers": providers,
-        "settings": settings,
+        "version": APP_VERSION,
+        "created_at": utc_now(),
+        "services": [dict(row) for row in services],
+        "providers": [dict(row) for row in providers],
+        "settings": [dict(row) for row in settings],
     }
 
 
 @app.post("/owner/snapshots")
-def create_snapshot(
-    payload: SnapshotRequest,
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
+def owner_create_snapshot(
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    snapshot_id = secrets.token_urlsafe(18)
+    snapshot_data = create_snapshot_data()
 
-    snapshot = collect_snapshot()
-
-    snapshot["description"] = payload.description
-
-    payload_json = json.dumps(
-        snapshot,
+    snapshot_json = json.dumps(
+        snapshot_data,
         ensure_ascii=False,
-        sort_keys=True,
-        default=str,
+        separators=(",", ":"),
     )
 
-    snapshot_hash = hashlib.sha256(
-        payload_json.encode("utf-8")
-    ).hexdigest()
-
-    snapshot_id = secrets.token_hex(16)
-
-    with _db_lock:
-        conn = db()
-
-        conn.execute(
+    with db_connection() as connection:
+        connection.execute(
             """
-            INSERT INTO integration_snapshots (
-                snapshot_id,
-                snapshot_hash,
-                payload_json,
-                created_at,
-                created_by
-            )
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO integration_snapshots
+            (snapshot_id, created_by, snapshot_json, created_at)
+            VALUES (?, ?, ?, ?)
             """,
             (
                 snapshot_id,
-                snapshot_hash,
-                payload_json,
+                owner["email"],
+                snapshot_json,
                 utc_now(),
-                session["owner_email"],
             ),
         )
+        connection.commit()
 
-        conn.commit()
-        conn.close()
-
-    audit(
-        actor=session["owner_email"],
+    write_audit(
+        actor=owner["email"],
         action="snapshot_created",
-        target_type="snapshot",
-        target_id=snapshot_id,
-        details={
-            "hash": snapshot_hash,
-        },
+        target=snapshot_id,
     )
 
     return {
-        "success": True,
+        "status": "created",
         "snapshot_id": snapshot_id,
-        "snapshot_hash": snapshot_hash,
-        "created_at": utc_now(),
+        "created_at": snapshot_data["created_at"],
+        "counts": {
+            "services": len(snapshot_data["services"]),
+            "providers": len(snapshot_data["providers"]),
+            "settings": len(snapshot_data["settings"]),
+        },
     }
 
 
 @app.get("/owner/snapshots")
-def list_snapshots(
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
-
-    with _db_lock:
-        conn = db()
-
-        rows = conn.execute(
+def owner_list_snapshots(
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    with db_connection() as connection:
+        rows = connection.execute(
             """
-            SELECT
-                snapshot_id,
-                snapshot_hash,
-                created_at,
-                created_by
+            SELECT snapshot_id, created_by, created_at
             FROM integration_snapshots
             ORDER BY id DESC
-            LIMIT 100
             """
         ).fetchall()
 
-        conn.close()
-
     return {
-        "count": len(rows),
         "snapshots": [dict(row) for row in rows],
+        "count": len(rows),
     }
 
 
-# ============================================================
-# AUDIT
-# ============================================================
+# ===============================================================
+# OWNER AUDIT AND STATUS
+# ===============================================================
 
 @app.get("/owner/audit")
-def get_audit_logs(
+def owner_list_audit(
     limit: int = 100,
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    limit = max(1, min(int(limit), 1000))
 
-    limit = max(1, min(limit, 500))
-
-    with _db_lock:
-        conn = db()
-
-        rows = conn.execute(
+    with db_connection() as connection:
+        rows = connection.execute(
             """
-            SELECT *
+            SELECT id, actor, action, target, details_json, created_at
             FROM integration_audit
             ORDER BY id DESC
             LIMIT ?
@@ -1281,338 +1495,133 @@ def get_audit_logs(
             (limit,),
         ).fetchall()
 
-        conn.close()
-
-    logs = []
+    entries = []
 
     for row in rows:
-        item = dict(row)
-
-        item["details"] = json.loads(
-            item.pop("details_json") or "{}"
+        entries.append(
+            {
+                "id": row["id"],
+                "actor": row["actor"],
+                "action": row["action"],
+                "target": row["target"],
+                "details": safe_json_loads(row["details_json"], {}),
+                "created_at": row["created_at"],
+            }
         )
 
-        logs.append(item)
-
     return {
-        "count": len(logs),
-        "logs": logs,
+        "audit": entries,
+        "count": len(entries),
     }
 
 
-# ============================================================
-# RUNTIME CONFIGURATION
-# ============================================================
+@app.get("/owner/status")
+def owner_status(
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    services = get_all_service_configs()
+    providers = get_all_provider_configs()
 
-@app.get("/runtime/services")
-def runtime_services() -> Dict[str, Any]:
-
-    with _db_lock:
-        conn = db()
-
-        rows = conn.execute(
+    with db_connection() as connection:
+        sessions_row = connection.execute(
             """
-            SELECT
-                service_id,
-                service_name,
-                base_url,
-                enabled,
-                timeout_seconds,
-                retry_count,
-                metadata_json,
-                updated_at
-            FROM runtime_services
-            WHERE enabled = 1
-            ORDER BY service_id
-            """
-        ).fetchall()
+            SELECT COUNT(*) AS total
+            FROM integration_sessions
+            WHERE revoked = 0 AND expires_at > ?
+            """,
+            (time.time(),),
+        ).fetchone()
 
-        conn.close()
-
-    result = []
-
-    for row in rows:
-        item = dict(row)
-
-        item["enabled"] = bool(item["enabled"])
-        item["metadata"] = json.loads(
-            item.pop("metadata_json") or "{}"
-        )
-
-        result.append(item)
+        snapshots_row = connection.execute(
+            "SELECT COUNT(*) AS total FROM integration_snapshots"
+        ).fetchone()
 
     return {
-        "services": result,
-        "count": len(result),
+        "service": APP_NAME,
+        "version": APP_VERSION,
         "timestamp": utc_now(),
+        "owner_configured": owner_configured(),
+        "internal_auth_configured": internal_token_configured(),
+        "services": {
+            "total": len(services),
+            "enabled": sum(1 for item in services if item["enabled"]),
+            "disabled": sum(1 for item in services if not item["enabled"]),
+        },
+        "providers": {
+            "total": len(providers),
+            "enabled": sum(1 for item in providers if item["enabled"]),
+            "disabled": sum(1 for item in providers if not item["enabled"]),
+        },
+        "active_sessions": int(sessions_row["total"]),
+        "snapshots": int(snapshots_row["total"]),
+    }
+
+
+# ===============================================================
+# OWNER MAINTENANCE
+# ===============================================================
+
+@app.post("/owner/maintenance/cleanup-sessions")
+def owner_cleanup_sessions(
+    owner: dict[str, Any] = Depends(require_owner),
+) -> dict[str, Any]:
+    now = time.time()
+
+    with db_connection() as connection:
+        cursor = connection.execute(
+            """
+            DELETE FROM integration_sessions
+            WHERE revoked = 1 OR expires_at <= ?
+            """,
+            (now,),
+        )
+        deleted = cursor.rowcount
+        connection.commit()
+
+    write_audit(
+        actor=owner["email"],
+        action="expired_sessions_cleanup",
+        details={"deleted": deleted},
+    )
+
+    return {
+        "status": "completed",
+        "deleted_sessions": deleted,
+    }
+
+
+# ===============================================================
+# INTERNAL RUNTIME ROUTES
+# ===============================================================
+
+@app.get("/runtime/services")
+def runtime_services(
+    internal: dict[str, str] = Depends(require_internal_access),
+) -> dict[str, Any]:
+    services = get_all_service_configs()
+
+    return {
+        "services": services,
+        "count": len(services),
     }
 
 
 @app.get("/runtime/providers")
-def runtime_providers() -> Dict[str, Any]:
+def runtime_providers(
+    internal: dict[str, str] = Depends(require_internal_access),
+) -> dict[str, Any]:
+    providers = get_all_provider_configs()
 
-    with _db_lock:
-        conn = db()
-
-        rows = conn.execute(
-            """
-            SELECT
-                provider_id,
-                provider_name,
-                category,
-                base_url,
-                enabled,
-                secret_ref,
-                timeout_seconds,
-                retry_count,
-                metadata_json,
-                updated_at
-            FROM runtime_providers
-            WHERE enabled = 1
-            ORDER BY provider_id
-            """
-        ).fetchall()
-
-        conn.close()
-
-    result = []
-
-    for row in rows:
-        item = dict(row)
-
-        item["enabled"] = bool(item["enabled"])
-        item["metadata"] = json.loads(
-            item.pop("metadata_json") or "{}"
-        )
-
-        result.append(item)
+    # Secret references are not included in the general provider listing.
+    safe_providers = [redact_provider(item) for item in providers]
 
     return {
-        "providers": result,
-        "count": len(result),
-        "timestamp": utc_now(),
+        "providers": safe_providers,
+        "count": len(safe_providers),
     }
 
-
-# ============================================================
-# OWNER STATUS
-# ============================================================
-
-@app.get("/owner/status")
-def owner_status(
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
-
-    with _db_lock:
-        conn = db()
-
-        service_count = conn.execute(
-            "SELECT COUNT(*) FROM runtime_services"
-        ).fetchone()[0]
-
-        active_services = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM runtime_services
-            WHERE enabled = 1
-            """
-        ).fetchone()[0]
-
-        provider_count = conn.execute(
-            "SELECT COUNT(*) FROM runtime_providers"
-        ).fetchone()[0]
-
-        active_providers = conn.execute(
-            """
-            SELECT COUNT(*)
-            FROM runtime_providers
-            WHERE enabled = 1
-            """
-        ).fetchone()[0]
-
-        conn.close()
-
-    return {
-        "owner_authenticated": True,
-        "owner_email": session["owner_email"],
-        "service_count": service_count,
-        "active_service_count": active_services,
-        "provider_count": provider_count,
-        "active_provider_count": active_providers,
-        "timestamp": utc_now(),
-    }
-
-
-# ============================================================
-# INTERNAL CONFIG LOOKUP
-# ============================================================
-
-def get_service_config(
-    service_id: str,
-) -> Optional[Dict[str, Any]]:
-
-    with _db_lock:
-        conn = db()
-
-        row = conn.execute(
-            """
-            SELECT *
-            FROM runtime_services
-            WHERE service_id = ?
-              AND enabled = 1
-            """,
-            (service_id,),
-        ).fetchone()
-
-        conn.close()
-
-    if not row:
-        return None
-
-    item = dict(row)
-
-    item["enabled"] = bool(item["enabled"])
-    item["metadata"] = json.loads(
-        item.pop("metadata_json") or "{}"
-    )
-
-    return item
-
-
-def get_provider_config(
-    provider_id: str,
-) -> Optional[Dict[str, Any]]:
-
-    with _db_lock:
-        conn = db()
-
-        row = conn.execute(
-            """
-            SELECT *
-            FROM runtime_providers
-            WHERE provider_id = ?
-              AND enabled = 1
-            """,
-            (provider_id,),
-        ).fetchone()
-
-        conn.close()
-
-    if not row:
-        return None
-
-    item = dict(row)
-
-    item["enabled"] = bool(item["enabled"])
-    item["metadata"] = json.loads(
-        item.pop("metadata_json") or "{}"
-    )
-
-    return item
-
-
-# ============================================================
-# INTERNAL API
-# ============================================================
 
 @app.get("/internal/service/{service_id}")
-def internal_service_config(
+def internal_get_service(
     service_id: str,
-) -> Dict[str, Any]:
-
-    config = get_service_config(service_id)
-
-    if not config:
-        raise HTTPException(
-            status_code=404,
-            detail="Enabled service not found",
-        )
-
-    return config
-
-
-@app.get("/internal/provider/{provider_id}")
-def internal_provider_config(
-    provider_id: str,
-) -> Dict[str, Any]:
-
-    config = get_provider_config(provider_id)
-
-    if not config:
-        raise HTTPException(
-            status_code=404,
-            detail="Enabled provider not found",
-        )
-
-    return config
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
-
-@app.post("/owner/maintenance/cleanup-sessions")
-def cleanup_sessions(
-    session: Dict[str, Any] = Depends(require_owner),
-) -> Dict[str, Any]:
-
-    now = int(time.time())
-
-    with _db_lock:
-        conn = db()
-
-        cursor = conn.execute(
-            """
-            DELETE FROM integration_sessions
-            WHERE expires_at <= ?
-               OR revoked = 1
-            """,
-            (now,),
-        )
-
-        conn.commit()
-        conn.close()
-
-    audit(
-        actor=session["owner_email"],
-        action="session_cleanup",
-        details={
-            "deleted": cursor.rowcount,
-        },
-    )
-
-    return {
-        "success": True,
-        "deleted_sessions": cursor.rowcount,
-    }
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-@app.on_event("startup")
-def startup_event() -> None:
-    init_db()
-    seed_defaults()
-
-    logger.info(
-        "%s v%s started",
-        SERVICE_NAME,
-        SERVICE_VERSION,
-    )
-
-
-# ============================================================
-# STANDALONE RUN
-# ============================================================
-
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        app,
-        host=HOST,
-        port=PORT,
-        log_level=LOG_LEVEL.lower(),
-    )
+    internal: dict[str, str]
