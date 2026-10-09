@@ -1,23 +1,36 @@
 """
 ARYA AgriDoctor
 Orchestrator / Unified API Gateway
-Version: 1.0.0
+Version: 1.1.0
 
 این فایل لایه هماهنگ‌کننده ARYA است.
 به main.py و ماژول‌های موجود دست نمی‌زند.
+
+قابلیت‌ها:
+- مسیریابی درخواست‌ها به سرویس‌های ARYA
+- هماهنگی تحلیل کشاورزی، تصویر و صدا
+- بررسی سلامت سرویس‌ها
+- مدیریت خطا و زمان انتظار
+- ثبت درخواست‌ها و زمان پاسخ
+- تنظیم آدرس سرویس‌ها از طریق متغیرهای محیطی
 """
 
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import time
 import uuid
-import logging
+
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
+
+import httpx
 
 from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
 
 
 # ============================================================
@@ -25,12 +38,25 @@ from pydantic import BaseModel, Field
 # ============================================================
 
 SERVICE_NAME = "ARYA Orchestrator"
-SERVICE_VERSION = "1.0.0"
+SERVICE_VERSION = "1.1.0"
 
 HOST = os.getenv("ARYA_ORCHESTRATOR_HOST", "0.0.0.0")
-PORT = int(os.getenv("ARYA_ORCHESTRATOR_PORT", "8010"))
 
-LOG_LEVEL = os.getenv("ARYA_ORCHESTRATOR_LOG_LEVEL", "INFO").upper()
+try:
+    PORT = int(os.getenv("ARYA_ORCHESTRATOR_PORT", "8010"))
+except ValueError:
+    PORT = 8010
+
+if not 1 <= PORT <= 65535:
+    PORT = 8010
+
+LOG_LEVEL = os.getenv(
+    "ARYA_ORCHESTRATOR_LOG_LEVEL",
+    "INFO",
+).upper()
+
+if LOG_LEVEL not in logging._nameToLevel:
+    LOG_LEVEL = "INFO"
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -64,42 +90,127 @@ class ServiceDefinition(BaseModel):
     base_url: str
     health_path: str = "/health"
     enabled: bool = True
-    timeout_seconds: float = 30.0
+    timeout_seconds: float = Field(default=30.0, gt=0, le=120)
+
+    model_config = ConfigDict(extra="forbid")
 
 
-DEFAULT_SERVICES = {
-    "vision": ServiceDefinition(
-        name="vision",
-        base_url=os.getenv(
-            "ARYA_VISION_URL",
-            "http://127.0.0.1:8001",
-        ),
+def normalize_base_url(value: str) -> str:
+    """
+    Validate and normalize a configured service URL.
+
+    Production deployments should use HTTPS for remote services.
+    Local HTTP is allowed for localhost and loopback addresses.
+    """
+
+    value = value.strip().rstrip("/")
+
+    parsed = urlparse(value)
+
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("Service URL must use HTTP or HTTPS.")
+
+    if not parsed.hostname:
+        raise ValueError("Service URL must contain a hostname.")
+
+    if parsed.username or parsed.password:
+        raise ValueError(
+            "Credentials must not be embedded in service URLs."
+        )
+
+    hostname = parsed.hostname.lower()
+
+    local_hosts = {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
+
+    if parsed.scheme == "http" and hostname not in local_hosts:
+        raise ValueError(
+            "Remote service URLs must use HTTPS."
+        )
+
+    if parsed.query or parsed.fragment:
+        raise ValueError(
+            "Service base URLs cannot contain a query or fragment."
+        )
+
+    return value
+
+
+def create_service(
+    name: str,
+    environment_variable: str,
+    default_url: str,
+) -> ServiceDefinition:
+
+    raw_url = os.getenv(
+        environment_variable,
+        default_url,
+    )
+
+    try:
+        base_url = normalize_base_url(raw_url)
+    except ValueError as exc:
+        logger.error(
+            "Invalid URL for service %s: %s",
+            name,
+            exc,
+        )
+
+        base_url = default_url
+
+    try:
+        timeout = float(
+            os.getenv(
+                f"ARYA_{name.upper()}_TIMEOUT",
+                "30",
+            )
+        )
+    except ValueError:
+        timeout = 30.0
+
+    timeout = max(1.0, min(timeout, 120.0))
+
+    return ServiceDefinition(
+        name=name,
+        base_url=base_url,
+        enabled=os.getenv(
+            f"ARYA_{name.upper()}_ENABLED",
+            "true",
+        ).lower() in {"1", "true", "yes", "on"},
+        timeout_seconds=timeout,
+    )
+
+
+DEFAULT_SERVICES: Dict[str, ServiceDefinition] = {
+    "vision": create_service(
+        "vision",
+        "ARYA_VISION_URL",
+        "http://127.0.0.1:8001",
     ),
-    "voice_language": ServiceDefinition(
-        name="voice_language",
-        base_url=os.getenv(
-            "ARYA_VOICE_LANGUAGE_URL",
-            "http://127.0.0.1:8002",
-        ),
+    "voice_language": create_service(
+        "voice_language",
+        "ARYA_VOICE_LANGUAGE_URL",
+        "http://127.0.0.1:8002",
     ),
-    "agri_engine": ServiceDefinition(
-        name="agri_engine",
-        base_url=os.getenv(
-            "ARYA_AGRI_ENGINE_URL",
-            "http://127.0.0.1:8003",
-        ),
+    "agri_engine": create_service(
+        "agri_engine",
+        "ARYA_AGRI_ENGINE_URL",
+        "http://127.0.0.1:8003",
     ),
-    "commerce_security": ServiceDefinition(
-        name="commerce_security",
-        base_url=os.getenv(
-            "ARYA_COMMERCE_SECURITY_URL",
-            "http://127.0.0.1:8004",
-        ),
+    "commerce_security": create_service(
+        "commerce_security",
+        "ARYA_COMMERCE_SECURITY_URL",
+        "http://127.0.0.1:8004",
     ),
 }
 
-
-service_registry: Dict[str, ServiceDefinition] = dict(DEFAULT_SERVICES)
+service_registry: Dict[str, ServiceDefinition] = {
+    name: definition.model_copy(deep=True)
+    for name, definition in DEFAULT_SERVICES.items()
+}
 
 
 # ============================================================
@@ -107,7 +218,11 @@ service_registry: Dict[str, ServiceDefinition] = dict(DEFAULT_SERVICES)
 # ============================================================
 
 class OrchestrationRequest(BaseModel):
-    action: str = Field(..., min_length=1, max_length=100)
+    action: str = Field(
+        ...,
+        min_length=1,
+        max_length=100,
+    )
 
     user_id: Optional[int] = None
     device_id: Optional[str] = None
@@ -168,7 +283,7 @@ async def call_service(
 
     service = service_registry.get(service_name)
 
-    if not service:
+    if service is None:
         return ServiceCallResult(
             service=service_name,
             success=False,
@@ -182,18 +297,38 @@ async def call_service(
             error="Service is disabled.",
         )
 
+    method = method.upper()
+
+    if method not in {"GET", "POST"}:
+        return ServiceCallResult(
+            service=service_name,
+            success=False,
+            error="Unsupported HTTP method.",
+        )
+
+    if not path.startswith("/") or path.startswith("//"):
+        return ServiceCallResult(
+            service=service_name,
+            success=False,
+            error="Invalid service path.",
+        )
+
     started = time.perf_counter()
 
+    url = service.base_url.rstrip("/") + path
+
     try:
-        import httpx
+        timeout = httpx.Timeout(
+            service.timeout_seconds,
+            connect=min(service.timeout_seconds, 10.0),
+        )
 
-        url = service.base_url.rstrip("/") + "/" + path.lstrip("/")
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            follow_redirects=False,
+        ) as client:
 
-        timeout = httpx.Timeout(service.timeout_seconds)
-
-        async with httpx.AsyncClient(timeout=timeout) as client:
-
-            if method.upper() == "GET":
+            if method == "GET":
                 response = await client.get(url)
             else:
                 response = await client.post(
@@ -201,26 +336,35 @@ async def call_service(
                     json=payload or {},
                 )
 
-        elapsed = (time.perf_counter() - started) * 1000
+        elapsed = (
+            time.perf_counter() - started
+        ) * 1000
 
         try:
             response_data = response.json()
-        except Exception:
-            response_data = response.text
+        except (ValueError, UnicodeDecodeError):
+            response_data = response.text[:20000]
 
         return ServiceCallResult(
             service=service_name,
             success=200 <= response.status_code < 300,
             status_code=response.status_code,
             response=response_data,
+            error=(
+                None
+                if 200 <= response.status_code < 300
+                else f"Service returned HTTP {response.status_code}."
+            ),
             elapsed_ms=round(elapsed, 2),
         )
 
-    except Exception as exc:
-        elapsed = (time.perf_counter() - started) * 1000
+    except httpx.TimeoutException:
+        elapsed = (
+            time.perf_counter() - started
+        ) * 1000
 
-        logger.exception(
-            "Service call failed: %s %s",
+        logger.warning(
+            "Service timeout: %s %s",
             service_name,
             path,
         )
@@ -228,7 +372,44 @@ async def call_service(
         return ServiceCallResult(
             service=service_name,
             success=False,
-            error=str(exc),
+            error="Service request timed out.",
+            elapsed_ms=round(elapsed, 2),
+        )
+
+    except httpx.RequestError:
+        elapsed = (
+            time.perf_counter() - started
+        ) * 1000
+
+        logger.warning(
+            "Service connection failed: %s %s",
+            service_name,
+            path,
+            exc_info=True,
+        )
+
+        return ServiceCallResult(
+            service=service_name,
+            success=False,
+            error="Unable to connect to the service.",
+            elapsed_ms=round(elapsed, 2),
+        )
+
+    except Exception:
+        elapsed = (
+            time.perf_counter() - started
+        ) * 1000
+
+        logger.exception(
+            "Unexpected service error: %s %s",
+            service_name,
+            path,
+        )
+
+        return ServiceCallResult(
+            service=service_name,
+            success=False,
+            error="Unexpected service communication error.",
             elapsed_ms=round(elapsed, 2),
         )
 
@@ -246,7 +427,6 @@ VISION_ACTIONS = {
     "disease_image",
 }
 
-
 VOICE_ACTIONS = {
     "voice",
     "speech",
@@ -255,7 +435,6 @@ VOICE_ACTIONS = {
     "translate",
     "language",
 }
-
 
 AGRI_ACTIONS = {
     "agri",
@@ -270,7 +449,6 @@ AGRI_ACTIONS = {
     "farm",
 }
 
-
 COMMERCE_ACTIONS = {
     "payment",
     "payments",
@@ -281,14 +459,33 @@ COMMERCE_ACTIONS = {
     "security",
 }
 
+COMPOSITE_ACTIONS = {
+    "full_diagnosis",
+    "complete_diagnosis",
+    "doctor",
+    "agri_doctor",
+}
+
 
 def normalize_action(action: str) -> str:
-    return action.strip().lower().replace("-", "_").replace(" ", "_")
+    return (
+        action.strip()
+        .lower()
+        .replace("-", "_")
+        .replace(" ", "_")
+    )
 
 
 def detect_services(action: str) -> list[str]:
 
     normalized = normalize_action(action)
+
+    if normalized in COMPOSITE_ACTIONS:
+        return [
+            "vision",
+            "voice_language",
+            "agri_engine",
+        ]
 
     services: list[str] = []
 
@@ -303,20 +500,6 @@ def detect_services(action: str) -> list[str]:
 
     if normalized in COMMERCE_ACTIONS:
         services.append("commerce_security")
-
-    # Composite agricultural diagnosis:
-    # image/voice + agricultural reasoning.
-    if normalized in {
-        "full_diagnosis",
-        "complete_diagnosis",
-        "doctor",
-        "agri_doctor",
-    }:
-        services = [
-            "vision",
-            "voice_language",
-            "agri_engine",
-        ]
 
     return services
 
@@ -346,7 +529,47 @@ def build_common_payload(
         "image": request.image,
         "voice": request.voice,
         "payment": request.payment,
-        "data": request.data,
+        "data": dict(request.data),
+    }
+
+
+# ============================================================
+# Result Helpers
+# ============================================================
+
+def serialize_result(
+    result: ServiceCallResult,
+) -> Dict[str, Any]:
+    return result.model_dump()
+
+
+def summarize_results(
+    results: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+
+    total = len(results)
+
+    succeeded = sum(
+        1
+        for item in results.values()
+        if item.get("success") is True
+    )
+
+    failed = total - succeeded
+
+    if total == 0 or succeeded == 0:
+        status = "failed"
+    elif failed:
+        status = "partial"
+    else:
+        status = "success"
+
+    return {
+        "success": succeeded > 0,
+        "status": status,
+        "total_services": total,
+        "successful_services": succeeded,
+        "failed_services": failed,
     }
 
 
@@ -362,34 +585,33 @@ async def orchestrate(
 
     action = normalize_action(request.action)
 
-    services = detect_services(action)
+    selected_services = detect_services(action)
 
-    if not services:
+    if not selected_services:
         raise HTTPException(
             status_code=400,
             detail={
                 "error": "unsupported_action",
                 "action": request.action,
-                "message": "No ARYA service is registered for this action.",
+                "message": (
+                    "No ARYA service is registered "
+                    "for this action."
+                ),
             },
         )
 
-    payload = build_common_payload(request, rid)
+    payload = build_common_payload(
+        request,
+        rid,
+    )
 
-    results: Dict[str, Any] = {}
+    results: Dict[str, Dict[str, Any]] = {}
 
     # --------------------------------------------------------
     # Composite agricultural diagnosis
     # --------------------------------------------------------
 
-    if action in {
-        "full_diagnosis",
-        "complete_diagnosis",
-        "doctor",
-        "agri_doctor",
-    }:
-
-        vision_result = None
+    if action in COMPOSITE_ACTIONS:
 
         if request.image:
             vision_result = await call_service(
@@ -398,10 +620,14 @@ async def orchestrate(
                 payload,
             )
 
-            results["vision"] = vision_result.model_dump()
+            results["vision"] = serialize_result(
+                vision_result
+            )
 
             if vision_result.success:
-                payload["data"]["vision_result"] = vision_result.response
+                payload["data"]["vision_result"] = (
+                    vision_result.response
+                )
 
         if request.voice:
             voice_result = await call_service(
@@ -410,10 +636,14 @@ async def orchestrate(
                 payload,
             )
 
-            results["voice_language"] = voice_result.model_dump()
+            results["voice_language"] = serialize_result(
+                voice_result
+            )
 
             if voice_result.success:
-                payload["data"]["voice_result"] = voice_result.response
+                payload["data"]["voice_result"] = (
+                    voice_result.response
+                )
 
         agri_result = await call_service(
             "agri_engine",
@@ -421,16 +651,17 @@ async def orchestrate(
             payload,
         )
 
-        results["agri_engine"] = agri_result.model_dump()
+        results["agri_engine"] = serialize_result(
+            agri_result
+        )
+
+        summary = summarize_results(results)
 
         return {
-            "success": any(
-                item.get("success")
-                for item in results.values()
-            ),
+            **summary,
             "request_id": rid,
             "action": action,
-            "services": services,
+            "services": selected_services,
             "results": results,
             "timestamp": utc_now(),
         }
@@ -439,7 +670,7 @@ async def orchestrate(
     # Normal routing
     # --------------------------------------------------------
 
-    for service_name in services:
+    for service_name in selected_services:
 
         if service_name == "vision":
             path = "/vision/analyze"
@@ -465,7 +696,14 @@ async def orchestrate(
             path = "/commerce/process"
 
         else:
-            path = "/"
+            results[service_name] = (
+                ServiceCallResult(
+                    service=service_name,
+                    success=False,
+                    error="No route is configured for this service.",
+                ).model_dump()
+            )
+            continue
 
         result = await call_service(
             service_name,
@@ -473,18 +711,15 @@ async def orchestrate(
             payload,
         )
 
-        results[service_name] = result.model_dump()
+        results[service_name] = serialize_result(result)
 
-    success = any(
-        item.get("success")
-        for item in results.values()
-    )
+    summary = summarize_results(results)
 
     return {
-        "success": success,
+        **summary,
         "request_id": rid,
         "action": action,
-        "services": services,
+        "services": selected_services,
         "results": results,
         "timestamp": utc_now(),
     }
@@ -496,6 +731,7 @@ async def orchestrate(
 
 @app.get("/")
 async def root():
+
     return {
         "service": SERVICE_NAME,
         "version": SERVICE_VERSION,
@@ -508,28 +744,56 @@ async def root():
 @app.get("/health")
 async def health():
 
-    service_status = {}
-
-    for name, service in service_registry.items():
-
+    async def check_one(
+        name: str,
+        definition: ServiceDefinition,
+    ):
         result = await call_service(
             name,
-            service.health_path,
+            definition.health_path,
             method="GET",
         )
 
-        service_status[name] = {
-            "enabled": service.enabled,
+        return name, {
+            "enabled": definition.enabled,
             "success": result.success,
             "status_code": result.status_code,
             "elapsed_ms": result.elapsed_ms,
             "error": result.error,
         }
 
+    checks = await asyncio.gather(
+        *[
+            check_one(name, definition)
+            for name, definition in service_registry.items()
+        ]
+    )
+
+    service_status = dict(checks)
+
+    enabled_services = [
+        item
+        for item in service_status.values()
+        if item["enabled"]
+    ]
+
+    healthy_count = sum(
+        1
+        for item in enabled_services
+        if item["success"]
+    )
+
+    if not enabled_services or healthy_count == 0:
+        overall_status = "degraded"
+    elif healthy_count < len(enabled_services):
+        overall_status = "degraded"
+    else:
+        overall_status = "healthy"
+
     return {
         "service": SERVICE_NAME,
         "version": SERVICE_VERSION,
-        "status": "online",
+        "status": overall_status,
         "uptime_seconds": round(
             time.time() - started_at,
             2,
@@ -641,19 +905,36 @@ async def request_logging_middleware(
 
     started = time.perf_counter()
 
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
 
-    elapsed = (time.perf_counter() - started) * 1000
+        elapsed = (
+            time.perf_counter() - started
+        ) * 1000
 
-    logger.info(
-        "%s %s -> %s (%.2f ms)",
-        request.method,
-        request.url.path,
-        response.status_code,
-        elapsed,
-    )
+        logger.info(
+            "%s %s -> %s (%.2f ms)",
+            request.method,
+            request.url.path,
+            response.status_code,
+            elapsed,
+        )
 
-    return response
+        return response
+
+    except Exception:
+        elapsed = (
+            time.perf_counter() - started
+        ) * 1000
+
+        logger.exception(
+            "%s %s failed after %.2f ms",
+            request.method,
+            request.url.path,
+            elapsed,
+        )
+
+        raise
 
 
 # ============================================================
@@ -665,7 +946,7 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(
-        "orchestrator:app",
+        app,
         host=HOST,
         port=PORT,
         reload=False,
