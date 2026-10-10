@@ -49,20 +49,33 @@ class AryaAiResponse {
   factory AryaAiResponse.fromMap(
     Map<String, dynamic> data,
   ) {
+    final answerValue = data['answer'] ??
+        data['response'] ??
+        data['message'] ??
+        data['content'];
+
+    final errorValue = data['error'] ??
+        data['detail'];
+
     return AryaAiResponse(
-      ok: data['ok'] == true,
+      ok: _boolValue(data['ok'] ?? data['success']),
       answer: _stringValue(
-        data['answer'] ??
-            data['message'] ??
-            'پاسخی از ARYA AI دریافت نشد.',
+        answerValue ?? 'پاسخی از ARYA AI دریافت نشد.',
       ),
       confidence: _confidence(data['confidence']),
-      requiresValidation:
-          data['requires_validation'] != false,
+      requiresValidation: _boolValue(
+        data['requires_validation'] ??
+            data['requiresValidation'],
+        defaultValue: true,
+      ),
       mode: _nullableString(data['mode']),
-      error: _nullableString(data['error']),
-      sources: _stringList(data['sources']),
-      actions: _stringList(data['actions']),
+      error: _nullableString(errorValue),
+      sources: _stringList(
+        data['sources'] ?? data['references'],
+      ),
+      actions: _stringList(
+        data['actions'] ?? data['action_plan'],
+      ),
       warnings: _stringList(data['warnings']),
       rawData: Map<String, dynamic>.from(data),
     );
@@ -83,27 +96,69 @@ class AryaAiResponse {
     };
   }
 
-  static double _confidence(dynamic value) {
-    if (value is num) {
-      final result = value.toDouble();
-
-      if (result < 0) {
-        return 0;
-      }
-
-      if (result > 1) {
-        return 1;
-      }
-
-      return result;
+  static bool _boolValue(
+    dynamic value, {
+    bool defaultValue = false,
+  }) {
+    if (value is bool) {
+      return value;
     }
 
-    return 0;
+    if (value is num) {
+      return value != 0;
+    }
+
+    if (value is String) {
+      switch (value.trim().toLowerCase()) {
+        case 'true':
+        case '1':
+        case 'yes':
+        case 'success':
+        case 'ok':
+          return true;
+
+        case 'false':
+        case '0':
+        case 'no':
+        case 'error':
+          return false;
+      }
+    }
+
+    return defaultValue;
+  }
+
+  static double _confidence(dynamic value) {
+    double? result;
+
+    if (value is num) {
+      result = value.toDouble();
+    } else if (value is String) {
+      result = double.tryParse(value.trim());
+    }
+
+    if (result == null || !result.isFinite) {
+      return 0;
+    }
+
+    if (result < 0) {
+      return 0;
+    }
+
+    if (result > 1) {
+      return 1;
+    }
+
+    return result;
   }
 
   static String _stringValue(dynamic value) {
     if (value == null) {
       return '';
+    }
+
+    if (value is Map || value is List) {
+      return value.toString();
     }
 
     return value.toString();
@@ -120,18 +175,22 @@ class AryaAiResponse {
   }
 
   static List<String> _stringList(dynamic value) {
+    if (value is String) {
+      final item = value.trim();
+
+      return item.isEmpty
+          ? const <String>[]
+          : <String>[item];
+    }
+
     if (value is! List) {
       return const <String>[];
     }
 
     return value
-        .map(
-          (item) => item?.toString() ?? '',
-        )
-        .where(
-          (item) => item.trim().isNotEmpty,
-        )
-        .toList();
+        .map((item) => item?.toString() ?? '')
+        .where((item) => item.trim().isNotEmpty)
+        .toList(growable: false);
   }
 }
 
@@ -150,8 +209,7 @@ class AryaAiContext {
     this.waterData,
     this.weatherData,
     this.labData,
-    this.additionalData =
-        const <String, dynamic>{},
+    this.additionalData = const <String, dynamic>{},
   });
 
   final String? country;
