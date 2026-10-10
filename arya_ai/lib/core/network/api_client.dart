@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
@@ -5,22 +6,45 @@ import 'package:http/http.dart' as http;
 class AryaApiClient {
   AryaApiClient({
     String? baseUrl,
-  }) : baseUrl = (baseUrl ??
-            const String.fromEnvironment(
-              'ARYA_API_URL',
-              defaultValue: 'https://arya-agridoctor.onrender.com',
-            ))
-            .trim()
-            .replaceAll(RegExp(r'/$'), '');
+    http.Client? client,
+    Duration? connectTimeout,
+    Duration? readTimeout,
+  })  : baseUrl = _normalizeBaseUrl(
+          baseUrl ??
+              const String.fromEnvironment(
+                'ARYA_API_URL',
+                defaultValue: 'https://arya-agridoctor.onrender.com',
+              ),
+        ),
+        _client = client ?? http.Client(),
+        _connectTimeout = connectTimeout ?? const Duration(seconds: 20),
+        _readTimeout = readTimeout ?? const Duration(seconds: 90);
 
   final String baseUrl;
+  final http.Client _client;
+  final Duration _connectTimeout;
+  final Duration _readTimeout;
 
   String? _token;
 
-  bool get isConfigured => baseUrl.isNotEmpty;
+  bool get isConfigured {
+    final uri = Uri.tryParse(baseUrl);
+
+    return uri != null &&
+        (uri.scheme == 'https' || uri.scheme == 'http') &&
+        uri.host.isNotEmpty;
+  }
+
+  String get configuredHost {
+    final uri = Uri.tryParse(baseUrl);
+    return uri?.host ?? '';
+  }
 
   void setToken(String? token) {
-    _token = token;
+    final cleanToken = token?.trim();
+    _token = (cleanToken == null || cleanToken.isEmpty)
+        ? null
+        : cleanToken;
   }
 
   Map<String, String> _headers({
@@ -29,13 +53,44 @@ class AryaApiClient {
     final headers = <String, String>{
       'Accept': 'application/json',
       'Content-Type': 'application/json',
+      'X-ARYA-Client': 'arya-main',
     };
 
-    if (authenticated && _token != null && _token!.isNotEmpty) {
+    if (authenticated && _token != null) {
       headers['Authorization'] = 'Bearer $_token';
     }
 
     return headers;
+  }
+
+  Uri _buildUri(
+    String path, {
+    Map<String, String>? queryParameters,
+  }) {
+    _ensureConfigured();
+
+    final normalizedPath = path.startsWith('/') ? path : '/$path';
+
+    final baseUri = Uri.parse(baseUrl);
+    final basePath = baseUri.path.replaceFirst(RegExp(r'/$'), '');
+    final requestedPath = '$basePath$normalizedPath';
+
+    final uri = baseUri.replace(
+      path: requestedPath,
+      query: null,
+      fragment: null,
+    );
+
+    if (queryParameters == null || queryParameters.isEmpty) {
+      return uri;
+    }
+
+    final mergedQuery = <String, String>{
+      ...baseUri.queryParameters,
+      ...queryParameters,
+    };
+
+    return uri.replace(queryParameters: mergedQuery);
   }
 
   Future<Map<String, dynamic>> get(
@@ -43,20 +98,43 @@ class AryaApiClient {
     Map<String, String>? queryParameters,
     bool authenticated = false,
   }) async {
-    _ensureConfigured();
-
-    final uri = Uri.parse('$baseUrl$path').replace(
+    final uri = _buildUri(
+      path,
       queryParameters: queryParameters,
     );
 
-    final response = await http
-        .get(
-          uri,
-          headers: _headers(authenticated: authenticated),
-        )
-        .timeout(const Duration(seconds: 60));
+    try {
+      final response = await _client
+          .get(
+            uri,
+            headers: _headers(authenticated: authenticated),
+          )
+          .timeout(_readTimeout);
 
-    return _decode(response);
+      return _decode(
+        response,
+        requestUri: uri,
+      );
+    } on TimeoutException {
+      return _networkError(
+        uri,
+        'زمان پاسخ‌گویی سرور به پایان رسید.',
+        code: 'timeout',
+      );
+    } on http.ClientException {
+      return _networkError(
+        uri,
+        'ارتباط با سرور برقرار نشد. اتصال اینترنت و وضعیت Backend را بررسی کنید.',
+        code: 'client_error',
+      );
+    } catch (e) {
+      return _networkError(
+        uri,
+        'خطای غیرمنتظره هنگام ارتباط با سرور رخ داد.',
+        code: 'unexpected_error',
+        error: e,
+      );
+    }
   }
 
   Future<Map<String, dynamic>> post(
@@ -64,32 +142,52 @@ class AryaApiClient {
     Map<String, dynamic>? body,
     bool authenticated = false,
   }) async {
-    _ensureConfigured();
+    final uri = _buildUri(path);
 
-    final uri = Uri.parse('$baseUrl$path');
+    try {
+      final response = await _client
+          .post(
+            uri,
+            headers: _headers(authenticated: authenticated),
+            body: jsonEncode(body ?? <String, dynamic>{}),
+          )
+          .timeout(_readTimeout);
 
-    final response = await http
-        .post(
-          uri,
-          headers: _headers(authenticated: authenticated),
-          body: jsonEncode(body ?? <String, dynamic>{}),
-        )
-        .timeout(const Duration(seconds: 90));
-
-    return _decode(response);
+      return _decode(
+        response,
+        requestUri: uri,
+      );
+    } on TimeoutException {
+      return _networkError(
+        uri,
+        'زمان پاسخ‌گویی سرور به پایان رسید.',
+        code: 'timeout',
+      );
+    } on http.ClientException {
+      return _networkError(
+        uri,
+        'ارتباط با سرور برقرار نشد. اتصال اینترنت و وضعیت Backend را بررسی کنید.',
+        code: 'client_error',
+      );
+    } catch (e) {
+      return _networkError(
+        uri,
+        'خطای غیرمنتظره هنگام ارسال درخواست رخ داد.',
+        code: 'unexpected_error',
+        error: e,
+      );
+    }
   }
 
   Future<Map<String, dynamic>> health() async {
-    try {
-      return await get('/health');
-    } catch (e) {
-      return {
-        'ok': false,
-        'configured': isConfigured,
-        'message': 'Could not connect to ARYA Backend.',
-        'error': e.toString(),
-      };
-    }
+    final result = await get('/health');
+
+    return {
+      ...result,
+      'configured': isConfigured,
+      'backend_host': configuredHost,
+      'checked_at': DateTime.now().toUtc().toIso8601String(),
+    };
   }
 
   Future<Map<String, dynamic>> login({
@@ -237,51 +335,96 @@ class AryaApiClient {
     );
   }
 
-  void _ensureConfigured() {
-    if (!isConfigured) {
-      throw StateError(
-        'ARYA Backend URL is not configured.',
-      );
-    }
-  }
-
   Map<String, dynamic> _decode(
-    http.Response response,
-  ) {
+    http.Response response, {
+    required Uri requestUri,
+  }) {
     dynamic decoded;
 
     try {
-      decoded = jsonDecode(response.body);
+      decoded = jsonDecode(utf8.decode(response.bodyBytes));
     } catch (_) {
       decoded = null;
     }
 
+    final requestInfo = <String, dynamic>{
+      'request_path': requestUri.path,
+      'backend_host': requestUri.host,
+      'status_code': response.statusCode,
+    };
+
     if (response.statusCode >= 200 &&
         response.statusCode < 300) {
-      if (decoded is Map<String, dynamic>) {
-        return decoded;
+      if (decoded is Map) {
+        return {
+          ...Map<String, dynamic>.from(decoded),
+          ...requestInfo,
+        };
       }
 
       return {
         'ok': true,
         'data': decoded,
+        ...requestInfo,
       };
     }
 
-    String message = 'ARYA Backend request failed.';
+    String message = 'درخواست به Backend ناموفق بود.';
 
-    if (decoded is Map &&
-        decoded['detail'] != null) {
+    if (decoded is Map && decoded['detail'] != null) {
       message = decoded['detail'].toString();
-    } else if (decoded is Map &&
-        decoded['message'] != null) {
+    } else if (decoded is Map && decoded['message'] != null) {
       message = decoded['message'].toString();
+    } else if (decoded is Map && decoded['error'] != null) {
+      message = decoded['error'].toString();
     }
 
     return {
       'ok': false,
-      'status_code': response.statusCode,
       'message': message,
+      ...requestInfo,
     };
+  }
+
+  Map<String, dynamic> _networkError(
+    Uri uri,
+    String message, {
+    required String code,
+    Object? error,
+  }) {
+    return {
+      'ok': false,
+      'configured': isConfigured,
+      'backend_host': uri.host,
+      'request_path': uri.path,
+      'error_code': code,
+      'message': message,
+      if (error != null) 'error': error.toString(),
+    };
+  }
+
+  void _ensureConfigured() {
+    if (!isConfigured) {
+      throw StateError(
+        'ARYA Backend URL is not configured correctly.',
+      );
+    }
+  }
+
+  static String _normalizeBaseUrl(String value) {
+    var normalized = value.trim();
+
+    while (normalized.endsWith('/')) {
+      normalized = normalized.substring(
+        0,
+        normalized.length - 1,
+      );
+    }
+
+    return normalized;
+  }
+
+  void dispose() {
+    _client.close();
   }
 }
