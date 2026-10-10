@@ -5092,7 +5092,45 @@ def provider_query(
         provider,
         path,
     )
+# ============================================================
+# LEGACY AI COMPATIBILITY
+# ============================================================
 
+class LegacyAIAskIn(BaseModel):
+    question: str = Field(
+        ...,
+        min_length=1,
+        max_length=20000,
+    )
+    language: str = Field(
+        default="fa",
+        max_length=20,
+    )
+    context: dict = Field(
+        default_factory=dict,
+    )
+
+
+@app.post("/ai/ask")
+def legacy_ai_ask(
+    x: LegacyAIAskIn,
+    authorization: Optional[str] = Header(None),
+):
+    request_data = AIRequestIn(
+        prompt=x.question,
+        language=x.language,
+        context=x.context,
+    )
+
+    return ai_analyze(
+        request_data,
+        authorization=authorization,
+    )
+
+
+# ============================================================
+# END LEGACY AI COMPATIBILITY
+# ============================================================
 
 # ============================================================
 # OWNER SETTINGS / STATS / USERS
