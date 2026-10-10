@@ -27,13 +27,44 @@ class AryaApiClient {
               defaultValue: 'https://arya-agridoctor.onrender.com',
             ))
             .trim()
-            .replaceAll(RegExp(r'/$'), '');
+            .replaceFirst(RegExp(r'/+$'), '');
 
   final String baseUrl;
 
   static const String _tokenKey = 'arya_access_token';
 
-  bool get isConfigured => baseUrl.isNotEmpty;
+  bool get isConfigured {
+    final uri = Uri.tryParse(baseUrl);
+
+    return uri != null &&
+        (uri.scheme == 'https' || uri.scheme == 'http') &&
+        uri.host.isNotEmpty;
+  }
+
+  Uri _buildUri(
+    String path, {
+    Map<String, String>? queryParameters,
+  }) {
+    _ensureConfigured();
+
+    final baseUri = Uri.parse(baseUrl);
+    final normalizedPath = path.startsWith('/') ? path : '/$path';
+
+    final resolvedUri = baseUri.replace(
+      path: '${baseUri.path.replaceFirst(RegExp(r'/+$'), '')}$normalizedPath',
+      query: null,
+      fragment: null,
+    );
+
+    final mergedQuery = <String, String>{
+      ...baseUri.queryParameters,
+      if (queryParameters != null) ...queryParameters,
+    };
+
+    return resolvedUri.replace(
+      queryParameters: mergedQuery.isEmpty ? null : mergedQuery,
+    );
+  }
 
   Future<Map<String, String>> _headers({
     bool json = false,
@@ -44,14 +75,14 @@ class AryaApiClient {
     };
 
     if (json) {
-      headers['Content-Type'] = 'application/json';
+      headers['Content-Type'] = 'application/json; charset=utf-8';
     }
 
     if (authenticated) {
       final token = await getToken();
 
-      if (token != null && token.isNotEmpty) {
-        headers['Authorization'] = 'Bearer $token';
+      if (token != null && token.trim().isNotEmpty) {
+        headers['Authorization'] = 'Bearer ${token.trim()}';
       }
     }
 
@@ -64,8 +95,14 @@ class AryaApiClient {
   }
 
   Future<void> saveToken(String token) async {
+    final normalizedToken = token.trim();
+
+    if (normalizedToken.isEmpty) {
+      throw ArgumentError.value(token, 'token', 'Token cannot be empty.');
+    }
+
     final prefs = await SharedPreferences.getInstance();
-    await prefs.setString(_tokenKey, token);
+    await prefs.setString(_tokenKey, normalizedToken);
   }
 
   Future<void> clearToken() async {
@@ -75,7 +112,7 @@ class AryaApiClient {
 
   Future<bool> isLoggedIn() async {
     final token = await getToken();
-    return token != null && token.isNotEmpty;
+    return token != null && token.trim().isNotEmpty;
   }
 
   Future<Map<String, dynamic>> get(
@@ -83,9 +120,8 @@ class AryaApiClient {
     Map<String, String>? queryParameters,
     bool authenticated = true,
   }) async {
-    _ensureConfigured();
-
-    final uri = Uri.parse('$baseUrl$path').replace(
+    final uri = _buildUri(
+      path,
       queryParameters: queryParameters,
     );
 
@@ -96,9 +132,7 @@ class AryaApiClient {
             authenticated: authenticated,
           ),
         )
-        .timeout(
-          const Duration(seconds: 30),
-        );
+        .timeout(const Duration(seconds: 30));
 
     return _decode(response);
   }
@@ -108,9 +142,7 @@ class AryaApiClient {
     Map<String, dynamic>? body,
     bool authenticated = true,
   }) async {
-    _ensureConfigured();
-
-    final uri = Uri.parse('$baseUrl$path');
+    final uri = _buildUri(path);
 
     final response = await http
         .post(
@@ -119,13 +151,9 @@ class AryaApiClient {
             json: true,
             authenticated: authenticated,
           ),
-          body: jsonEncode(
-            body ?? <String, dynamic>{},
-          ),
+          body: jsonEncode(body ?? <String, dynamic>{}),
         )
-        .timeout(
-          const Duration(seconds: 60),
-        );
+        .timeout(const Duration(seconds: 60));
 
     return _decode(response);
   }
@@ -135,9 +163,7 @@ class AryaApiClient {
     Map<String, dynamic>? body,
     bool authenticated = true,
   }) async {
-    _ensureConfigured();
-
-    final uri = Uri.parse('$baseUrl$path');
+    final uri = _buildUri(path);
 
     final response = await http
         .put(
@@ -146,13 +172,9 @@ class AryaApiClient {
             json: true,
             authenticated: authenticated,
           ),
-          body: jsonEncode(
-            body ?? <String, dynamic>{},
-          ),
+          body: jsonEncode(body ?? <String, dynamic>{}),
         )
-        .timeout(
-          const Duration(seconds: 60),
-        );
+        .timeout(const Duration(seconds: 60));
 
     return _decode(response);
   }
@@ -162,9 +184,8 @@ class AryaApiClient {
     Map<String, String>? queryParameters,
     bool authenticated = true,
   }) async {
-    _ensureConfigured();
-
-    final uri = Uri.parse('$baseUrl$path').replace(
+    final uri = _buildUri(
+      path,
       queryParameters: queryParameters,
     );
 
@@ -175,9 +196,7 @@ class AryaApiClient {
             authenticated: authenticated,
           ),
         )
-        .timeout(
-          const Duration(seconds: 30),
-        );
+        .timeout(const Duration(seconds: 30));
 
     return _decode(response);
   }
@@ -197,15 +216,14 @@ class AryaApiClient {
 
     final token = result['access_token'];
 
-    if (token is! String || token.isEmpty) {
+    if (token is! String || token.trim().isEmpty) {
       throw AryaApiException(
-        statusCode: 500,
-        message: 'Backend did not return an access token.',
+        statusCode: 502,
+        message: 'Backend did not return a valid access token.',
       );
     }
 
     await saveToken(token);
-
     return result;
   }
 
@@ -261,10 +279,16 @@ class AryaApiClient {
     }
 
     try {
-      return await get(
+      final result = await get(
         '/health',
         authenticated: false,
       );
+
+      return {
+        ...result,
+        'configured': true,
+        'ok': result['ok'] == true,
+      };
     } catch (e) {
       return {
         'ok': false,
@@ -306,12 +330,38 @@ class AryaApiClient {
     double? latitude,
     double? longitude,
   }) async {
+    final normalizedQuestion = question.trim();
+
+    if (normalizedQuestion.isEmpty) {
+      throw ArgumentError.value(
+        question,
+        'question',
+        'Question cannot be empty.',
+      );
+    }
+
+    if ((latitude == null) != (longitude == null)) {
+      throw ArgumentError(
+        'Latitude and longitude must either both be supplied or both be null.',
+      );
+    }
+
+    if (latitude != null &&
+        (latitude < -90 || latitude > 90)) {
+      throw ArgumentError.value(latitude, 'latitude');
+    }
+
+    if (longitude != null &&
+        (longitude < -180 || longitude > 180)) {
+      throw ArgumentError.value(longitude, 'longitude');
+    }
+
     return post(
       '/ai/ask',
       authenticated: true,
       body: {
         'user_id': userId,
-        'question': question,
+        'question': normalizedQuestion,
         'farm_id': farmId,
         'crop': crop,
         'region': region,
@@ -325,18 +375,16 @@ class AryaApiClient {
   void _ensureConfigured() {
     if (!isConfigured) {
       throw StateError(
-        'ARYA Backend URL is not configured.',
+        'ARYA Backend URL is invalid or not configured.',
       );
     }
   }
 
-  Map<String, dynamic> _decode(
-    http.Response response,
-  ) {
+  Map<String, dynamic> _decode(http.Response response) {
     dynamic decoded;
 
     try {
-      decoded = jsonDecode(response.body);
+      decoded = jsonDecode(utf8.decode(response.bodyBytes));
     } catch (_) {
       decoded = null;
     }
@@ -347,6 +395,10 @@ class AryaApiClient {
         return decoded;
       }
 
+      if (decoded is Map) {
+        return Map<String, dynamic>.from(decoded);
+      }
+
       return {
         'ok': true,
         'data': decoded,
@@ -355,12 +407,25 @@ class AryaApiClient {
 
     String message = 'ARYA Backend request failed.';
 
-    if (decoded is Map &&
-        decoded['detail'] != null) {
-      message = decoded['detail'].toString();
-    } else if (decoded is Map &&
-        decoded['message'] != null) {
-      message = decoded['message'].toString();
+    if (decoded is Map) {
+      final detail = decoded['detail'];
+      final serverMessage = decoded['message'];
+
+      if (detail is String && detail.trim().isNotEmpty) {
+        message = detail;
+      } else if (serverMessage is String &&
+          serverMessage.trim().isNotEmpty) {
+        message = serverMessage;
+      } else if (detail is List) {
+        message = detail
+            .map((item) {
+              if (item is Map && item['msg'] != null) {
+                return item['msg'].toString();
+              }
+              return item.toString();
+            })
+            .join('\n');
+      }
     }
 
     throw AryaApiException(
