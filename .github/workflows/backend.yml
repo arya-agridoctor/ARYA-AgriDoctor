@@ -9,36 +9,202 @@ on:
       - "backend/**"
       - ".github/workflows/backend.yml"
 
+permissions:
+  contents: read
+
+concurrency:
+  group: arya-backend-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    defaults:
+      run:
+        shell: bash
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
 
       - name: Install dependencies
         working-directory: backend
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Compile backend
+      - name: Compile all backend Python files
         working-directory: backend
         run: |
-          python -m py_compile main.py
+          set -euo pipefail
 
-      - name: Start backend test
+          python - <<'PY'
+          import pathlib
+          import py_compile
+          import sys
+
+          root = pathlib.Path(".")
+          files = sorted(
+              path for path in root.rglob("*.py")
+              if ".venv" not in path.parts
+              and "__pycache__" not in path.parts
+          )
+
+          if not files:
+              print("ERROR: No Python files found.")
+              sys.exit(1)
+
+          errors = []
+
+          for path in files:
+              try:
+                  py_compile.compile(
+                      str(path),
+                      doraise=True,
+                      cfile="/tmp/arya_compile.pyc",
+                  )
+                  print(f"OK: {path}")
+              except Exception as exc:
+                  errors.append((path, str(exc)))
+                  print(f"FAILED: {path}: {exc}")
+
+          if errors:
+              print(f"\nCompilation failed for {len(errors)} file(s).")
+              sys.exit(1)
+
+          print(f"\nCompilation successful: {len(files)} Python files.")
+          PY
+
+      - name: Verify main application imports
         working-directory: backend
+        env:
+          PYTHONPATH: .
         run: |
-          uvicorn main:app --host 127.0.0.1 --port 8000 &
-          sleep 5
-          curl --fail http://127.0.0.1:8000/health
+          set -euo pipefail
+
+          python - <<'PY'
+          import importlib
+          import sys
+
+          try:
+              module = importlib.import_module("main")
+
+              if not hasattr(module, "app"):
+                  raise RuntimeError(
+                      "backend/main.py does not expose an 'app' object."
+                  )
+
+              print("Main module:", module.__file__)
+              print("ASGI application:", type(module.app).__name__)
+              print("Main application import successful.")
+
+          except Exception:
+              import traceback
+              traceback.print_exc()
+              sys.exit(1)
+          PY
+
+      - name: Start backend test server
+        working-directory: backend
+        env:
+          PYTHONPATH: .
+        run: |
+          set -euo pipefail
+
+          python -m uvicorn main:app \
+            --host 127.0.0.1 \
+            --port 8000 \
+            > /tmp/arya-backend.log 2>&1 &
+
+          echo "$!" > /tmp/arya-backend.pid
+
+      - name: Wait for backend readiness
+        run: |
+          set -euo pipefail
+
+          READY=0
+
+          for attempt in $(seq 1 30); do
+            if ! kill -0 "$(cat /tmp/arya-backend.pid)" 2>/dev/null; then
+              echo "ERROR: Backend process exited unexpectedly."
+              cat /tmp/arya-backend.log
+              exit 1
+            fi
+
+            if curl --silent --show-error \
+              --fail \
+              --max-time 3 \
+              http://127.0.0.1:8000/health \
+              -o /tmp/arya-health.json; then
+              READY=1
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$READY" -ne 1 ]; then
+            echo "ERROR: Backend did not become healthy."
+            cat /tmp/arya-backend.log
+            exit 1
+          fi
+
+          echo "Backend health response:"
+          cat /tmp/arya-health.json
+          echo
+
+      - name: Validate health response
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          path = pathlib.Path("/tmp/arya-health.json")
+
+          try:
+              data = json.loads(path.read_text(encoding="utf-8"))
+              print("Health response type:", type(data).__name__)
+              print("Health response:", json.dumps(
+                  data,
+                  ensure_ascii=False,
+                  indent=2,
+              ))
+          except Exception as exc:
+              print("Health endpoint did not return valid JSON:", exc)
+              sys.exit(1)
+          PY
+
+      - name: Stop backend test server
+        if: always()
+        run: |
+          if [ -f /tmp/arya-backend.pid ]; then
+            PID="$(cat /tmp/arya-backend.pid)"
+            kill "$PID" 2>/dev/null || true
+          fi
+
+      - name: Show backend logs on failure
+        if: failure()
+        run: |
+          if [ -f /tmp/arya-backend.log ]; then
+            echo "===== ARYA BACKEND LOG ====="
+            cat /tmp/arya-backend.log
+          fi
 
       - name: Backend test completed
-        run: echo "ARYA AgriDoctor Backend test completed successfully."
+        if: success()
+        run: |
+          echo "ARYA backend compilation, import and health checks passed."
+          echo "Note: Passing these checks does not prove all modules are connected."
