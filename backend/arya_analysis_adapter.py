@@ -1,70 +1,144 @@
 """
 ARYA AgriDoctor
 Advanced Analysis Engine Adapter
-Version: 2.0.0
+Version: 2.1.0
 
-رابط امن بین Backend و موتور تحلیل تخصصی ARYA.
+رابط امن و سازگار بین Backend و موتور تحلیل تخصصی ARYA.
+
+اصول:
+- مستقل از main.py
+- حفظ توابع و نام‌های سازگاری قبلی
+- اعتبارسنجی ورودی‌ها
+- عدم افشای traceback و جزئیات داخلی
+- تشخیص صحیح نتیجه موفق و ناموفق موتور
+- حفظ زبان انتخاب‌شده توسط کاربر
+- سازگاری با اجرای package و اجرای مستقیم
+- عدم ادعای تشخیص علمی قطعی بدون شواهد کافی
 """
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Optional
-import traceback
+
+
+# ------------------------------------------------------------
+# Logging
+# ------------------------------------------------------------
+
+logger = logging.getLogger("arya.analysis.adapter")
 
 
 # ------------------------------------------------------------
 # Import compatibility
 # ------------------------------------------------------------
+
 try:
     from .arya_analysis_engine import analyze_agriculture
 except ImportError:
-    from arya_analysis_engine import analyze_agriculture
+    try:
+        from arya_analysis_engine import analyze_agriculture
+    except ImportError:
+        logger.exception(
+            "Unable to import ARYA agricultural analysis engine."
+        )
+        raise
+
+
+# ------------------------------------------------------------
+# Constants
+# ------------------------------------------------------------
+
+ADAPTER_NAME = "ARYA Analysis Adapter"
+ADAPTER_VERSION = "2.1.0"
+ENGINE_NAME = "ARYA_ANALYSIS_ENGINE"
+
+DEFAULT_LANGUAGE = "fa"
+
+MAX_PROMPT_LENGTH = 20_000
+MAX_LANGUAGE_LENGTH = 32
+MAX_TEXT_LENGTH = 20_000
+MAX_CONTEXT_DEPTH = 12
+MAX_CONTEXT_ITEMS = 2_000
+MAX_LIST_ITEMS = 500
+MAX_KEY_LENGTH = 256
 
 
 # ------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------
+
 def _safe_text(value: Any) -> str:
+    """
+    Convert supported scalar values to text safely.
+    Avoid returning arbitrary object representations.
+    """
+
     if value is None:
         return ""
 
     if isinstance(value, str):
         return value.strip()
 
-    try:
-        return str(value).strip()
-    except Exception:
-        return ""
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+
+    return ""
 
 
 def _as_dict(value: Any) -> Dict[str, Any]:
-    if value is None:
-        return {}
+    """
+    Convert common request/model objects to a dictionary.
+
+    Supports:
+    - dict
+    - Pydantic v2 model_dump()
+    - Pydantic v1 dict()
+    - objects exposing __dict__
+
+    Unsupported objects produce an empty dictionary.
+    """
 
     if isinstance(value, dict):
         return dict(value)
 
-    if hasattr(value, "model_dump"):
+    if value is None:
+        return {}
+
+    model_dump = getattr(value, "model_dump", None)
+
+    if callable(model_dump):
         try:
-            result = value.model_dump()
+            result = model_dump()
+
             if isinstance(result, dict):
                 return result
-        except Exception:
-            pass
 
-    if hasattr(value, "dict"):
+        except Exception:
+            logger.debug(
+                "Could not convert request using model_dump().",
+                exc_info=True,
+            )
+
+    model_dict = getattr(value, "dict", None)
+
+    if callable(model_dict):
         try:
-            result = value.dict()
+            result = model_dict()
+
             if isinstance(result, dict):
                 return result
-        except Exception:
-            pass
 
-    if hasattr(value, "__dict__"):
-        try:
-            return dict(value.__dict__)
         except Exception:
-            pass
+            logger.debug(
+                "Could not convert request using dict().",
+                exc_info=True,
+            )
+
+    object_dict = getattr(value, "__dict__", None)
+
+    if isinstance(object_dict, dict):
+        return dict(object_dict)
 
     return {}
 
@@ -73,9 +147,11 @@ def _first_value(
     data: Dict[str, Any],
     *keys: str,
 ) -> Any:
+    """
+    Return the first present, non-empty value.
+    """
 
     for key in keys:
-
         if key not in data:
             continue
 
@@ -92,12 +168,273 @@ def _first_value(
     return None
 
 
+def _normalize_language(
+    value: Any,
+    default: str = DEFAULT_LANGUAGE,
+) -> str:
+    """
+    Normalize a language identifier without forcing Persian
+    when a valid language was explicitly supplied.
+    """
+
+    language = _safe_text(value)
+
+    if not language:
+        language = default
+
+    language = language.strip().replace("_", "-")
+
+    if not language:
+        return DEFAULT_LANGUAGE
+
+    if len(language) > MAX_LANGUAGE_LENGTH:
+        return DEFAULT_LANGUAGE
+
+    if not all(
+        character.isalnum() or character == "-"
+        for character in language
+    ):
+        return DEFAULT_LANGUAGE
+
+    return language
+
+
+def _validate_prompt(value: Any) -> str:
+    """
+    Normalize and bound the prompt length.
+    """
+
+    prompt = _safe_text(value)
+
+    if len(prompt) > MAX_PROMPT_LENGTH:
+        raise ValueError(
+            "طول متن درخواست بیشتر از حد مجاز است."
+        )
+
+    return prompt
+
+
+def _sanitize_context_value(
+    value: Any,
+    *,
+    depth: int = 0,
+    counter: Optional[Dict[str, int]] = None,
+) -> Any:
+    """
+    Validate supported context structures and prevent excessively
+    nested or oversized input structures.
+
+    Supported values:
+    - None
+    - strings
+    - numbers
+    - booleans
+    - dictionaries
+    - lists and tuples
+
+    Unsupported arbitrary objects are rejected rather than
+    being converted into potentially misleading text.
+    """
+
+    if counter is None:
+        counter = {"items": 0}
+
+    counter["items"] += 1
+
+    if counter["items"] > MAX_CONTEXT_ITEMS:
+        raise ValueError(
+            "تعداد اجزای اطلاعات ورودی بیشتر از حد مجاز است."
+        )
+
+    if depth > MAX_CONTEXT_DEPTH:
+        raise ValueError(
+            "عمق ساختار اطلاعات ورودی بیشتر از حد مجاز است."
+        )
+
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, int):
+        return value
+
+    if isinstance(value, float):
+        # Reject NaN and infinity.
+        if value != value or value in (
+            float("inf"),
+            float("-inf"),
+        ):
+            raise ValueError(
+                "مقدار عددی نامعتبر در اطلاعات ورودی وجود دارد."
+            )
+
+        return value
+
+    if isinstance(value, str):
+        if len(value) > MAX_TEXT_LENGTH:
+            raise ValueError(
+                "یکی از فیلدهای متنی بیشتر از حد مجاز است."
+            )
+
+        return value
+
+    if isinstance(value, dict):
+        result: Dict[str, Any] = {}
+
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValueError(
+                    "کلیدهای اطلاعات ورودی باید متنی باشند."
+                )
+
+            if len(key) > MAX_KEY_LENGTH:
+                raise ValueError(
+                    "یکی از کلیدهای اطلاعات ورودی بیش از حد طولانی است."
+                )
+
+            result[key] = _sanitize_context_value(
+                item,
+                depth=depth + 1,
+                counter=counter,
+            )
+
+        return result
+
+    if isinstance(value, (list, tuple)):
+        if len(value) > MAX_LIST_ITEMS:
+            raise ValueError(
+                "تعداد اعضای یکی از فهرست‌های ورودی بیشتر از حد مجاز است."
+            )
+
+        return [
+            _sanitize_context_value(
+                item,
+                depth=depth + 1,
+                counter=counter,
+            )
+            for item in value
+        ]
+
+    raise ValueError(
+        "نوع یکی از مقادیر اطلاعات ورودی پشتیبانی نمی‌شود."
+    )
+
+
+def _safe_engine_status(
+    result: Dict[str, Any],
+) -> str:
+    """
+    Return the engine status as normalized text.
+    """
+
+    status = _safe_text(
+        result.get("status")
+    ).lower()
+
+    return status or "unknown"
+
+
+def _engine_result_is_successful(
+    result: Dict[str, Any],
+) -> bool:
+    """
+    Do not assume every dictionary is a successful result.
+
+    Explicit failure markers and recognized error statuses are
+    treated as failures. An engine that returns a dictionary
+    without an explicit status remains compatible with older
+    implementations unless it explicitly reports failure.
+    """
+
+    if result.get("ok") is False:
+        return False
+
+    status = _safe_engine_status(result)
+
+    failure_statuses = {
+        "error",
+        "failed",
+        "failure",
+        "unhealthy",
+        "invalid",
+        "invalid_result",
+        "empty_result",
+        "engine_error",
+        "engine_signature_error",
+        "request_adapter_error",
+        "timeout",
+        "unavailable",
+    }
+
+    if status in failure_statuses:
+        return False
+
+    return True
+
+
+def _error_response(
+    status: str,
+    message: str,
+) -> Dict[str, Any]:
+    """
+    Build a safe, stable error response without internal details.
+    """
+
+    return {
+        "ok": False,
+        "engine": ENGINE_NAME,
+        "status": status,
+        "message": message,
+        "adapter": {
+            "name": ADAPTER_NAME,
+            "version": ADAPTER_VERSION,
+        },
+    }
+
+
+def _attach_adapter_metadata(
+    result: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Preserve engine fields while adding adapter metadata.
+
+    The adapter does not overwrite the engine's own status.
+    """
+
+    output = dict(result)
+
+    output["ok"] = _engine_result_is_successful(output)
+
+    output.setdefault(
+        "adapter",
+        {
+            "name": ADAPTER_NAME,
+            "version": ADAPTER_VERSION,
+        },
+    )
+
+    output.setdefault(
+        "engine",
+        ENGINE_NAME,
+    )
+
+    return output
+
+
 # ------------------------------------------------------------
 # Context normalization
 # ------------------------------------------------------------
+
 def _normalize_context(
     context: Any,
 ) -> Dict[str, Any]:
+    """
+    Normalize common agricultural context field names.
+
+    Original context is preserved under raw_context.
+    """
 
     data = _as_dict(context)
 
@@ -227,17 +564,50 @@ def _normalize_context(
 # ------------------------------------------------------------
 # Main analysis function
 # ------------------------------------------------------------
+
 def run_analysis(
     prompt: str = "",
     context: Optional[Dict[str, Any]] = None,
     language: str = "fa",
 ) -> Dict[str, Any]:
+    """
+    Run the agricultural analysis engine.
+
+    Public error responses do not expose exception strings,
+    filesystem paths, or traceback data.
+    """
 
     try:
+        prompt_text = _validate_prompt(prompt)
 
-        normalized = _normalize_context(context)
+        if context is not None and not isinstance(
+            context,
+            dict,
+        ):
+            context = _as_dict(context)
 
-        prompt_text = _safe_text(prompt)
+        safe_context = _sanitize_context_value(
+            context or {}
+        )
+
+        if not isinstance(safe_context, dict):
+            return _error_response(
+                "invalid_context",
+                "ساختار اطلاعات تحلیل معتبر نیست.",
+            )
+
+        normalized = _normalize_context(
+            safe_context
+        )
+
+        # Explicit language parameter takes precedence only when
+        # it is actually provided and non-empty. Otherwise use the
+        # language contained in the context.
+        effective_language = _normalize_language(
+            language
+            if _safe_text(language)
+            else normalized.get("language")
+        )
 
         user_question = (
             normalized.get("user_question")
@@ -245,18 +615,10 @@ def run_analysis(
             or None
         )
 
-        effective_language = (
-            _safe_text(language)
-            or normalized.get("language")
-            or "fa"
-        )
-
         extra_data = {
             "language": effective_language,
-            "additional_information": (
-                normalized.get(
-                    "additional_information"
-                )
+            "additional_information": normalized.get(
+                "additional_information"
             ),
             "raw_context": normalized.get(
                 "raw_context",
@@ -264,9 +626,8 @@ def run_analysis(
             ),
         }
 
-        # IMPORTANT:
-        # فقط پارامترهایی که موتور واقعی پشتیبانی می‌کند
-        # مستقیماً ارسال می‌شوند.
+        # Only pass keyword arguments supported by the
+        # ARYA analysis engine's established interface.
         result = analyze_agriculture(
             crop=normalized.get("crop"),
             plant=normalized.get("plant"),
@@ -284,70 +645,84 @@ def run_analysis(
         )
 
         if result is None:
-            return {
-                "ok": False,
-                "engine": "ARYA_ANALYSIS_ENGINE",
-                "status": "empty_result",
-                "error": (
-                    "موتور تحلیل نتیجه‌ای برنگرداند."
-                ),
-            }
+            return _error_response(
+                "empty_result",
+                "موتور تحلیل نتیجه‌ای برنگرداند.",
+            )
 
         if not isinstance(result, dict):
+            # Preserve compatibility with non-dictionary engine
+            # results, but do not claim that the result is a
+            # structured agricultural diagnosis.
             return {
                 "ok": True,
-                "engine": "ARYA_ANALYSIS_ENGINE",
+                "engine": ENGINE_NAME,
                 "status": "success",
                 "result": result,
+                "adapter": {
+                    "name": ADAPTER_NAME,
+                    "version": ADAPTER_VERSION,
+                },
             }
 
-        output = dict(result)
+        output = _attach_adapter_metadata(result)
 
-        output["ok"] = True
-
-        output.setdefault(
-            "adapter",
-            {
-                "name": "ARYA Analysis Adapter",
-                "version": "2.0.0",
-            },
-        )
+        if not output["ok"]:
+            logger.warning(
+                "Agricultural analysis engine reported a failure. "
+                "status=%s",
+                _safe_engine_status(result),
+            )
 
         return output
 
-    except TypeError as exc:
+    except ValueError as exc:
+        # Validation messages originate from this adapter.
+        return _error_response(
+            "invalid_input",
+            str(exc),
+        )
 
-        return {
-            "ok": False,
-            "engine": "ARYA_ANALYSIS_ENGINE",
-            "status": "engine_signature_error",
-            "error": str(exc),
-            "message": (
-                "امضای موتور تحلیل با Adapter سازگار نیست."
-            ),
-        }
+    except TypeError:
+        logger.exception(
+            "Analysis engine signature or input type mismatch."
+        )
 
-    except Exception as exc:
+        return _error_response(
+            "engine_signature_error",
+            "امضای موتور تحلیل یا نوع ورودی با Adapter سازگار نیست.",
+        )
 
-        return {
-            "ok": False,
-            "engine": "ARYA_ANALYSIS_ENGINE",
-            "status": "error",
-            "error": str(exc),
-            "trace": traceback.format_exc(),
-        }
+    except Exception:
+        logger.exception(
+            "Unexpected error while running agricultural analysis."
+        )
+
+        return _error_response(
+            "error",
+            "در اجرای تحلیل خطایی رخ داد. لطفاً بعداً دوباره تلاش کنید.",
+        )
 
 
 # ------------------------------------------------------------
 # Request adapter
 # ------------------------------------------------------------
+
 def analyze_request(
     request: Any,
 ) -> Dict[str, Any]:
+    """
+    Adapt an API request/model/dictionary to run_analysis().
+    """
 
     try:
-
         data = _as_dict(request)
+
+        if not data:
+            return _error_response(
+                "invalid_request",
+                "درخواست تحلیل خالی یا نامعتبر است.",
+            )
 
         prompt = _first_value(
             data,
@@ -363,7 +738,7 @@ def analyze_request(
             "language",
             "lang",
             "user_language",
-        ) or "fa"
+        )
 
         context = _first_value(
             data,
@@ -373,33 +748,59 @@ def analyze_request(
             "analysis_context",
         )
 
-        if not isinstance(context, dict):
+        if context is None:
             context = dict(data)
+        elif not isinstance(context, dict):
+            context = _as_dict(context)
+
+            if not context:
+                return _error_response(
+                    "invalid_context",
+                    "ساختار اطلاعات تحلیل معتبر نیست.",
+                )
+
+        # If the outer request supplies a language but the nested
+        # context does not, preserve that language in the context.
+        if (
+            language
+            and "language" not in context
+            and "lang" not in context
+            and "user_language" not in context
+        ):
+            context = dict(context)
+            context["language"] = language
 
         return run_analysis(
             prompt=_safe_text(prompt),
             context=context,
-            language=_safe_text(language) or "fa",
+            language=_safe_text(language),
         )
 
-    except Exception as exc:
+    except Exception:
+        logger.exception(
+            "Unexpected error while adapting analysis request."
+        )
 
-        return {
-            "ok": False,
-            "engine": "ARYA_ANALYSIS_ENGINE",
-            "status": "request_adapter_error",
-            "error": str(exc),
-            "trace": traceback.format_exc(),
-        }
+        return _error_response(
+            "request_adapter_error",
+            "پردازش درخواست تحلیل با خطا مواجه شد.",
+        )
 
 
 # ------------------------------------------------------------
 # Health check
 # ------------------------------------------------------------
+
 def health_check() -> Dict[str, Any]:
+    """
+    Perform a lightweight functional check of the analysis engine.
+
+    This checks whether the engine can execute and return a
+    structured result. It does not validate scientific accuracy,
+    external data freshness, or other services.
+    """
 
     try:
-
         result = analyze_agriculture(
             crop="گندم",
             symptoms=[
@@ -422,9 +823,10 @@ def health_check() -> Dict[str, Any]:
             },
             lab={},
             image_description=None,
-            user_question="بررسی اولیه",
+            user_question="بررسی اولیه سلامت موتور تحلیل",
             extra_data={
                 "language": "fa",
+                "health_check": True,
             },
         )
 
@@ -432,33 +834,68 @@ def health_check() -> Dict[str, Any]:
             return {
                 "ok": False,
                 "status": "invalid_engine_result",
+                "engine": ENGINE_NAME,
+                "adapter": {
+                    "name": ADAPTER_NAME,
+                    "version": ADAPTER_VERSION,
+                },
+            }
+
+        if not _engine_result_is_successful(result):
+            logger.warning(
+                "Analysis engine health check returned a failure. "
+                "status=%s",
+                _safe_engine_status(result),
+            )
+
+            return {
+                "ok": False,
+                "status": "engine_reported_failure",
+                "engine": ENGINE_NAME,
+                "result_status": _safe_engine_status(result),
+                "adapter": {
+                    "name": ADAPTER_NAME,
+                    "version": ADAPTER_VERSION,
+                },
             }
 
         return {
             "ok": True,
             "status": "healthy",
-            "engine": result.get(
-                "engine",
-                {},
-            ),
-            "result_status": result.get(
-                "status"
+            "engine": ENGINE_NAME,
+            "result_status": _safe_engine_status(result),
+            "adapter": {
+                "name": ADAPTER_NAME,
+                "version": ADAPTER_VERSION,
+            },
+            "scope": (
+                "Engine execution check only; "
+                "scientific accuracy and external services "
+                "are not verified."
             ),
         }
 
-    except Exception as exc:
+    except Exception:
+        logger.exception(
+            "ARYA analysis engine health check failed."
+        )
 
         return {
             "ok": False,
             "status": "unhealthy",
-            "error": str(exc),
-            "trace": traceback.format_exc(),
+            "engine": ENGINE_NAME,
+            "message": "بررسی سلامت موتور تحلیل ناموفق بود.",
+            "adapter": {
+                "name": ADAPTER_NAME,
+                "version": ADAPTER_VERSION,
+            },
         }
 
 
 # ------------------------------------------------------------
 # Compatibility aliases
 # ------------------------------------------------------------
+
 analyze = run_analysis
 
 analyze_agriculture_request = analyze_request
@@ -467,8 +904,8 @@ analyze_agriculture_request = analyze_request
 # ------------------------------------------------------------
 # Local test
 # ------------------------------------------------------------
-if __name__ == "__main__":
 
+if __name__ == "__main__":
     import json
 
     print(
