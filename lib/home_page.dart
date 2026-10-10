@@ -118,28 +118,35 @@ class _AryaHomePageState extends State<AryaHomePage> {
         ),
         actions: [
           IconButton(
+            tooltip: 'اعلان‌ها',
             icon: const Icon(Icons.notifications_outlined),
-            onPressed: () => _openModule(
-              const AryaModule(
-                title: 'اعلان‌ها',
-                subtitle: 'هشدارها و کارهای نزدیک',
-                icon: Icons.notifications,
-              ),
-            ),
+            onPressed: () {
+              final notificationsModule = _modules.firstWhere(
+                (module) => module.title == 'اعلان‌ها',
+              );
+              _openModule(notificationsModule);
+            },
           ),
         ],
       ),
-      body: _selectedIndex == 0
-          ? _buildDashboard()
-          : _selectedIndex == 1
-              ? _buildAiAssistant()
-              : _buildFarmSummary(),
+      body: IndexedStack(
+        index: _selectedIndex,
+        children: [
+          _buildDashboard(),
+          const AryaAiPage(),
+          _buildFarmSummary(),
+        ],
+      ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _selectedIndex,
         onDestinationSelected: (value) {
-          setState(() {
-            _selectedIndex = value;
-          });
+          if (value < 0 || value >= 3) return;
+
+          if (_selectedIndex != value) {
+            setState(() {
+              _selectedIndex = value;
+            });
+          }
         },
         destinations: const [
           NavigationDestination(
@@ -190,7 +197,7 @@ class _AryaHomePageState extends State<AryaHomePage> {
         padding: const EdgeInsets.all(18),
         child: Row(
           children: [
-            CircleAvatar(
+            const CircleAvatar(
               radius: 32,
               child: Icon(
                 Icons.agriculture,
@@ -253,7 +260,8 @@ class _AryaHomePageState extends State<AryaHomePage> {
                     ),
                     SizedBox(height: 5),
                     Text(
-                      'مسئله کشاورزی خود را بنویسید و اطلاعات لازم را مرحله‌به‌مرحله بررسی کنید.',
+                      'مسئله کشاورزی خود را بنویسید و اطلاعات لازم را '
+                      'مرحله‌به‌مرحله بررسی کنید.',
                     ),
                   ],
                 ),
@@ -331,6 +339,16 @@ class _AryaHomePageState extends State<AryaHomePage> {
           'آزمایش ثبت نشده است',
           Icons.science,
         ),
+        const SizedBox(height: 8),
+        const Text(
+          'اطلاعات این صفحه فعلاً نمونه است و هنوز از پایگاه داده '
+          'خوانده نمی‌شود.',
+          textAlign: TextAlign.center,
+          style: TextStyle(
+            fontSize: 12,
+            color: Colors.grey,
+          ),
+        ),
       ],
     );
   }
@@ -351,9 +369,8 @@ class _AryaHomePageState extends State<AryaHomePage> {
   }
 
   void _openModule(AryaModule module) {
-    Navigator.push(
-      context,
-      MaterialPageRoute(
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
         builder: (_) => AryaModulePage(module: module),
       ),
     );
@@ -369,10 +386,14 @@ class AryaAiPage extends StatefulWidget {
 
 class _AryaAiPageState extends State<AryaAiPage> {
   final TextEditingController _controller = TextEditingController();
+  final ScrollController _scrollController = ScrollController();
+
   final List<AiMessage> _messages = [
     const AiMessage(
       text:
-          'سلام. من موتور هوشمند ARYA هستم. مسئله کشاورزی خود را توضیح دهید. برای پاسخ دقیق‌تر می‌توانم اطلاعات محصول، زمین، آب، خاک و آب‌وهوا را بررسی کنم.',
+          'سلام. من دستیار ARYA هستم. مسئله کشاورزی خود را توضیح دهید. '
+          'برای پاسخ دقیق‌تر می‌توانم اطلاعات محصول، زمین، آب، خاک و '
+          'آب‌وهوا را بررسی کنم.',
       isAi: true,
     ),
   ];
@@ -382,18 +403,21 @@ class _AryaAiPageState extends State<AryaAiPage> {
   @override
   void dispose() {
     _controller.dispose();
+    _scrollController.dispose();
     super.dispose();
   }
 
   void _sendMessage() {
-    final text = _controller.text.trim();
+    if (_loading) return;
 
-    if (text.isEmpty) return;
+    final question = _controller.text.trim();
+
+    if (question.isEmpty) return;
 
     setState(() {
       _messages.add(
         AiMessage(
-          text: text,
+          text: question,
           isAi: false,
         ),
       );
@@ -401,18 +425,61 @@ class _AryaAiPageState extends State<AryaAiPage> {
       _loading = true;
     });
 
-    Future.delayed(const Duration(milliseconds: 700), () {
+    _scrollToBottom();
+    _processLocalMessage(question);
+  }
+
+  Future<void> _processLocalMessage(String question) async {
+    try {
+      // این تأخیر صرفاً برای شبیه‌سازی پردازش رابط کاربری است.
+      // در این تابع درخواست شبکه‌ای به Backend ارسال نمی‌شود.
+      await Future<void>.delayed(
+        const Duration(milliseconds: 400),
+      );
+
+      if (!mounted) return;
+
+      final answer = _generateLocalAnalysis(question);
+
+      setState(() {
+        _messages.add(
+          AiMessage(
+            text: answer,
+            isAi: true,
+          ),
+        );
+        _loading = false;
+      });
+
+      _scrollToBottom();
+    } catch (_) {
       if (!mounted) return;
 
       setState(() {
         _loading = false;
         _messages.add(
-          AiMessage(
-            text: _generateLocalAnalysis(text),
+          const AiMessage(
+            text: 'در پردازش پیام خطایی رخ داد. لطفاً دوباره تلاش کنید.',
             isAi: true,
           ),
         );
       });
+
+      _scrollToBottom();
+    }
+  }
+
+  void _scrollToBottom() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scrollController.hasClients) return;
+
+      final position = _scrollController.position;
+
+      _scrollController.animateTo(
+        position.maxScrollExtent,
+        duration: const Duration(milliseconds: 250),
+        curve: Curves.easeOut,
+      );
     });
   }
 
@@ -430,44 +497,99 @@ class _AryaAiPageState extends State<AryaAiPage> {
           '۵. آخرین کود مصرفی\n'
           '۶. وضعیت آب‌وهوا\n'
           '۷. در صورت امکان عکس واضح از برگ و کل گیاه\n\n'
-          'بعد از دریافت این اطلاعات می‌توان علت‌های محتمل را مقایسه و اولویت‌بندی کرد.';
+          'بعد از دریافت این اطلاعات می‌توان علت‌های محتمل را مقایسه '
+          'و اولویت‌بندی کرد.\n\n'
+          'توجه: این پاسخ محلی و اولیه است و از موتور تخصصی سرور '
+          'دریافت نشده است.';
     }
 
     if (q.contains('آبیاری') || q.contains('آب')) {
-      return 'برای برنامه آبیاری دقیق باید نوع محصول، سن گیاه، بافت خاک، روش آبیاری، دمای منطقه و وضعیت رطوبت خاک مشخص شود.\n\n'
-          'در نسخه متصل به سرور، این اطلاعات با داده‌های آب‌وهوا و مشخصات مزرعه ترکیب خواهد شد.';
+      return 'برای برنامه آبیاری دقیق باید نوع محصول، سن گیاه، بافت خاک، '
+          'روش آبیاری، دمای منطقه و وضعیت رطوبت خاک مشخص شود.\n\n'
+          'برنامه آبیاری باید با توجه به نیاز محصول، رطوبت خاک و '
+          'شرایط آب‌وهوایی تنظیم شود.\n\n'
+          'این پاسخ محلی است و در حال حاضر از داده‌های واقعی هواشناسی '
+          'یا موتور سرور استفاده نمی‌کند.';
     }
 
     if (q.contains('کود') || q.contains('کوددهی')) {
-      return 'برای توصیه کودی دقیق، ابتدا باید محصول، مرحله رشد و نتیجه آزمایش خاک و در صورت نیاز آب مشخص شود.\n\n'
-          'از مصرف خودسرانه کود یا افزایش مقدار مصرف بدون بررسی شرایط مزرعه خودداری کنید.';
+      return 'برای توصیه کودی دقیق، ابتدا باید محصول، مرحله رشد و '
+          'نتیجه آزمایش خاک و در صورت نیاز آب مشخص شود.\n\n'
+          'از مصرف خودسرانه کود یا افزایش مقدار مصرف بدون بررسی '
+          'شرایط مزرعه خودداری کنید.\n\n'
+          'مقدار مصرف باید بر اساس نیاز محصول، نتایج آزمایش و '
+          'دستورالعمل معتبر تعیین شود.';
     }
 
     if (q.contains('سم') ||
         q.contains('آفت') ||
         q.contains('بیماری')) {
-      return 'برای تشخیص آفت یا بیماری، عکس واضح از قسمت آسیب‌دیده، نام محصول، سن گیاه، منطقه، الگوی گسترش آسیب و سابقه سم‌پاشی بسیار مهم است.\n\n'
-          'در نسخه کامل، موتور تشخیص تصویر و پایگاه داده آفات و بیماری‌ها به این بخش متصل می‌شوند.';
+      return 'برای بررسی آفت یا بیماری، اطلاعات زیر مهم هستند:\n\n'
+          '۱. نام محصول و مرحله رشد\n'
+          '۲. عکس واضح از قسمت آسیب‌دیده\n'
+          '۳. شکل و محل گسترش آسیب\n'
+          '۴. منطقه و شرایط آب‌وهوایی\n'
+          '۵. سابقه سم‌پاشی و مواد مصرف‌شده\n\n'
+          'تا پیش از شناسایی قابل‌اعتماد عامل، از توصیه قطعی سم، '
+          'مخلوط‌کردن سموم یا تعیین مقدار مصرف خودداری کنید.\n\n'
+          'این پاسخ محلی است؛ تشخیص تصویری و پایگاه داده سرور '
+          'از این صفحه فراخوانی نمی‌شوند.';
     }
 
     return 'درخواست شما ثبت شد.\n\n'
-        'برای تحلیل دقیق‌تر، ARYA اطلاعات زیر را در صورت ارتباط با مسئله بررسی می‌کند:\n'
+        'برای تحلیل دقیق‌تر، ARYA بسته به مسئله می‌تواند این اطلاعات '
+        'را بررسی کند:\n'
         '• محصول و مرحله رشد\n'
         '• منطقه و شرایط آب‌وهوایی\n'
-        '• خاک و آزمایشگاه\n'
+        '• خاک و نتایج آزمایشگاه\n'
         '• آب و آبیاری\n'
         '• کود و سموم مصرف‌شده\n'
         '• عکس یا ویدئو\n'
         '• سابقه اقدامات مزرعه\n\n'
-        'این نسخه هسته گفت‌وگویی اولیه را دارد و در معماری نهایی به موتور AI و پایگاه دانش ابری متصل می‌شود.';
+        'وضعیت فعلی: این صفحه از پاسخ‌های محلی اولیه استفاده می‌کند. '
+        'برای پاسخ تخصصی واقعی باید از طریق قرارداد معتبر API به '
+        'موتور تحلیل ARYA در Backend متصل شود.';
+  }
+
+  void _showInfo(String title, String text) {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(title),
+        content: Text(
+          text,
+          textAlign: TextAlign.right,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogContext),
+            child: const Text('باشه'),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Column(
       children: [
+        const Padding(
+          padding: EdgeInsets.fromLTRB(12, 8, 12, 4),
+          child: Align(
+            alignment: Alignment.centerRight,
+            child: Text(
+              'دستیار کشاورزی ARYA',
+              style: TextStyle(
+                fontSize: 17,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ),
+        ),
         Expanded(
           child: ListView.builder(
+            controller: _scrollController,
             padding: const EdgeInsets.all(14),
             itemCount: _messages.length,
             itemBuilder: (context, index) {
@@ -477,13 +599,21 @@ class _AryaAiPageState extends State<AryaAiPage> {
                 alignment: message.isAi
                     ? Alignment.centerRight
                     : Alignment.centerLeft,
-                child: Card(
-                  child: Padding(
-                    padding: const EdgeInsets.all(14),
-                    child: Text(
-                      message.text,
-                      textAlign: TextAlign.right,
-                      style: const TextStyle(fontSize: 16),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxWidth: MediaQuery.sizeOf(context).width * 0.86,
+                  ),
+                  child: Card(
+                    color: message.isAi
+                        ? Theme.of(context).colorScheme.surface
+                        : Theme.of(context).colorScheme.primaryContainer,
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: SelectableText(
+                        message.text,
+                        textAlign: TextAlign.right,
+                        style: const TextStyle(fontSize: 16),
+                      ),
                     ),
                   ),
                 ),
@@ -510,16 +640,22 @@ class _AryaAiPageState extends State<AryaAiPage> {
             ),
           ),
         SafeArea(
+          top: false,
           child: Padding(
             padding: const EdgeInsets.all(10),
             child: Row(
+              crossAxisAlignment: CrossAxisAlignment.end,
               children: [
                 IconButton(
+                  tooltip: 'تصویر گیاه',
                   icon: const Icon(Icons.photo_camera),
                   onPressed: () {
                     _showInfo(
                       'دوربین',
-                      'اتصال دوربین و تحلیل تصویری در لایه AI/Backend برنامه پیش‌بینی شده است.',
+                      'اتصال دوربین و تحلیل تصویری در این نسخه '
+                      'فعال نیست. برای انتخاب تصویر باید قابلیت '
+                      'انتخاب فایل و اتصال معتبر به سرویس تحلیل تصویر '
+                      'پیاده‌سازی شود.',
                     );
                   },
                 ),
@@ -527,6 +663,10 @@ class _AryaAiPageState extends State<AryaAiPage> {
                   child: TextField(
                     controller: _controller,
                     textDirection: TextDirection.rtl,
+                    textInputAction: TextInputAction.send,
+                    minLines: 1,
+                    maxLines: 4,
+                    enabled: !_loading,
                     decoration: const InputDecoration(
                       hintText: 'مسئله کشاورزی خود را بنویسید...',
                       border: OutlineInputBorder(),
@@ -535,33 +675,15 @@ class _AryaAiPageState extends State<AryaAiPage> {
                   ),
                 ),
                 IconButton(
+                  tooltip: 'ارسال پیام',
                   icon: const Icon(Icons.send),
-                  onPressed: _sendMessage,
+                  onPressed: _loading ? null : _sendMessage,
                 ),
               ],
             ),
           ),
         ),
       ],
-    );
-  }
-
-  void _showInfo(String title, String text) {
-    showDialog<void>(
-      context: context,
-      builder: (_) => AlertDialog(
-        title: Text(title),
-        content: Text(
-          text,
-          textAlign: TextAlign.right,
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('باشه'),
-          ),
-        ],
-      ),
     );
   }
 }
@@ -753,15 +875,21 @@ class AryaModulePage extends StatelessWidget {
         onTap: () {
           showDialog<void>(
             context: context,
-            builder: (_) => AlertDialog(
+            builder: (dialogContext) => AlertDialog(
               title: Text(title),
-              content: const Text(
-                'این بخش در ساختار نهایی ARYA AgriDoctor قرار گرفته و برای اتصال به داده‌های واقعی، پایگاه دانش و سرویس‌های ابری آماده است.',
+              content: Text(
+                module.title == 'OWNER / MASTER'
+                    ? 'این گزینه فعلاً رابط کاربری است و عملیات مدیریتی '
+                        'واقعی انجام نمی‌دهد. دسترسی مدیر باید از طریق '
+                        'احراز هویت امن و مجوزهای Backend بررسی شود.'
+                    : 'این گزینه فعلاً رابط کاربری اولیه است. برای ثبت، '
+                        'مشاهده یا تحلیل واقعی اطلاعات، باید به سرویس '
+                        'مربوط در Backend متصل شود.',
                 textAlign: TextAlign.right,
               ),
               actions: [
                 TextButton(
-                  onPressed: () => Navigator.pop(context),
+                  onPressed: () => Navigator.pop(dialogContext),
                   child: const Text('باشه'),
                 ),
               ],
