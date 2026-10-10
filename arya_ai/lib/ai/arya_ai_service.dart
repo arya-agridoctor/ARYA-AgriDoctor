@@ -30,7 +30,7 @@ class AryaAiService {
     if (!_apiClient.isConfigured) {
       return const AryaAiResponse(
         ok: false,
-        answer: 'Backend ARYA AI تنظیم نشده است.',
+        answer: 'آدرس Backend مربوط به ARYA AI تنظیم نشده است.',
         confidence: 0,
         requiresValidation: true,
         mode: 'offline',
@@ -63,9 +63,21 @@ class AryaAiService {
         },
       );
 
-      return AryaAiResponse.fromMap(
-        _normalizeResponse(result),
-      );
+      final normalized = _normalizeResponse(result);
+
+      if (normalized['ok'] == false) {
+        return AryaAiResponse(
+          ok: false,
+          answer: _errorMessage(normalized),
+          confidence: 0,
+          requiresValidation: true,
+          mode: 'backend_error',
+          error: normalized['error']?.toString() ??
+              normalized['message']?.toString(),
+        );
+      }
+
+      return AryaAiResponse.fromMap(normalized);
     } catch (e) {
       return AryaAiResponse(
         ok: false,
@@ -118,11 +130,20 @@ class AryaAiService {
     required String query,
     String language = 'fa',
   }) async {
+    final cleanQuery = query.trim();
+
+    if (cleanQuery.isEmpty) {
+      return {
+        'ok': false,
+        'message': 'برای تعیین موقعیت، نام منطقه را وارد کنید.',
+      };
+    }
+
     return _apiClient.post(
       '/location/resolve',
       authenticated: true,
       body: {
-        'query': query,
+        'query': cleanQuery,
         'language': language,
         'global_location_search': true,
         'validate_location': true,
@@ -134,6 +155,16 @@ class AryaAiService {
     required double latitude,
     required double longitude,
   }) {
+    if (latitude < -90 ||
+        latitude > 90 ||
+        longitude < -180 ||
+        longitude > 180) {
+      return Future<Map<String, dynamic>>.value({
+        'ok': false,
+        'message': 'مختصات جغرافیایی معتبر نیست.',
+      });
+    }
+
     return _apiClient.get(
       '/weather',
       authenticated: true,
@@ -150,6 +181,18 @@ class AryaAiService {
 
   bool get isBackendConfigured {
     return _apiClient.isConfigured;
+  }
+
+  String _errorMessage(Map<String, dynamic> result) {
+    final message = result['message'] ??
+        result['detail'] ??
+        result['error'];
+
+    if (message == null || message.toString().trim().isEmpty) {
+      return 'سرور ARYA نتوانست درخواست را با موفقیت پردازش کند.';
+    }
+
+    return message.toString();
   }
 
   Map<String, dynamic> _normalizeResponse(
