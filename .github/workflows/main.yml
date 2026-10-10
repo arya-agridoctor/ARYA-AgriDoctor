@@ -5,32 +5,108 @@ on:
   push:
     branches:
       - main
+    paths:
+      - "arya_main/**"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arya-android-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: arya_main
+        shell: bash
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Verify Flutter project
+        run: |
+          set -euo pipefail
+
+          if [ ! -f pubspec.yaml ]; then
+            echo "ERROR: arya_main/pubspec.yaml was not found."
+            exit 1
+          fi
+
+          if [ ! -f lib/main.dart ]; then
+            echo "ERROR: arya_main/lib/main.dart was not found."
+            exit 1
+          fi
+
+          echo "Flutter project found."
+          echo "Project path: arya_main"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.35.0'
+          flutter-version: "3.35.2"
           channel: stable
+          cache: true
 
-      - name: Create Android platform
-        run: flutter create --platforms=android .
+      - name: Show Flutter version
+        run: flutter --version
+
+      - name: Verify Android project configuration
+        run: |
+          set -euo pipefail
+
+          if [ ! -d android ]; then
+            echo "ERROR: Android project directory is missing."
+            echo "Refusing to regenerate the Android project automatically."
+            exit 1
+          fi
+
+          if [ ! -f android/gradlew ]; then
+            echo "ERROR: android/gradlew was not found."
+            exit 1
+          fi
+
+          chmod +x android/gradlew
 
       - name: Get dependencies
         run: flutter pub get
 
+      - name: Analyze Flutter code
+        run: flutter analyze --no-pub
+
       - name: Build ARYA AgriDoctor APK
         run: flutter build apk --release
+
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "ERROR: APK was not created or is empty."
+            exit 1
+          fi
+
+          echo "APK successfully created."
+          ls -lh "$APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: ARYA-AgriDoctor-APK
-          path: build/app/outputs/flutter-apk/app-release.apk
+          path: arya_main/build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 14
