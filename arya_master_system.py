@@ -1,3 +1,8 @@
+نام فایل: "arya_master_system.py"
+مسیر: "backend/arya_master_system.py"
+
+نسخهٔ کامل اصلاح‌شده برای جایگزینی فایل اصلی:
+
 from __future__ import annotations
 
 import asyncio
@@ -14,31 +19,41 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 
+
+# ============================================================
+# ARYA AgriDoctor MASTER GATEWAY
+# Version: 2.1.0
+# Central Gateway - Preserve Legacy and Current Routes
+# ============================================================
+
 APP_NAME = "ARYA AgriDoctor MASTER GATEWAY"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 BACKEND_URL = os.getenv(
     "ARYA_BACKEND_URL",
-    "http://127.0.0.1:8000"
+    "http://127.0.0.1:8000",
 ).rstrip("/")
 
 HOST = os.getenv(
     "ARYA_MASTER_HOST",
-    "0.0.0.0"
+    "0.0.0.0",
 )
 
 PORT = int(
     os.getenv(
         "ARYA_MASTER_PORT",
-        "8030"
+        "8030",
     )
 )
 
-TIMEOUT = float(
-    os.getenv(
-        "ARYA_MASTER_TIMEOUT",
-        "30"
-    )
+TIMEOUT = max(
+    1.0,
+    float(
+        os.getenv(
+            "ARYA_MASTER_TIMEOUT",
+            "30",
+        )
+    ),
 )
 
 RETRIES = max(
@@ -46,23 +61,29 @@ RETRIES = max(
     int(
         os.getenv(
             "ARYA_MASTER_RETRIES",
-            "2"
+            "2",
         )
-    )
+    ),
 )
 
-MAX_REQUEST_BYTES = int(
-    os.getenv(
-        "ARYA_MASTER_MAX_REQUEST_BYTES",
-        str(8 * 1024 * 1024)
-    )
+MAX_REQUEST_BYTES = max(
+    1024,
+    int(
+        os.getenv(
+            "ARYA_MASTER_MAX_REQUEST_BYTES",
+            str(8 * 1024 * 1024),
+        )
+    ),
 )
 
-MAX_RESPONSE_BYTES = int(
-    os.getenv(
-        "ARYA_MASTER_MAX_RESPONSE_BYTES",
-        str(16 * 1024 * 1024)
-    )
+MAX_RESPONSE_BYTES = max(
+    1024,
+    int(
+        os.getenv(
+            "ARYA_MASTER_MAX_RESPONSE_BYTES",
+            str(16 * 1024 * 1024),
+        )
+    ),
 )
 
 CIRCUIT_THRESHOLD = max(
@@ -70,9 +91,9 @@ CIRCUIT_THRESHOLD = max(
     int(
         os.getenv(
             "ARYA_MASTER_CIRCUIT_FAILURE_THRESHOLD",
-            "3"
+            "3",
         )
-    )
+    ),
 )
 
 CIRCUIT_COOLDOWN = max(
@@ -80,19 +101,19 @@ CIRCUIT_COOLDOWN = max(
     float(
         os.getenv(
             "ARYA_MASTER_CIRCUIT_COOLDOWN_SECONDS",
-            "30"
+            "30",
         )
-    )
+    ),
 )
 
 INTERNAL_SECRET = os.getenv(
     "ARYA_INTERNAL_GATEWAY_SECRET",
-    ""
+    "",
 )
 
 REQUIRE_SIGNATURE = os.getenv(
     "ARYA_MASTER_REQUIRE_INTERNAL_SIGNATURE",
-    "false"
+    "false",
 ).lower() in {
     "1",
     "true",
@@ -105,57 +126,88 @@ OPENAPI_CACHE_SECONDS = max(
     float(
         os.getenv(
             "ARYA_MASTER_OPENAPI_CACHE_SECONDS",
-            "15"
+            "15",
         )
-    )
+    ),
 )
+
+# Configure explicit origins for production deployments.
+# Wildcard origins cannot safely be combined with credentials.
+CORS_ORIGINS = [
+    item.strip()
+    for item in os.getenv(
+        "ARYA_MASTER_CORS_ORIGINS",
+        "*",
+    ).split(",")
+    if item.strip()
+]
+
+ALLOW_CREDENTIALS = "*" not in CORS_ORIGINS
 
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
     description=(
-        "Single gateway for the real "
-        "ARYA AgriDoctor backend"
+        "Central gateway for the ARYA AgriDoctor backend, "
+        "legacy clients, AI analysis, weather, location, "
+        "service routing, and orchestration."
     ),
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=ALLOW_CREDENTIALS,
+    allow_methods=[
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+        "HEAD",
+    ],
     allow_headers=["*"],
 )
 
 
+# ============================================================
+# CENTRAL RUNTIME STATE
+# ============================================================
+
 class Circuit:
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.failures = 0
         self.opened_at = 0.0
 
 
 circuit = Circuit()
 
-stats = defaultdict(int)
+stats: defaultdict[str, int] = defaultdict(int)
 
 last_error: Optional[str] = None
 
 _openapi: dict[str, Any] = {}
-
 _openapi_at = 0.0
 
+_state_lock = asyncio.Lock()
+_openapi_lock = asyncio.Lock()
+
+
+# ============================================================
+# COMMON RESPONSE AND HEADER HELPERS
+# ============================================================
 
 def make_url(path: str) -> str:
-    return BACKEND_URL + (
-        path
-        if path.startswith("/")
-        else "/" + path
-    )
+    if not path.startswith("/"):
+        path = "/" + path
+
+    return BACKEND_URL + path
 
 
 def safe_headers(
-    headers: httpx.Headers,
+    headers: Any,
 ) -> dict[str, str]:
 
     excluded = {
@@ -165,48 +217,151 @@ def safe_headers(
         "keep-alive",
         "transfer-encoding",
         "upgrade",
+        "proxy-authenticate",
+        "proxy-authorization",
     }
 
     return {
-        k: v
-        for k, v in headers.items()
-        if k.lower() not in excluded
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in excluded
     }
 
 
-def is_open() -> bool:
+def error_response(
+    status_code: int,
+    error: str,
+    **extra: Any,
+) -> JSONResponse:
 
-    if not circuit.opened_at:
-        return False
-
-    if (
-        time.time() - circuit.opened_at
-        >= CIRCUIT_COOLDOWN
-    ):
-        circuit.failures = 0
-        circuit.opened_at = 0.0
-        return False
-
-    return True
-
-
-def mark_success() -> None:
-
-    circuit.failures = 0
-    circuit.opened_at = 0.0
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "ok": False,
+            "error": error,
+            **extra,
+        },
+    )
 
 
-def mark_failure(error: str) -> None:
+def http_exception_response(
+    exc: HTTPException,
+) -> JSONResponse:
 
-    global last_error
+    detail = exc.detail
 
-    last_error = str(error)
+    if isinstance(detail, dict):
+        content = detail
+    else:
+        content = {
+            "ok": False,
+            "error": str(detail),
+        }
 
-    circuit.failures += 1
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=content,
+        headers=exc.headers,
+    )
 
-    if circuit.failures >= CIRCUIT_THRESHOLD:
-        circuit.opened_at = time.time()
 
+def response_from_backend(
+    response: httpx.Response,
+) -> Response:
+
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        headers=safe_headers(response.headers),
+        media_type=response.headers.get("content-type"),
+    )
+
+
+async def read_limited_body(
+    request: Request,
+) -> bytes:
+    """
+    Enforce the configured application-level request size.
+
+    Content-Length is checked when available, then the streamed
+    body is counted so an absent or incorrect header cannot bypass
+    this limit.
+    """
+
+    content_length = request.headers.get("content-length")
+
+    if content_length is not None:
+        try:
+            length = int(content_length)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="invalid_content_length",
+            )
+
+        if length < 0:
+            raise HTTPException(
+                status_code=400,
+                detail="invalid_content_length",
+            )
+
+        if length > MAX_REQUEST_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="request_too_large",
+            )
+
+    chunks: list[bytes] = []
+    total = 0
+
+    async for chunk in request.stream():
+        total += len(chunk)
+
+        if total > MAX_REQUEST_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail="request_too_large",
+            )
+
+        chunks.append(chunk)
+
+    return b"".join(chunks)
+
+
+def parse_json_body(body: bytes) -> Any:
+    if not body:
+        return {}
+
+    try:
+        return json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise HTTPException(
+            status_code=400,
+            detail="invalid_json",
+        )
+
+
+def encode_json(payload: Any) -> bytes:
+    try:
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "ok": False,
+                "error": "payload_not_json_serializable",
+                "message": str(exc),
+            },
+        )
+
+
+# ============================================================
+# INTERNAL HMAC SIGNATURE
+# ============================================================
 
 def make_signature(
     method: str,
@@ -217,17 +372,17 @@ def make_signature(
     if not INTERNAL_SECRET:
         return ""
 
-    msg = (
-        method.upper().encode()
+    message = (
+        method.upper().encode("utf-8")
         + b"\n"
-        + path.encode()
+        + path.encode("utf-8")
         + b"\n"
         + body
     )
 
     return hmac.new(
-        INTERNAL_SECRET.encode(),
-        msg,
+        INTERNAL_SECRET.encode("utf-8"),
+        message,
         hashlib.sha256,
     ).hexdigest()
 
@@ -257,20 +412,65 @@ def verify_signature(
     )
 
 
+# ============================================================
+# CIRCUIT BREAKER
+# ============================================================
+
+async def is_open() -> bool:
+
+    async with _state_lock:
+
+        if not circuit.opened_at:
+            return False
+
+        if (
+            time.time() - circuit.opened_at
+            >= CIRCUIT_COOLDOWN
+        ):
+            circuit.failures = 0
+            circuit.opened_at = 0.0
+            return False
+
+        return True
+
+
+async def mark_success() -> None:
+
+    async with _state_lock:
+        circuit.failures = 0
+        circuit.opened_at = 0.0
+
+
+async def mark_failure(error: str) -> None:
+
+    global last_error
+
+    async with _state_lock:
+        last_error = str(error)
+        circuit.failures += 1
+
+        if circuit.failures >= CIRCUIT_THRESHOLD:
+            circuit.opened_at = time.time()
+
+
+# ============================================================
+# CENTRAL BACKEND REQUEST CLIENT
+# ============================================================
+
 async def call_backend(
     method: str,
     path: str,
     *,
     body: bytes = b"",
-    query=None,
-    headers=None,
-    retry=True,
+    query: Any = None,
+    headers: Optional[dict[str, str]] = None,
+    retry: bool = True,
 ) -> httpx.Response:
 
-    if is_open():
+    if await is_open():
         raise HTTPException(
-            503,
-            {
+            status_code=503,
+            detail={
                 "ok": False,
                 "error": "backend_circuit_open",
             },
@@ -278,8 +478,8 @@ async def call_backend(
 
     if len(body) > MAX_REQUEST_BYTES:
         raise HTTPException(
-            413,
-            {
+            status_code=413,
+            detail={
                 "ok": False,
                 "error": "request_too_large",
             },
@@ -287,38 +487,33 @@ async def call_backend(
 
     method = method.upper()
 
+    retryable_methods = {
+        "GET",
+        "HEAD",
+        "OPTIONS",
+    }
+
     attempts = (
         RETRIES + 1
-        if retry
-        and method in {
-            "GET",
-            "HEAD",
-            "OPTIONS",
-        }
+        if retry and method in retryable_methods
         else 1
     )
 
-    req_headers = dict(headers or {})
+    request_headers = dict(headers or {})
 
     if INTERNAL_SECRET:
-        req_headers[
-            "X-ARYA-Gateway"
-        ] = "ARYA-MASTER"
-
-        req_headers[
-            "X-ARYA-Signature"
-        ] = make_signature(
+        request_headers["X-ARYA-Gateway"] = "ARYA-MASTER"
+        request_headers["X-ARYA-Signature"] = make_signature(
             method,
             path,
             body,
         )
 
-    last_exc = None
+    last_exception: Optional[Exception] = None
 
     for attempt in range(attempts):
 
         try:
-
             async with httpx.AsyncClient(
                 timeout=TIMEOUT,
                 follow_redirects=False,
@@ -329,43 +524,32 @@ async def call_backend(
                     make_url(path),
                     content=body,
                     params=query,
-                    headers=req_headers,
+                    headers=request_headers,
                 )
 
-            if (
-                len(response.content)
-                > MAX_RESPONSE_BYTES
-            ):
-                mark_failure(
-                    "response_too_large"
-                )
+            if len(response.content) > MAX_RESPONSE_BYTES:
+                await mark_failure("response_too_large")
 
                 raise HTTPException(
-                    502,
-                    {
+                    status_code=502,
+                    detail={
                         "ok": False,
-                        "error":
-                            "backend_response_too_large",
+                        "error": "backend_response_too_large",
                     },
                 )
 
             if response.status_code >= 500:
-
-                mark_failure(
-                    f"backend_http_"
-                    f"{response.status_code}"
+                await mark_failure(
+                    f"backend_http_{response.status_code}"
                 )
 
                 if attempt + 1 < attempts:
-
                     await asyncio.sleep(
                         0.35 * (attempt + 1)
                     )
-
                     continue
-
             else:
-                mark_success()
+                await mark_success()
 
             return response
 
@@ -377,23 +561,31 @@ async def call_backend(
             httpx.NetworkError,
         ) as exc:
 
-            last_exc = exc
-
-            mark_failure(str(exc))
+            last_exception = exc
+            await mark_failure(str(exc))
 
             if attempt + 1 < attempts:
+                await asyncio.sleep(
+                    0.35 * (attempt + 1)
+                )
 
+        except httpx.HTTPError as exc:
+
+            last_exception = exc
+            await mark_failure(str(exc))
+
+            if attempt + 1 < attempts:
                 await asyncio.sleep(
                     0.35 * (attempt + 1)
                 )
 
     raise HTTPException(
-        502,
-        {
+        status_code=502,
+        detail={
             "ok": False,
             "error": "backend_unreachable",
             "message": str(
-                last_exc or "unknown error"
+                last_exception or "unknown_error"
             ),
         },
     )
@@ -403,7 +595,7 @@ async def json_backend(
     method: str,
     path: str,
     payload: Any = None,
-    query=None,
+    query: Any = None,
 ) -> Any:
 
     body = b""
@@ -413,15 +605,8 @@ async def json_backend(
     }
 
     if payload is not None:
-
-        body = json.dumps(
-            payload,
-            ensure_ascii=False,
-        ).encode("utf-8")
-
-        headers[
-            "Content-Type"
-        ] = "application/json"
+        body = encode_json(payload)
+        headers["Content-Type"] = "application/json"
 
     response = await call_backend(
         method,
@@ -433,19 +618,19 @@ async def json_backend(
 
     try:
         return response.json()
-
-    except Exception:
-
+    except (ValueError, json.JSONDecodeError):
         return {
-            "status_code":
-                response.status_code,
-            "text":
-                response.text,
+            "status_code": response.status_code,
+            "text": response.text,
         }
 
 
+# ============================================================
+# BACKEND OPENAPI DISCOVERY AND ROUTE MATCHING
+# ============================================================
+
 async def load_openapi(
-    force=False,
+    force: bool = False,
 ) -> dict[str, Any]:
 
     global _openapi
@@ -454,35 +639,37 @@ async def load_openapi(
     if (
         _openapi
         and not force
-        and (
-            time.time()
-            - _openapi_at
-            < OPENAPI_CACHE_SECONDS
-        )
+        and time.time() - _openapi_at < OPENAPI_CACHE_SECONDS
     ):
         return _openapi
 
-    try:
+    async with _openapi_lock:
 
-        response = await call_backend(
-            "GET",
-            "/openapi.json",
-        )
+        if (
+            _openapi
+            and not force
+            and time.time() - _openapi_at < OPENAPI_CACHE_SECONDS
+        ):
+            return _openapi
 
-        if response.status_code == 200:
+        try:
+            response = await call_backend(
+                "GET",
+                "/openapi.json",
+            )
 
-            data = response.json()
+            if response.status_code == 200:
+                data = response.json()
 
-            if isinstance(data, dict):
+                if isinstance(data, dict):
+                    _openapi = data
+                    _openapi_at = time.time()
 
-                _openapi = data
+        except Exception:
+            # Preserve the last known valid specification.
+            pass
 
-                _openapi_at = time.time()
-
-    except Exception:
-        pass
-
-    return _openapi
+        return _openapi
 
 
 def route_exists(
@@ -491,11 +678,7 @@ def route_exists(
     method: str,
 ) -> bool:
 
-    item = (
-        spec
-        .get("paths", {})
-        .get(path)
-    )
+    item = spec.get("paths", {}).get(path)
 
     return (
         isinstance(item, dict)
@@ -511,26 +694,20 @@ async def choose(
     spec = await load_openapi()
 
     for path in candidates:
-
-        if route_exists(
-            spec,
-            path,
-            method,
-        ):
+        if route_exists(spec, path, method):
             return path
 
+    # Only use the configured fallback when OpenAPI itself
+    # is unavailable. Do not guess if a valid spec says
+    # none of the candidates supports the requested method.
     if not spec:
-        return (
-            candidates[0]
-            if candidates
-            else None
-        )
+        return candidates[0] if candidates else None
 
     return None
 
 
 # ============================================================
-# NEW: LEGACY / MOBILE AI PAYLOAD NORMALIZER
+# LEGACY / MOBILE AI PAYLOAD NORMALIZER
 # ============================================================
 
 def normalize_ai_payload(
@@ -538,19 +715,15 @@ def normalize_ai_payload(
 ) -> dict[str, Any]:
 
     """
-    Convert legacy/mobile AI payloads
-    to the current /ai/analyze contract.
+    Normalize legacy/mobile AI request fields.
 
-    Existing fields are preserved inside
-    context so no information is discarded.
+    Extra input fields are retained inside context so the
+    gateway does not silently discard supplied farm data.
     """
 
     if not isinstance(payload, dict):
-
         payload = {
-            "prompt": str(
-                payload or ""
-            )
+            "prompt": str(payload or ""),
         }
 
     prompt = (
@@ -568,82 +741,45 @@ def normalize_ai_payload(
         or "fa"
     )
 
-    context = payload.get("context")
+    original_context = payload.get("context")
 
-    if not isinstance(context, dict):
-        context = {}
+    context = (
+        dict(original_context)
+        if isinstance(original_context, dict)
+        else {}
+    )
 
     mapping = {
-
-        "crop":
-            "crop",
-
-        "crop_name":
-            "crop",
-
-        "product":
-            "crop",
-
-        "plant":
-            "plant",
-
-        "tree":
-            "plant",
-
-        "species":
-            "plant",
-
-        "symptoms":
-            "symptoms",
-
-        "symptom":
-            "symptoms",
-
-        "soil":
-            "soil",
-
-        "soil_data":
-            "soil",
-
-        "water":
-            "water",
-
-        "water_data":
-            "water",
-
-        "weather":
-            "weather",
-
-        "location":
-            "location",
-
-        "lab":
-            "lab",
-
-        "image":
-            "image_description",
-
-        "image_description":
-            "image_description",
-
-        "additional_information":
-            "additional_information",
-
-        "extra_data":
-            "extra_data",
+        "crop": "crop",
+        "crop_name": "crop",
+        "product": "crop",
+        "plant": "plant",
+        "tree": "plant",
+        "species": "plant",
+        "symptoms": "symptoms",
+        "symptom": "symptoms",
+        "soil": "soil",
+        "soil_data": "soil",
+        "water": "water",
+        "water_data": "water",
+        "weather": "weather",
+        "location": "location",
+        "lab": "lab",
+        "image": "image_description",
+        "image_description": "image_description",
+        "additional_information": "additional_information",
+        "extra_data": "extra_data",
     }
 
-    for src, dst in mapping.items():
-
+    for source, destination in mapping.items():
         if (
-            src in payload
-            and payload[src] is not None
-            and dst not in context
+            source in payload
+            and payload[source] is not None
+            and destination not in context
         ):
+            context[destination] = payload[source]
 
-            context[dst] = payload[src]
-
-    control = {
+    control_fields = {
         "prompt",
         "question",
         "query",
@@ -655,12 +791,7 @@ def normalize_ai_payload(
     }
 
     for key, value in payload.items():
-
-        if (
-            key not in control
-            and key not in context
-        ):
-
+        if key not in control_fields and key not in context:
             context[key] = value
 
     return {
@@ -670,175 +801,114 @@ def normalize_ai_payload(
     }
 
 
+# ============================================================
+# CENTRAL AI COMPATIBILITY HANDLER
+# ============================================================
+
 async def ai_analyze_compat(
     request: Request,
 ) -> Response:
 
-    body = await request.body()
-
-    if len(body) > MAX_REQUEST_BYTES:
-
-        return JSONResponse(
-            413,
-            {
-                "ok": False,
-                "error":
-                    "request_too_large",
-            },
-        )
-
     try:
+        body = await read_limited_body(request)
+        payload = parse_json_body(body)
+    except HTTPException as exc:
+        return http_exception_response(exc)
 
-        payload = (
-            json.loads(
-                body.decode("utf-8")
-            )
-            if body
-            else {}
-        )
-
-    except Exception:
-
-        payload = {
-            "text":
-                body.decode(
-                    "utf-8",
-                    errors="replace",
-                )
-        }
-
-    normalized = normalize_ai_payload(
-        payload
-    )
+    normalized = normalize_ai_payload(payload)
 
     headers = {
-        "Accept":
-            "application/json",
-
-        "Content-Type":
-            "application/json",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
     }
 
-    auth = request.headers.get(
-        "Authorization"
-    )
+    authorization = request.headers.get("Authorization")
 
-    if auth:
-        headers[
-            "Authorization"
-        ] = auth
+    if authorization:
+        headers["Authorization"] = authorization
 
-    response = await call_backend(
-        "POST",
-        "/ai/analyze",
-        body=json.dumps(
-            normalized,
-            ensure_ascii=False,
-        ).encode("utf-8"),
-        headers=headers,
-        retry=False,
-    )
+    try:
+        response = await call_backend(
+            "POST",
+            "/ai/analyze",
+            body=encode_json(normalized),
+            headers=headers,
+            retry=False,
+        )
 
-    return Response(
-        content=response.content,
-        status_code=response.status_code,
-        headers=safe_headers(
-            response.headers
-        ),
-        media_type=response.headers.get(
-            "content-type"
-        ),
-    )
+        return response_from_backend(response)
 
+    except HTTPException as exc:
+        return http_exception_response(exc)
+
+
+# ============================================================
+# GENERIC COMPATIBILITY HANDLER
+# ============================================================
 
 async def compat(
     request: Request,
     candidates: list[str],
 ) -> Response:
 
-    body = await request.body()
-
-    if len(body) > MAX_REQUEST_BYTES:
-
-        return JSONResponse(
-            413,
-            {
-                "ok": False,
-                "error":
-                    "request_too_large",
-            },
-        )
-
-    try:
-
-        payload = (
-            json.loads(
-                body.decode("utf-8")
-            )
-            if body
-            else {
-                k: v
-                for k, v
-                in request.query_params.multi_items()
-            }
-        )
-
-    except Exception:
-
-        payload = {
-            "raw":
-                body.decode(
-                    "utf-8",
-                    errors="replace",
-                )
-        }
-
     method = request.method.upper()
 
-    target_method = (
-        "POST"
-        if method == "GET"
-        else method
-    )
+    try:
+        body = await read_limited_body(request)
+    except HTTPException as exc:
+        return http_exception_response(exc)
 
+    # Preserve the incoming HTTP method. GET is not converted
+    # to POST because doing so breaks weather/location routes.
     target = await choose(
         candidates,
-        target_method,
+        method,
     )
 
     if not target:
-
-        return JSONResponse(
+        return error_response(
             404,
-            {
-                "ok": False,
-                "error":
-                    "compatible_backend_route_not_found",
-                "candidates":
-                    candidates,
-            },
+            "compatible_backend_route_not_found",
+            candidates=candidates,
+            method=method,
         )
 
-    if target_method == "GET":
+    headers = {
+        "Accept": request.headers.get(
+            "Accept",
+            "application/json",
+        ),
+    }
 
-        data = await json_backend(
-            "GET",
+    authorization = request.headers.get("Authorization")
+
+    if authorization:
+        headers["Authorization"] = authorization
+
+    content_type = request.headers.get("Content-Type")
+
+    if content_type and body:
+        headers["Content-Type"] = content_type
+
+    try:
+        response = await call_backend(
+            method,
             target,
-            query=list(
-                request.query_params.multi_items()
-            ),
+            body=body,
+            query=list(request.query_params.multi_items()),
+            headers=headers,
+            retry=method in {"GET", "HEAD", "OPTIONS"},
         )
 
-    else:
+        return response_from_backend(response)
 
-        data = await json_backend(
-            target_method,
-            target,
-            payload,
-        )
+    except HTTPException as exc:
+        return http_exception_response(exc)
 
-    return JSONResponse(data)
 
+# ============================================================
+# ROOT / HEALTH / STATUS
+# ============================================================
 
 @app.get("/")
 async def root():
@@ -857,54 +927,42 @@ async def health():
     started = time.perf_counter()
 
     try:
-
-        r = await call_backend(
+        response = await call_backend(
             "GET",
             "/health",
         )
 
-        return {
-            "ok":
-                200 <= r.status_code < 300,
+        ok = 200 <= response.status_code < 300
 
-            "master":
-                "ok",
-
-            "backend_status":
-                r.status_code,
-
-            "latency_ms":
-                round(
-                    (
-                        time.perf_counter()
-                        - started
-                    ) * 1000,
+        return JSONResponse(
+            status_code=200 if ok else 503,
+            content={
+                "ok": ok,
+                "master": "ok",
+                "backend_status": response.status_code,
+                "latency_ms": round(
+                    (time.perf_counter() - started) * 1000,
                     2,
                 ),
-        }
-
-    except Exception as exc:
-
-        return {
-            "ok": False,
-
-            "master":
-                "ok",
-
-            "backend": {
-                "ok": False,
-                "error": str(exc),
             },
+        )
 
-            "latency_ms":
-                round(
-                    (
-                        time.perf_counter()
-                        - started
-                    ) * 1000,
+    except Exception:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "ok": False,
+                "master": "ok",
+                "backend": {
+                    "ok": False,
+                    "error": "backend_unavailable",
+                },
+                "latency_ms": round(
+                    (time.perf_counter() - started) * 1000,
                     2,
                 ),
-        }
+            },
+        )
 
 
 @app.get("/status")
@@ -912,37 +970,21 @@ async def status():
 
     spec = await load_openapi()
 
+    async with _state_lock:
+        circuit_open = bool(circuit.opened_at)
+        failures = circuit.failures
+        current_error = last_error
+
     return {
         "ok": True,
-
-        "service":
-            APP_NAME,
-
-        "version":
-            APP_VERSION,
-
-        "backend":
-            BACKEND_URL,
-
-        "circuit_open":
-            is_open(),
-
-        "failures":
-            circuit.failures,
-
-        "last_error":
-            last_error,
-
-        "route_count":
-            len(
-                spec.get(
-                    "paths",
-                    {},
-                )
-            ),
-
-        "requests":
-            dict(stats),
+        "service": APP_NAME,
+        "version": APP_VERSION,
+        "backend": BACKEND_URL,
+        "circuit_open": circuit_open,
+        "failures": failures,
+        "last_error": current_error,
+        "route_count": len(spec.get("paths", {})),
+        "requests": dict(stats),
     }
 
 
@@ -953,20 +995,11 @@ async def system_map():
 
     return {
         "ok": True,
-
-        "master":
-            APP_NAME,
-
-        "backend":
-            BACKEND_URL,
-
-        "backend_routes":
-            sorted(
-                spec.get(
-                    "paths",
-                    {},
-                ).keys()
-            ),
+        "master": APP_NAME,
+        "backend": BACKEND_URL,
+        "backend_routes": sorted(
+            spec.get("paths", {}).keys()
+        ),
     }
 
 
@@ -974,39 +1007,27 @@ async def system_map():
 async def backend_routes():
 
     spec = await load_openapi()
-
-    paths = spec.get(
-        "paths",
-        {},
-    )
+    paths = spec.get("paths", {})
 
     return {
-        "ok":
-            bool(spec),
-
-        "count":
-            len(paths),
-
+        "ok": bool(spec),
+        "count": len(paths),
         "routes": {
-            p:
-                sorted(
-                    m.upper()
-                    for m in v
-                    if m.lower()
-                    in {
-                        "get",
-                        "post",
-                        "put",
-                        "patch",
-                        "delete",
-                        "options",
-                        "head",
-                    }
-                )
-
-            for p, v in paths.items()
-
-            if isinstance(v, dict)
+            path: sorted(
+                method.upper()
+                for method in methods
+                if method.lower() in {
+                    "get",
+                    "post",
+                    "put",
+                    "patch",
+                    "delete",
+                    "options",
+                    "head",
+                }
+            )
+            for path, methods in paths.items()
+            if isinstance(methods, dict)
         },
     }
 
@@ -1014,29 +1035,23 @@ async def backend_routes():
 @app.post("/backend-routes/refresh")
 async def refresh_routes():
 
-    spec = await load_openapi(True)
+    spec = await load_openapi(force=True)
 
     return {
-        "ok":
-            bool(spec),
-
-        "count":
-            len(
-                spec.get(
-                    "paths",
-                    {},
-                )
-            ),
+        "ok": bool(spec),
+        "count": len(spec.get("paths", {})),
     }
 
+
+# ============================================================
+# WEATHER / GEOCODING / LOCATION COMPATIBILITY
+# ============================================================
 
 @app.api_route(
     "/arya/weather",
     methods=["GET", "POST"],
 )
-async def arya_weather(
-    request: Request,
-):
+async def arya_weather(request: Request):
 
     return await compat(
         request,
@@ -1048,13 +1063,14 @@ async def arya_weather(
     "/arya/geocode",
     methods=["GET", "POST"],
 )
-async def arya_geocode(
-    request: Request,
-):
+async def arya_geocode(request: Request):
 
     return await compat(
         request,
-        ["/location/resolve"],
+        [
+            "/location/resolve",
+            "/geocode",
+        ],
     )
 
 
@@ -1062,9 +1078,31 @@ async def arya_geocode(
     "/arya/location/resolve",
     methods=["GET", "POST"],
 )
-async def arya_location(
-    request: Request,
-):
+async def arya_location(request: Request):
+
+    return await compat(
+        request,
+        ["/location/resolve"],
+    )
+
+
+@app.api_route(
+    "/weather",
+    methods=["GET"],
+)
+async def weather_get_compat(request: Request):
+
+    return await compat(
+        request,
+        ["/weather"],
+    )
+
+
+@app.api_route(
+    "/location/resolve",
+    methods=["GET"],
+)
+async def location_get_compat(request: Request):
 
     return await compat(
         request,
@@ -1073,124 +1111,66 @@ async def arya_location(
 
 
 # ============================================================
-# REAL SPECIALIST AI ROUTES
+# SPECIALIST AI ROUTES
 # ============================================================
 
-@app.api_route(
-    "/arya/doctor",
-    methods=["POST"],
-)
-async def arya_doctor(
-    request: Request,
-):
+@app.post("/arya/doctor")
+async def arya_doctor(request: Request):
 
-    return await ai_analyze_compat(
-        request
-    )
+    return await ai_analyze_compat(request)
 
 
-@app.api_route(
-    "/arya/diagnose",
-    methods=["POST"],
-)
-async def arya_diagnose(
-    request: Request,
-):
+@app.post("/arya/diagnose")
+async def arya_diagnose(request: Request):
 
-    return await ai_analyze_compat(
-        request
-    )
+    return await ai_analyze_compat(request)
 
 
-@app.api_route(
-    "/arya/analyze",
-    methods=["POST"],
-)
-async def arya_analyze(
-    request: Request,
-):
+@app.post("/arya/analyze")
+async def arya_analyze(request: Request):
 
-    return await ai_analyze_compat(
-        request
-    )
+    return await ai_analyze_compat(request)
 
 
-@app.api_route(
-    "/ai/analyze",
-    methods=["POST"],
-)
-async def direct_ai_analyze(
-    request: Request,
-):
+@app.post("/ai/analyze")
+async def direct_ai_analyze(request: Request):
 
-    return await ai_analyze_compat(
-        request
-    )
+    return await ai_analyze_compat(request)
 
 
 # ============================================================
 # LEGACY MOBILE AI COMPATIBILITY
 # ============================================================
 
-@app.api_route(
-    "/ai/ask",
-    methods=["POST"],
-)
-async def legacy_ai_ask(
-    request: Request,
-):
+@app.post("/ai/ask")
+async def legacy_ai_ask(request: Request):
 
-    return await ai_analyze_compat(
-        request
-    )
+    return await ai_analyze_compat(request)
 
 
-@app.api_route(
-    "/ask",
-    methods=["POST"],
-)
-async def legacy_ask(
-    request: Request,
-):
+@app.post("/ask")
+async def legacy_ask(request: Request):
 
-    return await ai_analyze_compat(
-        request
-    )
+    return await ai_analyze_compat(request)
 
 
-@app.api_route(
-    "/analyze",
-    methods=["POST"],
-)
-async def legacy_analyze(
-    request: Request,
-):
+@app.post("/analyze")
+async def legacy_analyze(request: Request):
 
-    return await ai_analyze_compat(
-        request
-    )
+    return await ai_analyze_compat(request)
 
 
-@app.api_route(
-    "/agri/analyze",
-    methods=["POST"],
-)
-async def legacy_agri_analyze(
-    request: Request,
-):
+@app.post("/agri/analyze")
+async def legacy_agri_analyze(request: Request):
 
-    return await ai_analyze_compat(
-        request
-    )
+    return await ai_analyze_compat(request)
 
 
 @app.api_route(
     "/arya/recommend",
     methods=["GET", "POST"],
 )
-async def arya_recommend(
-    request: Request,
-):
+async def arya_recommend(request: Request):
 
     return await compat(
         request,
@@ -1202,6 +1182,10 @@ async def arya_recommend(
         ],
     )
 
+
+# ============================================================
+# CENTRAL API PROXY
+# ============================================================
 
 @app.api_route(
     "/api/{path:path}",
@@ -1220,9 +1204,7 @@ async def api_proxy(
     request: Request,
 ):
 
-    stats[
-        f"/api/{path}"
-    ] += 1
+    stats[f"/api/{path}"] += 1
 
     return await passthrough(
         request,
@@ -1247,9 +1229,7 @@ async def backend_proxy(
     request: Request,
 ):
 
-    stats[
-        f"/backend/{path}"
-    ] += 1
+    stats[f"/backend/{path}"] += 1
 
     return await passthrough(
         request,
@@ -1274,28 +1254,21 @@ async def internal_proxy(
     request: Request,
 ):
 
-    body = await request.body()
+    try:
+        body = await read_limited_body(request)
+    except HTTPException as exc:
+        return http_exception_response(exc)
 
     if (
         REQUIRE_SIGNATURE
-        and not verify_signature(
-            request,
-            body,
-        )
+        and not verify_signature(request, body)
     ):
-
-        return JSONResponse(
+        return error_response(
             401,
-            {
-                "ok": False,
-                "error":
-                    "invalid_internal_signature",
-            },
+            "invalid_internal_signature",
         )
 
-    stats[
-        f"/internal/{path}"
-    ] += 1
+    stats[f"/internal/{path}"] += 1
 
     return await passthrough(
         request,
@@ -1311,41 +1284,36 @@ async def passthrough(
 ) -> Response:
 
     if body is None:
-        body = await request.body()
+        try:
+            body = await read_limited_body(request)
+        except HTTPException as exc:
+            return http_exception_response(exc)
 
-    response = await call_backend(
-        request.method,
-        path,
-        body=body,
-        query=list(
-            request.query_params.multi_items()
-        ),
-        headers=safe_headers(
-            request.headers
-        ),
-        retry=request.method
-        in {
-            "GET",
-            "HEAD",
-            "OPTIONS",
-        },
-    )
+    headers = safe_headers(request.headers)
 
-    headers = safe_headers(
-        response.headers
-    )
+    try:
+        response = await call_backend(
+            request.method,
+            path,
+            body=body,
+            query=list(request.query_params.multi_items()),
+            headers=headers,
+            retry=request.method.upper() in {
+                "GET",
+                "HEAD",
+                "OPTIONS",
+            },
+        )
 
-    media_type = response.headers.get(
-        "content-type"
-    )
+        return response_from_backend(response)
 
-    return Response(
-        content=response.content,
-        status_code=response.status_code,
-        headers=headers,
-        media_type=media_type,
-    )
+    except HTTPException as exc:
+        return http_exception_response(exc)
 
+
+# ============================================================
+# SERVICES / PROVIDERS
+# ============================================================
 
 @app.get("/services")
 async def services():
@@ -1354,15 +1322,10 @@ async def services():
 
     return {
         "ok": True,
-        "backend":
-            BACKEND_URL,
-        "routes":
-            sorted(
-                spec.get(
-                    "paths",
-                    {},
-                ).keys()
-            ),
+        "backend": BACKEND_URL,
+        "routes": sorted(
+            spec.get("paths", {}).keys()
+        ),
     }
 
 
@@ -1371,43 +1334,11 @@ async def providers():
 
     return {
         "ok": True,
-
         "providers": {
-            "open_meteo_weather":
-                "backend:/weather",
-
-            "open_meteo_geocoding":
-                "backend:/location/resolve",
+            "open_meteo_weather": "backend:/weather",
+            "open_meteo_geocoding": "backend:/location/resolve",
         },
     }
-
-
-@app.api_route(
-    "/weather",
-    methods=["GET"],
-)
-async def weather_get_compat(
-    request: Request,
-):
-
-    return await compat(
-        request,
-        ["/weather"],
-    )
-
-
-@app.api_route(
-    "/location/resolve",
-    methods=["GET"],
-)
-async def location_get_compat(
-    request: Request,
-):
-
-    return await compat(
-        request,
-        ["/location/resolve"],
-    )
 
 
 @app.api_route(
@@ -1433,89 +1364,92 @@ async def service_compat(
     )
 
 
-@app.api_route(
-    "/orchestrate",
-    methods=["POST"],
-)
-async def orchestrate(
-    request: Request,
-):
+# ============================================================
+# ORCHESTRATION
+# ============================================================
 
-    body = await request.body()
+@app.post("/orchestrate")
+async def orchestrate(request: Request):
 
     try:
+        body = await read_limited_body(request)
+        payload = parse_json_body(body)
+    except HTTPException as exc:
+        return http_exception_response(exc)
 
-        payload = (
-            json.loads(
-                body.decode("utf-8")
-            )
-            if body
-            else {}
+    if not isinstance(payload, dict):
+        return error_response(
+            400,
+            "invalid_payload",
         )
 
-    except Exception:
-
-        payload = {}
-
-    action = (
+    action = str(
         payload.get("action", "")
-        if isinstance(
-            payload,
-            dict,
+    ).strip().lower()
+
+    data = payload.get("data", {})
+
+    if not isinstance(data, dict):
+        return error_response(
+            400,
+            "invalid_data",
         )
-        else ""
-    )
 
-    data = (
-        payload.get("data", {})
-        if isinstance(
-            payload,
-            dict,
+    # Weather and location are GET-based when the backend
+    # OpenAPI specification confirms those methods.
+    if action in {"weather", "location"}:
+
+        candidates = (
+            ["/weather"]
+            if action == "weather"
+            else ["/location/resolve"]
         )
-        else {}
-    )
 
-    candidates = {
+        target = await choose(
+            candidates,
+            "GET",
+        )
 
-        "doctor":
-            ["/ai/analyze"],
+        if not target:
+            return error_response(
+                404,
+                "backend_route_not_found",
+                candidates=candidates,
+                method="GET",
+            )
 
-        "full_diagnosis":
-            ["/ai/analyze"],
+        try:
+            response = await call_backend(
+                "GET",
+                target,
+                query=list(data.items()),
+            )
 
-        "complete_diagnosis":
-            ["/ai/analyze"],
+            return response_from_backend(response)
 
-        "weather":
-            ["/weather"],
+        except HTTPException as exc:
+            return http_exception_response(exc)
 
-        "location":
-            ["/location/resolve"],
+    candidates_by_action = {
+        "doctor": ["/ai/analyze"],
+        "full_diagnosis": ["/ai/analyze"],
+        "complete_diagnosis": ["/ai/analyze"],
+        "analyze": ["/ai/analyze"],
+        "recommend": [
+            "/recommend",
+            "/agri/recommend",
+            "/ai/ask",
+            "/ask",
+        ],
+    }
 
-        "analyze":
-            ["/ai/analyze"],
-
-        "recommend":
-            [
-                "/recommend",
-                "/agri/recommend",
-                "/ai/ask",
-                "/ask",
-            ],
-
-    }.get(action)
+    candidates = candidates_by_action.get(action)
 
     if not candidates:
-
-        return JSONResponse(
+        return error_response(
             404,
-            {
-                "ok": False,
-                "error":
-                    "unknown_action",
-                "action":
-                    action,
-            },
+            "unknown_action",
+            action=action,
         )
 
     target = await choose(
@@ -1524,35 +1458,53 @@ async def orchestrate(
     )
 
     if not target:
-
-        return JSONResponse(
+        return error_response(
             404,
-            {
-                "ok": False,
-                "error":
-                    "backend_route_not_found",
-                "candidates":
-                    candidates,
-            },
+            "backend_route_not_found",
+            candidates=candidates,
+            method="POST",
         )
 
-    return JSONResponse(
-        await json_backend(
+    if action in {
+        "doctor",
+        "full_diagnosis",
+        "complete_diagnosis",
+        "analyze",
+    }:
+        data = normalize_ai_payload(data)
+
+    try:
+        response = await call_backend(
             "POST",
             target,
-            data,
+            body=encode_json(data),
+            headers={
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            retry=False,
         )
-    )
 
+        # Preserve the actual backend status code and headers.
+        return response_from_backend(response)
+
+    except HTTPException as exc:
+        return http_exception_response(exc)
+
+
+# ============================================================
+# STARTUP
+# ============================================================
 
 @app.on_event("startup")
 async def startup():
 
-    await load_openapi(True)
+    await load_openapi(force=True)
 
 
 # ============================================================
 # FINAL FALLBACK
+# Keep this route last so explicit routes take precedence.
 # ============================================================
 
 @app.api_route(
@@ -1577,6 +1529,10 @@ async def final_backend_fallback(
         "/" + path,
     )
 
+
+# ============================================================
+# DIRECT EXECUTION
+# ============================================================
 
 if __name__ == "__main__":
 
