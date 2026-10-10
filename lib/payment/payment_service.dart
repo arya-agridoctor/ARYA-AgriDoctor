@@ -3,6 +3,9 @@ import 'dart:convert';
 import '../core/network/api_client.dart';
 
 class PaymentService {
+  PaymentService._();
+
+  /// دریافت کیف پول‌های فعال.
   static Future<List<Map<String, dynamic>>> getActiveWallets({
     String? currency,
     String? network,
@@ -17,118 +20,191 @@ class PaymentService {
       },
     );
 
-    if (result['ok'] != true) {
-      throw Exception(
-        result['message']?.toString() ??
-            'Could not load payment wallets.',
-      );
+    _ensureSuccess(result, 'دریافت کیف پول‌های فعال ناموفق بود.');
+
+    final rawWallets = result['wallets'] ?? result['data'];
+
+    if (rawWallets is List) {
+      return rawWallets
+          .whereType<Map>()
+          .map((item) => Map<String, dynamic>.from(item))
+          .where(_isValidWallet)
+          .toList();
     }
 
-    final wallets = result['wallets'];
-
-    if (wallets is! List) {
-      return [];
+    // پشتیبانی از پاسخ‌هایی که کیف پول‌ها را داخل data برمی‌گردانند.
+    if (rawWallets is Map && rawWallets['wallets'] is List) {
+      return (rawWallets['wallets'] as List)
+          .whereType<Map>()
+          .map((item) => Map<String, dynamic>.from(item))
+          .where(_isValidWallet)
+          .toList();
     }
 
-    return wallets
-        .whereType<Map>()
-        .map(
-          (item) => Map<String, dynamic>.from(item),
-        )
-        .toList();
+    throw Exception('قالب پاسخ کیف پول‌ها از سرور معتبر نیست.');
   }
 
+  /// ایجاد درخواست پرداخت.
   static Future<Map<String, dynamic>> createPaymentIntent({
     int? userId,
     required String currency,
     required String network,
     required String amount,
   }) async {
+    final normalizedAmount = amount.trim();
+    final parsedAmount = double.tryParse(normalizedAmount);
+
+    if (currency.trim().isEmpty) {
+      throw ArgumentError('ارز پرداخت مشخص نشده است.');
+    }
+
+    if (network.trim().isEmpty) {
+      throw ArgumentError('شبکه پرداخت مشخص نشده است.');
+    }
+
+    if (parsedAmount == null ||
+        !parsedAmount.isFinite ||
+        parsedAmount <= 0) {
+      throw ArgumentError('مبلغ پرداخت معتبر نیست.');
+    }
+
     final result = await ApiClient.post(
       '/wallets/payment-intent',
       body: {
-        'user_id': userId,
-        'currency': currency,
-        'network': network,
-        'amount': amount,
+        if (userId != null) 'user_id': userId,
+        'currency': currency.trim(),
+        'network': network.trim(),
+        'amount': normalizedAmount,
       },
     );
 
-    if (result['ok'] != true) {
-      throw Exception(
-        result['message']?.toString() ??
-            'Could not create payment intent.',
-      );
-    }
+    _ensureSuccess(result, 'ایجاد درخواست پرداخت ناموفق بود.');
 
-    final payment = result['payment'];
-
-    if (payment is Map<String, dynamic>) {
-      return payment;
-    }
-
-    if (payment is Map) {
-      return Map<String, dynamic>.from(payment);
-    }
-
-    throw Exception('Invalid payment response.');
+    return _extractPayment(result);
   }
 
+  /// دریافت آخرین وضعیت درخواست پرداخت.
   static Future<Map<String, dynamic>> getPaymentIntent(
     int paymentId,
   ) async {
+    if (paymentId <= 0) {
+      throw ArgumentError('شناسه پرداخت معتبر نیست.');
+    }
+
     final result = await ApiClient.get(
       '/wallets/payment-intent/$paymentId',
     );
 
-    if (result['ok'] != true) {
+    _ensureSuccess(result, 'دریافت وضعیت پرداخت ناموفق بود.');
+
+    return _extractPayment(result);
+  }
+
+  static void _ensureSuccess(
+    Map<String, dynamic> result,
+    String defaultMessage,
+  ) {
+    if (result['ok'] == false) {
       throw Exception(
-        result['message']?.toString() ??
-            'Could not load payment information.',
+        result['message']?.toString() ?? defaultMessage,
       );
     }
 
-    final payment = result['payment'];
+    final statusCode = result['status_code'];
+    if (statusCode is num && statusCode >= 400) {
+      throw Exception(
+        result['message']?.toString() ?? defaultMessage,
+      );
+    }
+  }
 
-    if (payment is Map<String, dynamic>) {
-      return payment;
+  static Map<String, dynamic> _extractPayment(
+    Map<String, dynamic> result,
+  ) {
+    dynamic payment = result['payment'];
+
+    if (payment == null && result['data'] is Map) {
+      final data = result['data'];
+      payment = data is Map && data.containsKey('payment')
+          ? data['payment']
+          : data;
     }
 
     if (payment is Map) {
-      return Map<String, dynamic>.from(payment);
+      final normalized = Map<String, dynamic>.from(payment);
+
+      if (normalized['payment_id'] == null &&
+          normalized['id'] != null) {
+        normalized['payment_id'] = normalized['id'];
+      }
+
+      return normalized;
     }
 
-    throw Exception('Invalid payment response.');
+    // بعضی APIها خود اطلاعات پرداخت را در ریشه پاسخ می‌دهند.
+    if (result['payment_id'] != null || result['id'] != null) {
+      final normalized = Map<String, dynamic>.from(result);
+
+      if (normalized['payment_id'] == null &&
+          normalized['id'] != null) {
+        normalized['payment_id'] = normalized['id'];
+      }
+
+      return normalized;
+    }
+
+    throw Exception('اطلاعات پرداخت در پاسخ سرور وجود ندارد.');
   }
 
-  static String walletAddress(
-    Map<String, dynamic> payment,
-  ) {
-    return payment['wallet_address']?.toString() ?? '';
+  static bool _isValidWallet(Map<String, dynamic> wallet) {
+    final currency = wallet['currency']?.toString().trim() ?? '';
+    final network = wallet['network']?.toString().trim() ?? '';
+
+    return currency.isNotEmpty && network.isNotEmpty;
   }
 
-  static String currency(
-    Map<String, dynamic> payment,
-  ) {
-    return payment['currency']?.toString() ?? '';
+  static String walletAddress(Map<String, dynamic> payment) {
+    return _firstValue(payment, [
+      'wallet_address',
+      'address',
+      'payment_address',
+    ]);
   }
 
-  static String network(
-    Map<String, dynamic> payment,
-  ) {
-    return payment['network']?.toString() ?? '';
+  static String currency(Map<String, dynamic> payment) {
+    return _firstValue(payment, ['currency', 'asset']);
   }
 
-  static String amount(
-    Map<String, dynamic> payment,
-  ) {
-    return payment['amount']?.toString() ?? '';
+  static String network(Map<String, dynamic> payment) {
+    return _firstValue(payment, ['network', 'network_name']);
   }
 
-  static String status(
-    Map<String, dynamic> payment,
-  ) {
-    return payment['status']?.toString() ?? 'unknown';
+  static String amount(Map<String, dynamic> payment) {
+    return _firstValue(payment, ['amount', 'pay_amount']);
+  }
+
+  static String status(Map<String, dynamic> payment) {
+    return _firstValue(
+      payment,
+      ['status', 'payment_status'],
+      fallback: 'unknown',
+    );
+  }
+
+  static String _firstValue(
+    Map<String, dynamic> data,
+    List<String> keys, {
+    String fallback = '',
+  }) {
+    for (final key in keys) {
+      final value = data[key];
+
+      if (value != null && value.toString().trim().isNotEmpty) {
+        return value.toString();
+      }
+    }
+
+    return fallback;
   }
 
   static String paymentAsJson(
