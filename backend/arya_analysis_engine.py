@@ -1,820 +1,592 @@
 """
 ARYA AgriDoctor
-Advanced Agricultural Analysis Engine
-Version: 1.0.0
+Advanced Analysis Engine Adapter
+Version: 2.1.0
 
-این فایل موتور تحلیل تخصصی ARYA است.
-قابلیت‌های اصلی:
-- تحلیل چندعاملی وضعیت مزرعه/گیاه
-- تحلیل بر اساس محصول، خاک، آب، آب‌وهوا و علائم
-- تشخیص اطلاعات ناقص
-- تعیین سطح اطمینان
-- اولویت‌بندی احتمالات
-- هشدارهای ایمنی
-- پیشنهاد اقدام مرحله‌ای
-- خروجی ساختاریافته برای Backend و AI
+رابط امن بین Backend و موتور تحلیل تخصصی ARYA.
+
+ویژگی‌ها:
+- سازگاری با اجرای ماژول به‌صورت package یا مستقیم
+- نرمال‌سازی ورودی‌ها
+- حفظ خطاهای واقعی موتور
+- جلوگیری از گزارش موفقیت کاذب
+- جلوگیری از افشای traceback در پاسخ عمومی
+- حفظ خروجی ساختاریافته موتور
+- پشتیبانی از درخواست‌های Backend
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-import math
-import re
+import logging
+from typing import Any, Dict, Optional
 
 
-ENGINE_NAME = "ARYA Advanced Agricultural Analysis Engine"
-ENGINE_VERSION = "1.0.0"
+logger = logging.getLogger("arya.analysis.adapter")
 
-
-# ============================================================
-# DATA MODELS
-# ============================================================
-
-@dataclass
-class AnalysisFactor:
-    name: str
-    value: Any
-    weight: float
-    impact: str
-    explanation: str
-
-
-@dataclass
-class Diagnosis:
-    title: str
-    probability: float
-    severity: str
-    evidence: List[str]
-    missing_evidence: List[str]
-    explanation: str
-
-
-@dataclass
-class Recommendation:
-    priority: int
-    action: str
-    reason: str
-    urgency: str
-    caution: Optional[str] = None
+ENGINE_NAME = "ARYA_ANALYSIS_ENGINE"
+ADAPTER_VERSION = "2.1.0"
 
 
 # ============================================================
-# MAIN ENGINE
+# ENGINE IMPORT
 # ============================================================
 
-class AryaAnalysisEngine:
-
-    def __init__(self) -> None:
-        self.name = ENGINE_NAME
-        self.version = ENGINE_VERSION
-
-    # --------------------------------------------------------
-    # PUBLIC API
-    # --------------------------------------------------------
-
-    def analyze(
-        self,
-        *,
-        crop: Optional[str] = None,
-        plant: Optional[str] = None,
-        symptoms: Optional[Any] = None,
-        soil: Optional[Dict[str, Any]] = None,
-        water: Optional[Dict[str, Any]] = None,
-        weather: Optional[Dict[str, Any]] = None,
-        location: Optional[Dict[str, Any]] = None,
-        lab: Optional[Dict[str, Any]] = None,
-        image_description: Optional[str] = None,
-        user_question: Optional[str] = None,
-        extra_data: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-
-        crop_name = self._clean(crop or plant)
-
-        symptom_list = self._normalize_symptoms(symptoms)
-
-        context = {
-            "crop": crop_name,
-            "symptoms": symptom_list,
-            "soil": soil or {},
-            "water": water or {},
-            "weather": weather or {},
-            "location": location or {},
-            "lab": lab or {},
-            "image_description": image_description,
-            "user_question": user_question,
-            "extra_data": extra_data or {},
-        }
-
-        missing = self.detect_missing_information(context)
-
-        factors = self._build_factors(context)
-
-        diagnoses = self._generate_diagnoses(context, factors)
-
-        diagnoses = self._normalize_probabilities(diagnoses)
-
-        recommendations = self._build_recommendations(
-            context,
-            diagnoses,
-            missing,
+try:
+    from .arya_analysis_engine import analyze_agriculture
+except ImportError:
+    try:
+        from arya_analysis_engine import analyze_agriculture
+    except ImportError:
+        logger.exception(
+            "Failed to import ARYA agricultural analysis engine."
         )
+        raise
 
-        warnings = self._build_warnings(context, diagnoses)
 
-        confidence = self._calculate_confidence(
-            context=context,
-            diagnoses=diagnoses,
-            missing=missing,
-        )
+# ============================================================
+# HELPERS
+# ============================================================
 
-        severity = self._overall_severity(diagnoses)
+def _safe_text(value: Any) -> str:
+    if value is None:
+        return ""
 
-        analysis_summary = self._build_summary(
-            context=context,
-            diagnoses=diagnoses,
-            confidence=confidence,
-            missing=missing,
-        )
+    if isinstance(value, str):
+        return value.strip()
 
-        return {
-            "engine": {
-                "name": self.name,
-                "version": self.version,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            },
-            "status": "ok",
-            "crop": crop_name,
-            "summary": analysis_summary,
-            "overall_severity": severity,
-            "confidence": confidence,
-            "factors": [asdict(x) for x in factors],
-            "diagnoses": [asdict(x) for x in diagnoses],
-            "recommendations": [asdict(x) for x in recommendations],
-            "warnings": warnings,
-            "missing_information": missing,
-            "requires_more_data": len(missing) > 0,
-        }
+    try:
+        return str(value).strip()
+    except Exception:
+        return ""
 
-    # ========================================================
-    # INFORMATION QUALITY
-    # ========================================================
 
-    def detect_missing_information(
-        self,
-        context: Dict[str, Any],
-    ) -> List[str]:
+def _as_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
 
-        missing: List[str] = []
+    if value is None:
+        return {}
 
-        if not context.get("crop"):
-            missing.append("نام محصول یا گیاه")
-
-        if not context.get("symptoms"):
-            missing.append("علائم یا مشکل مشاهده‌شده")
-
-        soil = context.get("soil") or {}
-
-        if not soil:
-            missing.append("اطلاعات خاک")
-
-        weather = context.get("weather") or {}
-
-        if not weather:
-            missing.append("اطلاعات آب‌وهوا یا شرایط اقلیمی")
-
-        water = context.get("water") or {}
-
-        if not water:
-            missing.append("اطلاعات آب آبیاری")
-
-        if not context.get("location"):
-            missing.append("موقعیت یا منطقه کشت")
-
-        return missing
-
-    # ========================================================
-    # FACTOR ANALYSIS
-    # ========================================================
-
-    def _build_factors(
-        self,
-        context: Dict[str, Any],
-    ) -> List[AnalysisFactor]:
-
-        factors: List[AnalysisFactor] = []
-
-        crop = context.get("crop")
-
-        if crop:
-            factors.append(
-                AnalysisFactor(
-                    name="crop",
-                    value=crop,
-                    weight=1.0,
-                    impact="high",
-                    explanation="نوع محصول برای تفسیر علائم و شرایط ضروری است.",
-                )
+    if hasattr(value, "model_dump"):
+        try:
+            result = value.model_dump()
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            logger.debug(
+                "model_dump conversion failed.",
+                exc_info=True,
             )
 
-        symptoms = context.get("symptoms") or []
-
-        if symptoms:
-            factors.append(
-                AnalysisFactor(
-                    name="symptoms",
-                    value=symptoms,
-                    weight=1.0,
-                    impact="high",
-                    explanation="علائم مشاهده‌شده مهم‌ترین ورودی اولیه برای تشخیص هستند.",
-                )
+    if hasattr(value, "dict"):
+        try:
+            result = value.dict()
+            if isinstance(result, dict):
+                return result
+        except Exception:
+            logger.debug(
+                "dict conversion failed.",
+                exc_info=True,
             )
 
-        soil = context.get("soil") or {}
-
-        if soil:
-            factors.append(
-                AnalysisFactor(
-                    name="soil",
-                    value=soil,
-                    weight=0.85,
-                    impact="high",
-                    explanation="ویژگی‌های خاک می‌توانند باعث کمبود غذایی، تنش ریشه و اختلال جذب شوند.",
-                )
+    if hasattr(value, "__dict__"):
+        try:
+            return dict(value.__dict__)
+        except Exception:
+            logger.debug(
+                "Object dictionary conversion failed.",
+                exc_info=True,
             )
 
-        water = context.get("water") or {}
+    return {}
 
-        if water:
-            factors.append(
-                AnalysisFactor(
-                    name="water",
-                    value=water,
-                    weight=0.8,
-                    impact="high",
-                    explanation="کیفیت و مقدار آب بر ریشه، شوری و جذب عناصر اثر دارد.",
-                )
-            )
 
-        weather = context.get("weather") or {}
+def _first_value(
+    data: Dict[str, Any],
+    *keys: str,
+) -> Any:
+    for key in keys:
+        if key not in data:
+            continue
 
-        if weather:
-            factors.append(
-                AnalysisFactor(
-                    name="weather",
-                    value=weather,
-                    weight=0.9,
-                    impact="high",
-                    explanation="دما، رطوبت، بارندگی و باد می‌توانند علائم را ایجاد یا تشدید کنند.",
-                )
-            )
-
-        lab = context.get("lab") or {}
-
-        if lab:
-            factors.append(
-                AnalysisFactor(
-                    name="laboratory",
-                    value=lab,
-                    weight=1.2,
-                    impact="very_high",
-                    explanation="نتایج آزمایشگاهی در صورت معتبر بودن می‌توانند تشخیص را بسیار دقیق‌تر کنند.",
-                )
-            )
-
-        return factors
-
-    # ========================================================
-    # DIAGNOSIS
-    # ========================================================
-
-    def _generate_diagnoses(
-        self,
-        context: Dict[str, Any],
-        factors: List[AnalysisFactor],
-    ) -> List[Diagnosis]:
-
-        symptoms = context.get("symptoms") or []
-        text = " ".join(symptoms).lower()
-
-        diagnoses: List[Diagnosis] = []
-
-        # ----------------------------------------------------
-        # WATER STRESS
-        # ----------------------------------------------------
-
-        if self._contains_any(
-            text,
-            [
-                "خشکی",
-                "پژمردگی",
-                "wilting",
-                "dry",
-                "سوختگی",
-            ],
-        ):
-            diagnoses.append(
-                Diagnosis(
-                    title="تنش آبی",
-                    probability=0.68,
-                    severity="medium",
-                    evidence=[
-                        "وجود علائم مرتبط با خشکی یا پژمردگی",
-                    ],
-                    missing_evidence=[
-                        "رطوبت واقعی خاک",
-                        "فاصله آخرین آبیاری",
-                    ],
-                    explanation=(
-                        "علائم می‌توانند با کمبود آب مرتبط باشند، "
-                        "اما قبل از افزایش آبیاری باید وضعیت ریشه و رطوبت خاک بررسی شود."
-                    ),
-                )
-            )
-
-        # ----------------------------------------------------
-        # ROOT / EXCESS WATER
-        # ----------------------------------------------------
-
-        if self._contains_any(
-            text,
-            [
-                "زردی",
-                "yellow",
-                "ریزش برگ",
-                "پوسیدگی",
-                "root rot",
-                "خفگی ریشه",
-            ],
-        ):
-            diagnoses.append(
-                Diagnosis(
-                    title="اختلال ریشه یا زهکشی",
-                    probability=0.58,
-                    severity="medium",
-                    evidence=[
-                        "زردی یا ریزش برگ می‌تواند با اختلال ریشه مرتبط باشد.",
-                    ],
-                    missing_evidence=[
-                        "وضعیت زهکشی",
-                        "رطوبت خاک",
-                        "وضعیت ریشه",
-                    ],
-                    explanation=(
-                        "زردی به‌تنهایی اثبات‌کننده کمبود غذایی نیست؛ "
-                        "مشکل ریشه، آب اضافی و کمبود اکسیژن نیز باید بررسی شوند."
-                    ),
-                )
-            )
-
-        # ----------------------------------------------------
-        # NUTRIENT DEFICIENCY
-        # ----------------------------------------------------
-
-        if self._contains_any(
-            text,
-            [
-                "کمبود",
-                "رنگ‌پریدگی",
-                "کلروز",
-                "chlorosis",
-                "برگ زرد",
-            ],
-        ):
-            diagnoses.append(
-                Diagnosis(
-                    title="احتمال اختلال تغذیه‌ای",
-                    probability=0.52,
-                    severity="medium",
-                    evidence=[
-                        "وجود تغییر رنگ یا علائم مشابه کمبود غذایی",
-                    ],
-                    missing_evidence=[
-                        "آزمایش خاک",
-                        "آزمایش برگ",
-                        "pH خاک",
-                        "EC",
-                    ],
-                    explanation=(
-                        "تشخیص دقیق عنصر غذایی از روی رنگ برگ به‌تنهایی "
-                        "قابل اتکا نیست و باید با خاک، آب و در صورت امکان آزمایش تأیید شود."
-                    ),
-                )
-            )
-
-        # ----------------------------------------------------
-        # PEST / DISEASE
-        # ----------------------------------------------------
-
-        if self._contains_any(
-            text,
-            [
-                "آفت",
-                "حشره",
-                "کرم",
-                "لکه",
-                "قارچ",
-                "بیماری",
-                "سوراخ",
-                "شپشک",
-                "شته",
-            ],
-        ):
-            diagnoses.append(
-                Diagnosis(
-                    title="احتمال آفت یا بیماری",
-                    probability=0.61,
-                    severity="medium",
-                    evidence=[
-                        "وجود علائم ظاهری سازگار با آفت یا بیماری",
-                    ],
-                    missing_evidence=[
-                        "تصویر واضح از اندام آسیب‌دیده",
-                        "توزیع علائم در مزرعه",
-                        "مرحله رشد محصول",
-                    ],
-                    explanation=(
-                        "برای تشخیص قطعی عامل بیماری یا آفت، "
-                        "مشاهده مستقیم یا تصویر باکیفیت و اطلاعات مزرعه لازم است."
-                    ),
-                )
-            )
-
-        # ----------------------------------------------------
-        # GENERAL UNKNOWN
-        # ----------------------------------------------------
-
-        if not diagnoses:
-            diagnoses.append(
-                Diagnosis(
-                    title="علت نامشخص ـ نیازمند داده بیشتر",
-                    probability=0.35,
-                    severity="unknown",
-                    evidence=[],
-                    missing_evidence=[
-                        "شرح دقیق علائم",
-                        "تصویر گیاه",
-                        "اطلاعات خاک",
-                        "اطلاعات آب",
-                        "اطلاعات آب‌وهوا",
-                    ],
-                    explanation=(
-                        "اطلاعات فعلی برای ارائه یک تشخیص تخصصی کافی نیست."
-                    ),
-                )
-            )
-
-        return diagnoses
-
-    # ========================================================
-    # RECOMMENDATIONS
-    # ========================================================
-
-    def _build_recommendations(
-        self,
-        context: Dict[str, Any],
-        diagnoses: List[Diagnosis],
-        missing: List[str],
-    ) -> List[Recommendation]:
-
-        recommendations: List[Recommendation] = []
-
-        if missing:
-            recommendations.append(
-                Recommendation(
-                    priority=1,
-                    action="تکمیل اطلاعات مزرعه و گیاه",
-                    reason=(
-                        "بخشی از داده‌های ضروری برای کاهش خطای تشخیص موجود نیست."
-                    ),
-                    urgency="high",
-                    caution="بدون اطلاعات کافی از مصرف خودسرانه سم یا کود خودداری شود.",
-                )
-            )
-
-        for diagnosis in diagnoses:
-
-            if diagnosis.title == "تنش آبی":
-                recommendations.append(
-                    Recommendation(
-                        priority=2,
-                        action="بررسی رطوبت خاک و وضعیت ریشه پیش از تغییر برنامه آبیاری",
-                        reason="علائم می‌تواند ناشی از تنش آبی باشد.",
-                        urgency="high",
-                        caution="افزایش بی‌دلیل آبیاری ممکن است مشکل ریشه را تشدید کند.",
-                    )
-                )
-
-            elif diagnosis.title == "اختلال ریشه یا زهکشی":
-                recommendations.append(
-                    Recommendation(
-                        priority=2,
-                        action="بررسی زهکشی، رطوبت خاک و وضعیت ریشه",
-                        reason="آب اضافی و اختلال ریشه می‌تواند با زردی و ریزش برگ همراه باشد.",
-                        urgency="high",
-                        caution="قبل از کوددهی سنگین، وضعیت ریشه بررسی شود.",
-                    )
-                )
-
-            elif diagnosis.title == "احتمال اختلال تغذیه‌ای":
-                recommendations.append(
-                    Recommendation(
-                        priority=3,
-                        action="انجام یا بررسی آزمایش خاک و آب",
-                        reason="تشخیص عنصر کمبود بدون داده آزمایشگاهی ممکن است خطا داشته باشد.",
-                        urgency="medium",
-                        caution="از مصرف کود فقط بر اساس رنگ برگ خودداری شود.",
-                    )
-                )
-
-            elif diagnosis.title == "احتمال آفت یا بیماری":
-                recommendations.append(
-                    Recommendation(
-                        priority=2,
-                        action="تهیه تصویر واضح از علائم و بررسی الگوی انتشار",
-                        reason="تشخیص عامل قبل از انتخاب روش کنترل ضروری است.",
-                        urgency="high",
-                        caution="تا مشخص شدن عامل، از سمپاشی کورکورانه خودداری شود.",
-                    )
-                )
-
-        return sorted(
-            recommendations,
-            key=lambda x: x.priority,
-        )
-
-    # ========================================================
-    # WARNINGS
-    # ========================================================
-
-    def _build_warnings(
-        self,
-        context: Dict[str, Any],
-        diagnoses: List[Diagnosis],
-    ) -> List[str]:
-
-        warnings: List[str] = []
-
-        if not context.get("crop"):
-            warnings.append(
-                "نوع محصول مشخص نیست؛ توصیه‌های اختصاصی محصول قابل اعتماد نیستند."
-            )
-
-        if not context.get("symptoms"):
-            warnings.append(
-                "علائم کافی ثبت نشده‌اند؛ تشخیص قطعی امکان‌پذیر نیست."
-            )
-
-        if not context.get("weather"):
-            warnings.append(
-                "اطلاعات آب‌وهوا موجود نیست؛ تحلیل تنش‌های اقلیمی محدود است."
-            )
-
-        if not context.get("lab"):
-            warnings.append(
-                "نتیجه آزمایش خاک/آب ارائه نشده است؛ تشخیص تغذیه‌ای قطعی نیست."
-            )
-
-        warnings.append(
-            "مصرف سم، کود یا ماده شیمیایی باید بر اساس محصول، عامل، دوز مجاز و مقررات منطقه‌ای انجام شود."
-        )
-
-        return warnings
-
-    # ========================================================
-    # CONFIDENCE
-    # ========================================================
-
-    def _calculate_confidence(
-        self,
-        *,
-        context: Dict[str, Any],
-        diagnoses: List[Diagnosis],
-        missing: List[str],
-    ) -> Dict[str, Any]:
-
-        score = 35.0
-
-        if context.get("crop"):
-            score += 10
-
-        if context.get("symptoms"):
-            score += 15
-
-        if context.get("soil"):
-            score += 8
-
-        if context.get("water"):
-            score += 7
-
-        if context.get("weather"):
-            score += 8
-
-        if context.get("location"):
-            score += 5
-
-        if context.get("lab"):
-            score += 15
-
-        if context.get("image_description"):
-            score += 5
-
-        score -= min(len(missing) * 3, 20)
-
-        score = max(0.0, min(score, 95.0))
-
-        if score >= 80:
-            level = "very_high"
-        elif score >= 65:
-            level = "high"
-        elif score >= 45:
-            level = "medium"
-        else:
-            level = "low"
-
-        return {
-            "score": round(score, 2),
-            "level": level,
-            "note": (
-                "این امتیاز اطمینان تحلیلی است و به معنی تشخیص قطعی بیماری نیست."
-            ),
-        }
-
-    # ========================================================
-    # SUMMARY
-    # ========================================================
-
-    def _build_summary(
-        self,
-        *,
-        context: Dict[str, Any],
-        diagnoses: List[Diagnosis],
-        confidence: Dict[str, Any],
-        missing: List[str],
-    ) -> str:
-
-        top = max(
-            diagnoses,
-            key=lambda x: x.probability,
-        )
-
-        crop = context.get("crop") or "محصول نامشخص"
-
-        if missing:
-            return (
-                f"برای {crop}، محتمل‌ترین وضعیت فعلی «{top.title}» "
-                f"است؛ اما به دلیل ناقص بودن داده‌ها، نتیجه مقدماتی است."
-            )
-
-        return (
-            f"برای {crop}، محتمل‌ترین وضعیت «{top.title}» "
-            f"با احتمال تحلیلی {round(top.probability * 100)}٪ است."
-        )
-
-    # ========================================================
-    # SEVERITY
-    # ========================================================
-
-    def _overall_severity(
-        self,
-        diagnoses: List[Diagnosis],
-    ) -> str:
-
-        order = {
-            "unknown": 0,
-            "low": 1,
-            "medium": 2,
-            "high": 3,
-            "critical": 4,
-        }
-
-        if not diagnoses:
-            return "unknown"
-
-        return max(
-            diagnoses,
-            key=lambda x: order.get(x.severity, 0),
-        ).severity
-
-    # ========================================================
-    # NORMALIZATION
-    # ========================================================
-
-    def _normalize_probabilities(
-        self,
-        diagnoses: List[Diagnosis],
-    ) -> List[Diagnosis]:
-
-        total = sum(
-            max(0.01, d.probability)
-            for d in diagnoses
-        )
-
-        if total <= 0:
-            return diagnoses
-
-        for d in diagnoses:
-            d.probability = round(
-                max(0.01, d.probability) / total,
-                4,
-            )
-
-        return diagnoses
-
-    # ========================================================
-    # HELPERS
-    # ========================================================
-
-    @staticmethod
-    def _clean(value: Optional[str]) -> Optional[str]:
+        value = data.get(key)
 
         if value is None:
-            return None
+            continue
 
-        value = str(value).strip()
-
-        if not value:
-            return None
+        if isinstance(value, str) and not value.strip():
+            continue
 
         return value
 
-    @staticmethod
-    def _normalize_symptoms(
-        symptoms: Optional[Any],
-    ) -> List[str]:
+    return None
 
-        if symptoms is None:
-            return []
 
-        if isinstance(symptoms, str):
-            parts = re.split(
-                r"[,،;\n]+",
-                symptoms,
+def _error_result(
+    *,
+    status: str,
+    message: str,
+) -> Dict[str, Any]:
+    return {
+        "ok": False,
+        "engine": ENGINE_NAME,
+        "status": status,
+        "message": message,
+        "adapter": {
+            "name": "ARYA Analysis Adapter",
+            "version": ADAPTER_VERSION,
+        },
+    }
+
+
+# ============================================================
+# CONTEXT NORMALIZATION
+# ============================================================
+
+def _normalize_context(
+    context: Any,
+) -> Dict[str, Any]:
+    data = _as_dict(context)
+
+    normalized: Dict[str, Any] = {}
+
+    normalized["crop"] = _first_value(
+        data,
+        "crop",
+        "crop_name",
+        "plant",
+        "plant_name",
+        "tree",
+        "tree_name",
+        "product",
+        "cultivation",
+    )
+
+    normalized["plant"] = _first_value(
+        data,
+        "plant",
+        "plant_name",
+        "tree",
+        "tree_name",
+        "crop",
+        "crop_name",
+    )
+
+    normalized["symptoms"] = _first_value(
+        data,
+        "symptoms",
+        "symptom",
+        "problem",
+        "problems",
+        "disease_symptoms",
+        "signs",
+        "observations",
+    )
+
+    normalized["soil"] = _first_value(
+        data,
+        "soil",
+        "soil_type",
+        "soil_data",
+        "soil_info",
+    )
+
+    normalized["water"] = _first_value(
+        data,
+        "water",
+        "water_source",
+        "irrigation",
+        "irrigation_data",
+        "water_data",
+    )
+
+    normalized["weather"] = _first_value(
+        data,
+        "weather",
+        "weather_data",
+        "climate",
+        "climate_data",
+    )
+
+    normalized["location"] = _first_value(
+        data,
+        "location",
+        "location_data",
+        "gps",
+        "coordinates",
+        "address",
+        "region",
+        "province",
+        "city",
+        "country",
+    )
+
+    normalized["lab"] = _first_value(
+        data,
+        "lab",
+        "lab_test",
+        "lab_tests",
+        "soil_lab",
+        "soil_lab_test",
+        "soil_lab_tests",
+        "laboratory",
+    )
+
+    normalized["image_description"] = _first_value(
+        data,
+        "image_description",
+        "image_analysis",
+        "image_result",
+        "photo_description",
+        "vision_result",
+    )
+
+    normalized["user_question"] = _first_value(
+        data,
+        "user_question",
+        "question",
+        "prompt",
+        "query",
+        "message",
+    )
+
+    normalized["language"] = _first_value(
+        data,
+        "language",
+        "lang",
+        "user_language",
+    )
+
+    normalized["additional_information"] = _first_value(
+        data,
+        "additional_information",
+        "additional_info",
+        "extra",
+        "notes",
+        "description",
+    )
+
+    normalized["raw_context"] = data
+
+    return normalized
+
+
+# ============================================================
+# MAIN ANALYSIS
+# ============================================================
+
+def run_analysis(
+    prompt: str = "",
+    context: Optional[Dict[str, Any]] = None,
+    language: str = "fa",
+) -> Dict[str, Any]:
+    try:
+        normalized = _normalize_context(context)
+
+        prompt_text = _safe_text(prompt)
+
+        user_question = (
+            normalized.get("user_question")
+            or prompt_text
+            or None
+        )
+
+        effective_language = (
+            _safe_text(language)
+            or _safe_text(normalized.get("language"))
+            or "fa"
+        )
+
+        extra_data = {
+            "language": effective_language,
+            "additional_information": normalized.get(
+                "additional_information"
+            ),
+            "raw_context": normalized.get(
+                "raw_context",
+                {},
+            ),
+        }
+
+        result = analyze_agriculture(
+            crop=normalized.get("crop"),
+            plant=normalized.get("plant"),
+            symptoms=normalized.get("symptoms"),
+            soil=normalized.get("soil"),
+            water=normalized.get("water"),
+            weather=normalized.get("weather"),
+            location=normalized.get("location"),
+            lab=normalized.get("lab"),
+            image_description=normalized.get(
+                "image_description"
+            ),
+            user_question=user_question,
+            extra_data=extra_data,
+        )
+
+        if result is None:
+            logger.error(
+                "Analysis engine returned None."
             )
 
-            return [
-                p.strip()
-                for p in parts
-                if p.strip()
-            ]
+            return _error_result(
+                status="empty_result",
+                message="موتور تحلیل نتیجه‌ای برنگرداند.",
+            )
 
-        if isinstance(symptoms, list):
-            return [
-                str(x).strip()
-                for x in symptoms
-                if str(x).strip()
-            ]
+        if not isinstance(result, dict):
+            logger.error(
+                "Analysis engine returned unsupported type: %s",
+                type(result).__name__,
+            )
 
-        return [str(symptoms).strip()]
+            return _error_result(
+                status="invalid_engine_result",
+                message="ساختار خروجی موتور تحلیل معتبر نیست.",
+            )
 
-    @staticmethod
-    def _contains_any(
-        text: str,
-        words: List[str],
-    ) -> bool:
+        output = dict(result)
 
-        return any(
-            word.lower() in text
-            for word in words
+        # موتور ممکن است خطا را داخل دیکشنری گزارش کند.
+        # در این حالت نباید پاسخ به‌عنوان موفقیت علامت‌گذاری شود.
+        engine_ok = output.get("ok")
+
+        engine_status = _safe_text(
+            output.get("status")
+        ).lower()
+
+        if engine_ok is False:
+            logger.error(
+                "Analysis engine reported failure. Status=%s",
+                engine_status or "unspecified",
+            )
+
+            output["ok"] = False
+
+        elif engine_status in {
+            "error",
+            "failed",
+            "failure",
+            "unhealthy",
+            "invalid_engine_result",
+            "engine_signature_error",
+        }:
+            logger.error(
+                "Analysis engine returned failure status: %s",
+                engine_status,
+            )
+
+            output["ok"] = False
+
+        else:
+            output["ok"] = True
+
+        output.setdefault(
+            "adapter",
+            {
+                "name": "ARYA Analysis Adapter",
+                "version": ADAPTER_VERSION,
+            },
+        )
+
+        return output
+
+    except TypeError:
+        # جزئیات کامل فقط در گزارش سرور ثبت می‌شود.
+        logger.exception(
+            "Analysis engine signature or input type error."
+        )
+
+        return _error_result(
+            status="engine_signature_error",
+            message=(
+                "ورودی تحلیل با ساختار مورد انتظار موتور سازگار نیست."
+            ),
+        )
+
+    except Exception:
+        logger.exception(
+            "Unexpected error while running agricultural analysis."
+        )
+
+        return _error_result(
+            status="analysis_error",
+            message=(
+                "هنگام تحلیل کشاورزی خطایی رخ داد. "
+                "لطفاً دوباره تلاش کنید."
+            ),
         )
 
 
 # ============================================================
-# SINGLETON
+# REQUEST ADAPTER
 # ============================================================
 
-_engine = AryaAnalysisEngine()
-
-
-def analyze_agriculture(
-    *,
-    crop: Optional[str] = None,
-    plant: Optional[str] = None,
-    symptoms: Optional[Any] = None,
-    soil: Optional[Dict[str, Any]] = None,
-    water: Optional[Dict[str, Any]] = None,
-    weather: Optional[Dict[str, Any]] = None,
-    location: Optional[Dict[str, Any]] = None,
-    lab: Optional[Dict[str, Any]] = None,
-    image_description: Optional[str] = None,
-    user_question: Optional[str] = None,
-    extra_data: Optional[Dict[str, Any]] = None,
+def analyze_request(
+    request: Any,
 ) -> Dict[str, Any]:
+    try:
+        data = _as_dict(request)
 
-    return _engine.analyze(
-        crop=crop,
-        plant=plant,
-        symptoms=symptoms,
-        soil=soil,
-        water=water,
-        weather=weather,
-        location=location,
-        lab=lab,
-        image_description=image_description,
-        user_question=user_question,
-        extra_data=extra_data,
-    )
+        prompt = _first_value(
+            data,
+            "prompt",
+            "question",
+            "query",
+            "message",
+            "user_question",
+        )
+
+        language = _first_value(
+            data,
+            "language",
+            "lang",
+            "user_language",
+        ) or "fa"
+
+        context = _first_value(
+            data,
+            "context",
+            "data",
+            "payload",
+            "analysis_context",
+        )
+
+        if not isinstance(context, dict):
+            context = dict(data)
+
+        return run_analysis(
+            prompt=_safe_text(prompt),
+            context=context,
+            language=_safe_text(language) or "fa",
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to adapt incoming analysis request."
+        )
+
+        return _error_result(
+            status="request_adapter_error",
+            message=(
+                "تبدیل درخواست برای موتور تحلیل ناموفق بود."
+            ),
+        )
+
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+def health_check() -> Dict[str, Any]:
+    """
+    آزمون عملکرد موتور با ورودی نمونه.
+    این بررسی یک تحلیل واقعی اجرا می‌کند و صرفاً بررسی import نیست.
+    """
+
+    try:
+        result = analyze_agriculture(
+            crop="گندم",
+            symptoms=[
+                "زرد شدن برگ",
+                "پژمردگی",
+            ],
+            soil={
+                "type": "رسی",
+                "ph": 7.5,
+            },
+            water={
+                "source": "آبیاری",
+            },
+            weather={
+                "temperature": 25,
+                "humidity": 50,
+            },
+            location={
+                "region": "کرمانشاه",
+            },
+            lab={},
+            image_description=None,
+            user_question="بررسی اولیه",
+            extra_data={
+                "language": "fa",
+            },
+        )
+
+        if not isinstance(result, dict):
+            logger.error(
+                "Health check returned invalid engine result."
+            )
+
+            return {
+                "ok": False,
+                "status": "invalid_engine_result",
+                "engine": ENGINE_NAME,
+                "adapter_version": ADAPTER_VERSION,
+            }
+
+        if result.get("ok") is False:
+            return {
+                "ok": False,
+                "status": "engine_reported_failure",
+                "engine": result.get(
+                    "engine",
+                    ENGINE_NAME,
+                ),
+                "adapter_version": ADAPTER_VERSION,
+            }
+
+        engine_status = _safe_text(
+            result.get("status")
+        ).lower()
+
+        if engine_status in {
+            "error",
+            "failed",
+            "failure",
+            "unhealthy",
+        }:
+            return {
+                "ok": False,
+                "status": "engine_reported_failure",
+                "engine": result.get(
+                    "engine",
+                    ENGINE_NAME,
+                ),
+                "adapter_version": ADAPTER_VERSION,
+            }
+
+        return {
+            "ok": True,
+            "status": "healthy",
+            "engine": result.get(
+                "engine",
+                {},
+            ),
+            "result_status": result.get("status"),
+            "adapter_version": ADAPTER_VERSION,
+        }
+
+    except Exception:
+        logger.exception(
+            "ARYA analysis engine health check failed."
+        )
+
+        return {
+            "ok": False,
+            "status": "unhealthy",
+            "engine": ENGINE_NAME,
+            "adapter_version": ADAPTER_VERSION,
+        }
+
+
+# ============================================================
+# COMPATIBILITY ALIASES
+# ============================================================
+
+analyze = run_analysis
+
+analyze_agriculture_request = analyze_request
 
 
 # ============================================================
@@ -822,31 +594,51 @@ def analyze_agriculture(
 # ============================================================
 
 if __name__ == "__main__":
-
-    result = analyze_agriculture(
-        crop="گندم",
-        symptoms=[
-            "زرد شدن برگ",
-            "پژمردگی",
-        ],
-        soil={
-            "type": "رسی",
-            "ph": 7.8,
-        },
-        weather={
-            "temperature": 31,
-            "humidity": 25,
-        },
-        location={
-            "region": "کرمانشاه",
-        },
-    )
-
     import json
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     print(
         json.dumps(
-            result,
+            health_check(),
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+
+    print(
+        json.dumps(
+            run_analysis(
+                prompt=(
+                    "برگ‌های گندم زرد شده و "
+                    "گیاه پژمرده است."
+                ),
+                context={
+                    "crop": "گندم",
+                    "symptoms": [
+                        "زرد شدن برگ",
+                        "پژمردگی",
+                    ],
+                    "soil": {
+                        "type": "رسی",
+                        "ph": 7.8,
+                    },
+                    "water": {
+                        "source": "چاه",
+                    },
+                    "weather": {
+                        "temperature": 31,
+                        "humidity": 25,
+                    },
+                    "location": {
+                        "region": "کرمانشاه",
+                    },
+                },
+                language="fa",
+            ),
             ensure_ascii=False,
             indent=2,
         )
