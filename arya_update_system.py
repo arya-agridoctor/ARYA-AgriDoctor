@@ -577,33 +577,51 @@ def create_backup(
 # ZIP SECURITY
 # ============================================================
 
+
 def validate_zip_member(
     name: str,
 ) -> None:
 
-    if not name:
+    if not name or "\x00" in name:
         raise UpdateError(
             "Invalid ZIP member name"
         )
 
-    if "\x00" in name:
+    # رد کردن جداکننده‌های مسیر ویندوز
+    if "\\" in name:
         raise UpdateError(
-            "NUL byte in ZIP member"
+            f"Backslash in ZIP path rejected: {name}"
         )
 
-    p = PurePosixPath(name)
+    # رد کردن مسیرهای دارای حرف درایو یا نحو جریان جایگزین
+    if ":" in name:
+        raise UpdateError(
+            f"Colon in ZIP path rejected: {name}"
+        )
+
+    # اجازه به / انتهایی برای ورودی پوشه‌ای ZIP
+    raw_name = name[:-1] if name.endswith("/") else name
+
+    if not raw_name:
+        raise UpdateError(
+            "Invalid ZIP member name"
+        )
+
+    raw_parts = raw_name.split("/")
+
+    if any(
+        part in ("", ".", "..")
+        for part in raw_parts
+    ):
+        raise UpdateError(
+            f"Unsafe ZIP path rejected: {name}"
+        )
+
+    p = PurePosixPath(raw_name)
 
     if p.is_absolute():
         raise UpdateError(
             f"Absolute ZIP path rejected: {name}"
-        )
-
-    if any(
-        part in ("", ".", "..")
-        for part in p.parts
-    ):
-        raise UpdateError(
-            f"Unsafe ZIP path rejected: {name}"
         )
 
     if len(p.parts) > 100:
@@ -615,6 +633,7 @@ def validate_zip_member(
         raise UpdateError(
             f"ZIP path too long: {name}"
         )
+
 
 
 def extract_zip_candidate(
