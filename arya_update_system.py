@@ -2005,104 +2005,13 @@ def knowledge_scan(
     """
     Collect scientific sources and create a review report.
 
-    IMPORTANT:
-    This function DOES NOT decide that new information is valid
-    scientific knowledge.
-
-    It DOES NOT modify executable code.
-
-    Human/AI review must determine:
-    - whether knowledge is actually new
-    - whether current knowledge already covers it
-    - whether sources conflict
-    - confidence
-    - whether persistent storage is necessary
-    - affected sections
-    - affected files
-    - estimated change size
-    """
-
-    sources = [
-        fetch_source(url)
-        for url in urls
-    ]
-
-    report_id = uuid.uuid4().hex
-
-    report = {
-        "schema": 1,
-
-        "report_id":
-            report_id,
-
-        "created_at":
-            utc_now(),
-
-        "kind":
-            "scientific_knowledge_review",
-
-        "status":
-            "REVIEW_REQUIRED",
-
-        "sources": [
-            {
-                "url":
-                    source["url"],
-
-                "fetched_at":
-                    source["fetched_at"],
-
-                "status":
-                    source["status"],
-
-                "content_type":
-                    source["content_type"],
-
-                "sha256":
-                    source["sha256"],
-
-                "bytes":
-                    source["bytes"],
-
-                "content_preview":
-                    source["content"][:4000],
-            }
-
-            for source in sources
-        ],
-
-        "review": {
-
-            "new_knowledge":
-                None,
-
-            "current_knowledge_covers_it":
-                None,
-
-            "conflicts":
-                None,
-
-            "confidence":
-                None,
-
-# ============================================================
-# SCIENTIFIC KNOWLEDGE SCAN
-# ============================================================
-
-def knowledge_scan(
-    urls: Sequence[str],
-    notes: Sequence[str],
-) -> Path:
-    """
-    Collect scientific sources and create a review report.
-
-    External scientific content is treated as DATA only.
+    External scientific content is DATA only.
     This function does not validate scientific claims,
     modify executable code, or automatically apply updates.
 
     Individual source failures are recorded so that one
-    unavailable or invalid source does not prevent the
-    remaining sources from being processed.
+    failed source does not prevent other sources from being
+    processed.
     """
 
     if isinstance(urls, (str, bytes)):
@@ -2163,8 +2072,6 @@ def knowledge_scan(
             })
 
         except Exception as exc:
-            # Record the failure without storing a traceback,
-            # credentials, or arbitrary exception details.
             source_reports.append({
                 "url": url,
                 "fetched_at": utc_now(),
@@ -2197,13 +2104,9 @@ def knowledge_scan(
 
     report = {
         "schema": 1,
-
         "report_id": report_id,
-
         "created_at": utc_now(),
-
         "kind": "scientific_knowledge_review",
-
         "status": report_status,
 
         "sources": source_reports,
