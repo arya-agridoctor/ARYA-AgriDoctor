@@ -2085,30 +2085,154 @@ def knowledge_scan(
             "confidence":
                 None,
 
-            "persistent_update_needed":
-                None,
+# ============================================================
+# SCIENTIFIC KNOWLEDGE SCAN
+# ============================================================
 
-            "affected_sections":
-                [],
+def knowledge_scan(
+    urls: Sequence[str],
+    notes: Sequence[str],
+) -> Path:
+    """
+    Collect scientific sources and create a review report.
 
-            "affected_files":
-                [],
+    External scientific content is treated as DATA only.
+    This function does not validate scientific claims,
+    modify executable code, or automatically apply updates.
 
-            "estimated_change_bytes":
-                None,
+    Individual source failures are recorded so that one
+    unavailable or invalid source does not prevent the
+    remaining sources from being processed.
+    """
 
-            "recommended_action":
-                "REVIEW_REQUIRED",
+    if isinstance(urls, (str, bytes)):
+        raise UpdateError(
+            "urls must be a sequence of URL strings"
+        )
+
+    if isinstance(notes, (str, bytes)):
+        raise UpdateError(
+            "notes must be a sequence of strings"
+        )
+
+    try:
+        url_items = list(urls)
+        note_items = list(notes)
+    except (TypeError, ValueError) as exc:
+        raise UpdateError(
+            "Invalid knowledge scan inputs"
+        ) from exc
+
+    if any(
+        not isinstance(url, str) or not url.strip()
+        for url in url_items
+    ):
+        raise UpdateError(
+            "Every source URL must be a non-empty string"
+        )
+
+    if any(
+        not isinstance(note, str)
+        for note in note_items
+    ):
+        raise UpdateError(
+            "Every note must be a string"
+        )
+
+    # Remove duplicate URLs while preserving input order.
+    unique_urls = list(dict.fromkeys(
+        url.strip()
+        for url in url_items
+    ))
+
+    source_reports = []
+
+    for url in unique_urls:
+        try:
+            source = fetch_source(url)
+
+            source_reports.append({
+                "url": source["url"],
+                "fetched_at": source["fetched_at"],
+                "status": source["status"],
+                "content_type": source["content_type"],
+                "sha256": source["sha256"],
+                "bytes": source["bytes"],
+                "content_preview": source["content"][:4000],
+                "fetch_error": None,
+            })
+
+        except Exception as exc:
+            # Record the failure without storing a traceback,
+            # credentials, or arbitrary exception details.
+            source_reports.append({
+                "url": url,
+                "fetched_at": utc_now(),
+                "status": None,
+                "content_type": None,
+                "sha256": None,
+                "bytes": 0,
+                "content_preview": "",
+                "fetch_error": type(exc).__name__,
+            })
+
+    report_id = uuid.uuid4().hex
+
+    successful_count = sum(
+        1
+        for source in source_reports
+        if source["fetch_error"] is None
+    )
+
+    failed_count = (
+        len(source_reports) - successful_count
+    )
+
+    if failed_count == 0:
+        report_status = "REVIEW_REQUIRED"
+    elif successful_count > 0:
+        report_status = "PARTIAL_SOURCE_FAILURE"
+    else:
+        report_status = "SOURCE_FETCH_FAILED"
+
+    report = {
+        "schema": 1,
+
+        "report_id": report_id,
+
+        "created_at": utc_now(),
+
+        "kind": "scientific_knowledge_review",
+
+        "status": report_status,
+
+        "sources": source_reports,
+
+        "source_summary": {
+            "requested": len(url_items),
+            "unique": len(unique_urls),
+            "succeeded": successful_count,
+            "failed": failed_count,
         },
 
-        "notes":
-            list(notes),
+        "review": {
+            "new_knowledge": None,
+            "current_knowledge_covers_it": None,
+            "conflicts": None,
+            "confidence": None,
+            "persistent_update_needed": None,
+            "affected_sections": [],
+            "affected_files": [],
+            "estimated_change_bytes": None,
+            "recommended_action": "REVIEW_REQUIRED",
+        },
 
-        "policy":
-            (
-                "External scientific content is DATA only "
-                "and cannot directly modify or execute ARYA code."
-            ),
+        "notes": note_items,
+
+        "policy": (
+            "External scientific content is DATA only "
+            "and cannot directly modify or execute ARYA code."
+        ),
     }
 
     REPORT_DIR.mkdir(
@@ -2127,7 +2251,6 @@ def knowledge_scan(
     )
 
     return path
-
 
 # ============================================================
 # SAFE OFFLINE SELF TEST
