@@ -1,645 +1,354 @@
+
 """
 ARYA AgriDoctor
-Advanced Analysis Engine Adapter
-Version: 2.1.0
+Analysis Engine Compatibility Bridge
+Version: 1.0.0
 
-رابط امن بین Backend و موتور تحلیل تخصصی ARYA.
+Connects the backend analysis adapter to the existing
+specialized engine in modules/agri_engine.py.
 
-ویژگی‌ها:
-- سازگاری با اجرای ماژول به‌صورت package یا مستقیم
-- نرمال‌سازی ورودی‌ها
-- حفظ خطاهای واقعی موتور
-- جلوگیری از گزارش موفقیت کاذب
-- جلوگیری از افشای traceback در پاسخ عمومی
-- حفظ خروجی ساختاریافته موتور
-- پشتیبانی از درخواست‌های Backend
+This file intentionally does not duplicate the specialist
+engine or its agricultural analysis logic.
 """
 
 from __future__ import annotations
 
-import logging
 from typing import Any, Dict, Optional
+import logging
 
 
-logger = logging.getLogger("arya.analysis.adapter")
+logger = logging.getLogger("arya.analysis.engine_bridge")
 
-ENGINE_NAME = "ARYA_ANALYSIS_ENGINE"
-ADAPTER_VERSION = "2.1.0"
+ENGINE_NAME = "ARYA_AGRI_ENGINE_BRIDGE"
+ENGINE_VERSION = "1.0.0"
 
 
-# ============================================================
-# ENGINE IMPORT
-# ============================================================
+# ------------------------------------------------------------
+# Import the actual specialist engine.
+# Never import this file as its own engine.
+# ------------------------------------------------------------
 
 try:
-    from .arya_analysis_engine import analyze_agriculture
+    from .modules import agri_engine as _specialist_engine
 except ImportError:
     try:
-        from arya_analysis_engine import analyze_agriculture
+        from modules import agri_engine as _specialist_engine
     except ImportError:
         logger.exception(
-            "Failed to import ARYA agricultural analysis engine."
+            "Unable to import backend/modules/agri_engine.py."
         )
         raise
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
-def _safe_text(value: Any) -> str:
-    if value is None:
-        return ""
-
-    if isinstance(value, str):
-        return value.strip()
-
-    try:
-        return str(value).strip()
-    except Exception:
-        return ""
-
-
 def _as_dict(value: Any) -> Dict[str, Any]:
+    """Convert supported mappings and model objects to dictionaries."""
+
     if isinstance(value, dict):
         return dict(value)
 
     if value is None:
         return {}
 
-    if hasattr(value, "model_dump"):
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
         try:
-            result = value.model_dump()
+            result = model_dump()
             if isinstance(result, dict):
                 return result
         except Exception:
-            logger.debug(
-                "model_dump conversion failed.",
-                exc_info=True,
-            )
+            logger.debug("model_dump conversion failed.", exc_info=True)
 
-    if hasattr(value, "dict"):
+    old_dict = getattr(value, "dict", None)
+    if callable(old_dict):
         try:
-            result = value.dict()
+            result = old_dict()
             if isinstance(result, dict):
                 return result
         except Exception:
-            logger.debug(
-                "dict conversion failed.",
-                exc_info=True,
-            )
-
-    if hasattr(value, "__dict__"):
-        try:
-            return dict(value.__dict__)
-        except Exception:
-            logger.debug(
-                "Object dictionary conversion failed.",
-                exc_info=True,
-            )
+            logger.debug("dict conversion failed.", exc_info=True)
 
     return {}
 
 
-def _first_value(
-    data: Dict[str, Any],
-    *keys: str,
-) -> Any:
-    for key in keys:
-        if key not in data:
-            continue
+def _text(value: Any) -> Optional[str]:
+    """Return safe, non-empty text for model fields."""
 
-        value = data.get(key)
+    if isinstance(value, str):
+        value = value.strip()
+        return value or None
 
-        if value is None:
-            continue
-
-        if isinstance(value, str) and not value.strip():
-            continue
-
-        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return str(value)
 
     return None
 
 
-def _error_result(
-    *,
-    status: str,
-    message: str,
+def _first_text(data: Dict[str, Any], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = _text(data.get(key))
+        if value:
+            return value
+    return None
+
+
+def _number(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
+
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    if result != result or result in (float("inf"), float("-inf")):
+        return None
+
+    return result
+
+
+def _context_value(value: Any) -> Dict[str, Any]:
+    """Normalize a context field that may be text or a dictionary."""
+
+    if isinstance(value, dict):
+        return value
+
+    text = _text(value)
+    return {"description": text} if text else {}
+
+
+def analyze_agriculture(
+    crop: Any = None,
+    plant: Any = None,
+    symptoms: Any = None,
+    soil: Any = None,
+    water: Any = None,
+    weather: Any = None,
+    location: Any = None,
+    lab: Any = None,
+    image_description: Any = None,
+    user_question: Any = None,
+    extra_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    """
+    Adapter-compatible entry point for specialist agricultural analysis.
+
+    Raises real engine errors so the calling adapter can report failure
+    instead of incorrectly claiming that analysis succeeded.
+    """
+
+    extra = _as_dict(extra_data)
+    raw_context = _as_dict(extra.get("raw_context"))
+
+    soil_data = _context_value(soil)
+    water_data = _context_value(water)
+    weather_data = _context_value(weather)
+    location_data = _context_value(location)
+    lab_data = _context_value(lab)
+
+    # Preserve original context fields where available.
+    merged = dict(raw_context)
+    merged.update({
+        key: value
+        for key, value in {
+            "crop": crop,
+            "plant": plant,
+            "soil": soil,
+            "water": water,
+            "weather": weather,
+            "location": location,
+            "lab": lab,
+            "image_description": image_description,
+            "symptoms": symptoms,
+        }.items()
+        if value is not None
+    })
+
+    crop_name = (
+        _text(crop)
+        or _text(plant)
+        or _first_text(merged, "crop_name", "plant_name", "tree_name")
+    )
+
+    region = (
+        _first_text(location_data, "region", "province", "state", "city")
+        or _first_text(merged, "region", "province", "city")
+        or _text(location)
+    )
+
+    country = (
+        _first_text(location_data, "country")
+        or _first_text(merged, "country")
+    )
+
+    latitude = _number(
+        location_data.get("latitude", location_data.get("lat"))
+    )
+    longitude = _number(
+        location_data.get("longitude", location_data.get("lon"))
+    )
+
+    soil_type = (
+        _first_text(soil_data, "type", "soil_type", "description")
+        or _first_text(merged, "soil_type")
+    )
+    soil_ph = _number(
+        soil_data.get("ph", soil_data.get("soil_ph"))
+    )
+    if soil_ph is None:
+        soil_ph = _number(merged.get("soil_ph"))
+
+    organic_matter = _number(
+        soil_data.get("organic_matter")
+    )
+
+    temperature = _number(
+        weather_data.get(
+            "temperature_c",
+            weather_data.get(
+                "temperature",
+                weather_data.get("temp"),
+            ),
+        )
+    )
+    rainfall = _number(
+        weather_data.get("rainfall_mm", weather_data.get("rainfall"))
+    )
+
+    water_source = (
+        _first_text(water_data, "source", "water_source", "description")
+        or _first_text(merged, "water_source")
+    )
+    irrigation_type = (
+        _first_text(water_data, "irrigation", "irrigation_type", "method")
+        or _first_text(merged, "irrigation_type")
+    )
+
+    crop_stage = (
+        _first_text(merged, "crop_stage", "growth_stage", "stage")
+    )
+    season = _first_text(merged, "season")
+    planting_date = _first_text(merged, "planting_date")
+
+    # Build a useful question without inventing missing observations.
+    question = (
+        _text(user_question)
+        or _text(merged.get("question"))
+        or _text(merged.get("prompt"))
+        or _text(merged.get("message"))
+    )
+
+    if not question:
+        details = []
+        if crop_name:
+            details.append(f"محصول یا گیاه: {crop_name}")
+        if symptoms is not None:
+            details.append(f"علائم گزارش‌شده: {symptoms}")
+        if image_description is not None:
+            details.append(f"توضیح تصویر: {image_description}")
+        if lab_data:
+            details.append(f"اطلاعات آزمایش: {lab_data}")
+
+        question = (
+            "لطفاً اطلاعات کشاورزی زیر را بررسی کن و عدم قطعیت‌ها "
+            "و داده‌های لازم را مشخص کن: "
+            + ("؛ ".join(details) if details else "ارزیابی اولیه مزرعه")
+        )
+
+    # AnalyzeRequest requires a question of at least three characters.
+    if len(question.strip()) < 3:
+        question = "لطفاً وضعیت کشاورزی را بررسی کن."
+
+    language = (
+        _text(extra.get("language"))
+        or _text(merged.get("language"))
+        or "fa"
+    )
+
+    context_payload = {
+        "country": country,
+        "region": region,
+        "province": _first_text(location_data, "province", "state")
+        or _first_text(merged, "province"),
+        "latitude": latitude,
+        "longitude": longitude,
+        "soil_type": soil_type,
+        "soil_ph": soil_ph,
+        "organic_matter": organic_matter,
+        "irrigation_type": irrigation_type,
+        "water_source": water_source,
+        "season": season,
+        "planting_date": planting_date,
+        "temperature_c": temperature,
+        "rainfall_mm": rainfall,
+        "crop": crop_name,
+        "crop_stage": crop_stage,
+    }
+
+    # Pydantic model fields may reject unknown values; pass only
+    # the declared FarmContext fields above.
+    farm_context = _specialist_engine.FarmContext(**context_payload)
+    request = _specialist_engine.AnalyzeRequest(
+        context=farm_context,
+        question=question,
+        language=language,
+    )
+
+    # Ensure SQLite tables exist before the engine queries them.
+    _specialist_engine.init_db()
+
+    result = _specialist_engine.analyze_farm(request)
+
+    if not isinstance(result, dict):
+        logger.error(
+            "Specialist engine returned unsupported result type: %s",
+            type(result).__name__,
+        )
+        raise TypeError("Specialist engine returned an invalid result.")
+
+    status = str(result.get("status", "")).strip().lower()
+    if status in {
+        "error",
+        "failed",
+        "failure",
+        "unhealthy",
+        "invalid_engine_result",
+    }:
+        return {
+            **result,
+            "ok": False,
+            "engine": ENGINE_NAME,
+            "engine_version": ENGINE_VERSION,
+        }
+
     return {
-        "ok": False,
+        **result,
+        "ok": True,
         "engine": ENGINE_NAME,
-        "status": status,
-        "message": message,
-        "adapter": {
-            "name": "ARYA Analysis Adapter",
-            "version": ADAPTER_VERSION,
-        },
+        "engine_version": ENGINE_VERSION,
     }
 
 
-# ============================================================
-# CONTEXT NORMALIZATION
-# ============================================================
-
-def _normalize_context(
-    context: Any,
-) -> Dict[str, Any]:
-    data = _as_dict(context)
-
-    normalized: Dict[str, Any] = {}
-
-    normalized["crop"] = _first_value(
-        data,
-        "crop",
-        "crop_name",
-        "plant",
-        "plant_name",
-        "tree",
-        "tree_name",
-        "product",
-        "cultivation",
-    )
-
-    normalized["plant"] = _first_value(
-        data,
-        "plant",
-        "plant_name",
-        "tree",
-        "tree_name",
-        "crop",
-        "crop_name",
-    )
-
-    normalized["symptoms"] = _first_value(
-        data,
-        "symptoms",
-        "symptom",
-        "problem",
-        "problems",
-        "disease_symptoms",
-        "signs",
-        "observations",
-    )
-
-    normalized["soil"] = _first_value(
-        data,
-        "soil",
-        "soil_type",
-        "soil_data",
-        "soil_info",
-    )
-
-    normalized["water"] = _first_value(
-        data,
-        "water",
-        "water_source",
-        "irrigation",
-        "irrigation_data",
-        "water_data",
-    )
-
-    normalized["weather"] = _first_value(
-        data,
-        "weather",
-        "weather_data",
-        "climate",
-        "climate_data",
-    )
-
-    normalized["location"] = _first_value(
-        data,
-        "location",
-        "location_data",
-        "gps",
-        "coordinates",
-        "address",
-        "region",
-        "province",
-        "city",
-        "country",
-    )
-
-    normalized["lab"] = _first_value(
-        data,
-        "lab",
-        "lab_test",
-        "lab_tests",
-        "soil_lab",
-        "soil_lab_test",
-        "soil_lab_tests",
-        "laboratory",
-    )
-
-    normalized["image_description"] = _first_value(
-        data,
-        "image_description",
-        "image_analysis",
-        "image_result",
-        "photo_description",
-        "vision_result",
-    )
-
-    normalized["user_question"] = _first_value(
-        data,
-        "user_question",
-        "question",
-        "prompt",
-        "query",
-        "message",
-    )
-
-    normalized["language"] = _first_value(
-        data,
-        "language",
-        "lang",
-        "user_language",
-    )
-
-    normalized["additional_information"] = _first_value(
-        data,
-        "additional_information",
-        "additional_info",
-        "extra",
-        "notes",
-        "description",
-    )
-
-    normalized["raw_context"] = data
-
-    return normalized
-
-
-# ============================================================
-# MAIN ANALYSIS
-# ============================================================
-
-def run_analysis(
-    prompt: str = "",
-    context: Optional[Dict[str, Any]] = None,
-    language: str = "fa",
-) -> Dict[str, Any]:
-    try:
-        normalized = _normalize_context(context)
-
-        prompt_text = _safe_text(prompt)
-
-        user_question = (
-            normalized.get("user_question")
-            or prompt_text
-            or None
-        )
-
-        effective_language = (
-            _safe_text(language)
-            or _safe_text(normalized.get("language"))
-            or "fa"
-        )
-
-        extra_data = {
-            "language": effective_language,
-            "additional_information": normalized.get(
-                "additional_information"
-            ),
-            "raw_context": normalized.get(
-                "raw_context",
-                {},
-            ),
-        }
-
-        result = analyze_agriculture(
-            crop=normalized.get("crop"),
-            plant=normalized.get("plant"),
-            symptoms=normalized.get("symptoms"),
-            soil=normalized.get("soil"),
-            water=normalized.get("water"),
-            weather=normalized.get("weather"),
-            location=normalized.get("location"),
-            lab=normalized.get("lab"),
-            image_description=normalized.get(
-                "image_description"
-            ),
-            user_question=user_question,
-            extra_data=extra_data,
-        )
-
-        if result is None:
-            logger.error(
-                "Analysis engine returned None."
-            )
-
-            return _error_result(
-                status="empty_result",
-                message="موتور تحلیل نتیجه‌ای برنگرداند.",
-            )
-
-        if not isinstance(result, dict):
-            logger.error(
-                "Analysis engine returned unsupported type: %s",
-                type(result).__name__,
-            )
-
-            return _error_result(
-                status="invalid_engine_result",
-                message="ساختار خروجی موتور تحلیل معتبر نیست.",
-            )
-
-        output = dict(result)
-
-        # موتور ممکن است خطا را داخل دیکشنری گزارش کند.
-        # در این حالت نباید پاسخ به‌عنوان موفقیت علامت‌گذاری شود.
-        engine_ok = output.get("ok")
-
-        engine_status = _safe_text(
-            output.get("status")
-        ).lower()
-
-        if engine_ok is False:
-            logger.error(
-                "Analysis engine reported failure. Status=%s",
-                engine_status or "unspecified",
-            )
-
-            output["ok"] = False
-
-        elif engine_status in {
-            "error",
-            "failed",
-            "failure",
-            "unhealthy",
-            "invalid_engine_result",
-            "engine_signature_error",
-        }:
-            logger.error(
-                "Analysis engine returned failure status: %s",
-                engine_status,
-            )
-
-            output["ok"] = False
-
-        else:
-            output["ok"] = True
-
-        output.setdefault(
-            "adapter",
-            {
-                "name": "ARYA Analysis Adapter",
-                "version": ADAPTER_VERSION,
-            },
-        )
-
-        return output
-
-    except TypeError:
-        # جزئیات کامل فقط در گزارش سرور ثبت می‌شود.
-        logger.exception(
-            "Analysis engine signature or input type error."
-        )
-
-        return _error_result(
-            status="engine_signature_error",
-            message=(
-                "ورودی تحلیل با ساختار مورد انتظار موتور سازگار نیست."
-            ),
-        )
-
-    except Exception:
-        logger.exception(
-            "Unexpected error while running agricultural analysis."
-        )
-
-        return _error_result(
-            status="analysis_error",
-            message=(
-                "هنگام تحلیل کشاورزی خطایی رخ داد. "
-                "لطفاً دوباره تلاش کنید."
-            ),
-        )
-
-
-# ============================================================
-# REQUEST ADAPTER
-# ============================================================
-
-def analyze_request(
-    request: Any,
-) -> Dict[str, Any]:
-    try:
-        data = _as_dict(request)
-
-        prompt = _first_value(
-            data,
-            "prompt",
-            "question",
-            "query",
-            "message",
-            "user_question",
-        )
-
-        language = _first_value(
-            data,
-            "language",
-            "lang",
-            "user_language",
-        ) or "fa"
-
-        context = _first_value(
-            data,
-            "context",
-            "data",
-            "payload",
-            "analysis_context",
-        )
-
-        if not isinstance(context, dict):
-            context = dict(data)
-
-        return run_analysis(
-            prompt=_safe_text(prompt),
-            context=context,
-            language=_safe_text(language) or "fa",
-        )
-
-    except Exception:
-        logger.exception(
-            "Failed to adapt incoming analysis request."
-        )
-
-        return _error_result(
-            status="request_adapter_error",
-            message=(
-                "تبدیل درخواست برای موتور تحلیل ناموفق بود."
-            ),
-        )
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
 def health_check() -> Dict[str, Any]:
-    """
-    آزمون عملکرد موتور با ورودی نمونه.
-    این بررسی یک تحلیل واقعی اجرا می‌کند و صرفاً بررسی import نیست.
-    """
+    """Check that the specialist engine can be imported and initialized."""
 
     try:
-        result = analyze_agriculture(
-            crop="گندم",
-            symptoms=[
-                "زرد شدن برگ",
-                "پژمردگی",
-            ],
-            soil={
-                "type": "رسی",
-                "ph": 7.5,
-            },
-            water={
-                "source": "آبیاری",
-            },
-            weather={
-                "temperature": 25,
-                "humidity": 50,
-            },
-            location={
-                "region": "کرمانشاه",
-            },
-            lab={},
-            image_description=None,
-            user_question="بررسی اولیه",
-            extra_data={
-                "language": "fa",
-            },
-        )
-
-        if not isinstance(result, dict):
-            logger.error(
-                "Health check returned invalid engine result."
-            )
-
-            return {
-                "ok": False,
-                "status": "invalid_engine_result",
-                "engine": ENGINE_NAME,
-                "adapter_version": ADAPTER_VERSION,
-            }
-
-        if result.get("ok") is False:
-            return {
-                "ok": False,
-                "status": "engine_reported_failure",
-                "engine": result.get(
-                    "engine",
-                    ENGINE_NAME,
-                ),
-                "adapter_version": ADAPTER_VERSION,
-            }
-
-        engine_status = _safe_text(
-            result.get("status")
-        ).lower()
-
-        if engine_status in {
-            "error",
-            "failed",
-            "failure",
-            "unhealthy",
-        }:
-            return {
-                "ok": False,
-                "status": "engine_reported_failure",
-                "engine": result.get(
-                    "engine",
-                    ENGINE_NAME,
-                ),
-                "adapter_version": ADAPTER_VERSION,
-            }
-
+        _specialist_engine.init_db()
         return {
             "ok": True,
             "status": "healthy",
-            "engine": result.get(
-                "engine",
-                {},
+            "engine": ENGINE_NAME,
+            "engine_version": ENGINE_VERSION,
+            "specialist_engine": getattr(
+                _specialist_engine,
+                "APP_NAME",
+                "ARYA Agri Engine",
             ),
-            "result_status": result.get("status"),
-            "adapter_version": ADAPTER_VERSION,
         }
-
     except Exception:
-        logger.exception(
-            "ARYA analysis engine health check failed."
-        )
-
+        logger.exception("Specialist engine health check failed.")
         return {
             "ok": False,
             "status": "unhealthy",
             "engine": ENGINE_NAME,
-            "adapter_version": ADAPTER_VERSION,
+            "engine_version": ENGINE_VERSION,
         }
-
-
-# ============================================================
-# COMPATIBILITY ALIASES
-# ============================================================
-
-analyze = run_analysis
-
-analyze_agriculture_request = analyze_request
-
-
-# ============================================================
-# LOCAL TEST
-# ============================================================
-
-if __name__ == "__main__":
-    import json
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
-
-    print(
-        json.dumps(
-            health_check(),
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-
-    print(
-        json.dumps(
-            run_analysis(
-                prompt=(
-                    "برگ‌های گندم زرد شده و "
-                    "گیاه پژمرده است."
-                ),
-                context={
-                    "crop": "گندم",
-                    "symptoms": [
-                        "زرد شدن برگ",
-                        "پژمردگی",
-                    ],
-                    "soil": {
-                        "type": "رسی",
-                        "ph": 7.8,
-                    },
-                    "water": {
-                        "source": "چاه",
-                    },
-                    "weather": {
-                        "temperature": 31,
-                        "humidity": 25,
-                    },
-                    "location": {
-                        "region": "کرمانشاه",
-                    },
-                },
-                language="fa",
-            ),
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
