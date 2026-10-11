@@ -651,6 +651,7 @@ def extract_zip_candidate(
         parents=True,
         exist_ok=True,
     )
+
 # ============================================================
 # ZIP SECURITY
 # ============================================================
@@ -658,17 +659,18 @@ def extract_zip_candidate(
 DEFAULT_MAX_ZIP_TOTAL_SIZE = 512 * 1024 * 1024
 DEFAULT_MAX_ZIP_PATH_LENGTH = 4096
 DEFAULT_MAX_ZIP_PATH_DEPTH = 100
+DEFAULT_ZIP_COPY_CHUNK_SIZE = 1024 * 1024
 
 
 def validate_zip_member(
     name: str,
 ) -> None:
     """
-    Validate a ZIP member path before accessing the filesystem.
+    Validate a ZIP member path before filesystem access.
 
-    Rejects absolute paths, traversal, Windows path tricks,
-    malformed components, control characters, and reserved
-    Windows device names.
+    Rejects traversal, absolute paths, Windows path tricks,
+    control characters, reserved device names, and malformed
+    or excessively long paths.
     """
 
     if (
@@ -695,14 +697,17 @@ def validate_zip_member(
             f"Colon in ZIP path rejected: {name!r}"
         )
 
-    # Allow one trailing slash for directory entries.
+    # Only a single trailing slash is allowed for directories.
     raw_name = (
         name[:-1]
         if name.endswith("/")
         else name
     )
 
-    if not raw_name or raw_name.startswith("/"):
+    if (
+        not raw_name
+        or raw_name.startswith("/")
+    ):
         raise UpdateError(
             f"Absolute or empty ZIP path rejected: {name!r}"
         )
@@ -722,19 +727,30 @@ def validate_zip_member(
             f"ZIP path too deep: {name!r}"
         )
 
-    for part in parts:
-        if any(ord(char) < 32 for char in part):
-            raise UpdateError(
-                f"Control character in ZIP path: {name!r}"
-            )
-
     reserved_names = {
-        "CON", "PRN", "AUX", "NUL",
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
         *(f"COM{i}" for i in range(1, 10)),
         *(f"LPT{i}" for i in range(1, 10)),
     }
 
     for part in parts:
+        if any(
+            ord(char) < 32
+            for char in part
+        ):
+            raise UpdateError(
+                f"Control character in ZIP path: {name!r}"
+            )
+
+        # Avoid ambiguous names on Windows filesystems.
+        if part.endswith((" ", ".")):
+            raise UpdateError(
+                f"Ambiguous Windows path component: {name!r}"
+            )
+
         base_name = part.split(".", 1)[0].upper()
 
         if base_name in reserved_names:
@@ -749,7 +765,7 @@ def validate_zip_member(
         or ".." in normalized.parts
     ):
         raise UpdateError(
-            f"Unsafe ZIP path rejected: {name!r}"
+            f"Unsafe normalized ZIP path: {name!r}"
         )
 
 
@@ -757,14 +773,20 @@ def extract_zip_candidate(
     zip_path: Path,
 ) -> Path:
     """
-    Extract an update ZIP into a fresh candidate directory.
+    Safely extract a ZIP into a newly created candidate directory.
 
-    Enforces entry-count, per-file, declared-total, and actual
-    extracted-size limits. Rejects special files, symbolic links,
-    duplicate paths, and secret files.
+    Enforces:
+    - Maximum ZIP entry count.
+    - Maximum individual file size.
+    - Maximum declared and actual total extraction size.
+    - Path traversal protection.
+    - Symlink and special-file rejection.
+    - Duplicate and conflicting path rejection.
+    - Secret-file rejection.
+    - Cleanup of partial extraction after any failure.
     """
 
-    zip_path = zip_path.resolve()
+    zip_path = Path(zip_path).resolve()
 
     if not zip_path.is_file():
         raise UpdateError(
@@ -776,13 +798,18 @@ def extract_zip_candidate(
         exist_ok=True,
     )
 
+    if CANDIDATE_DIR.is_symlink():
+        raise UpdateError(
+            "Candidate directory must not be a symlink"
+        )
+
     candidate = (
         CANDIDATE_DIR
         / uuid.uuid4().hex
     )
 
     candidate.mkdir(
-        parents=True,
+        parents=False,
         exist_ok=False,
     )
 
@@ -790,8 +817,9 @@ def extract_zip_candidate(
         with zipfile.ZipFile(
             zip_path,
             "r",
-        ) as z:
-            infos = z.infolist()
+        ) as archive:
+
+            infos = archive.infolist()
 
             if len(infos) > DEFAULT_MAX_ZIP_FILES:
                 raise UpdateError(
@@ -800,35 +828,42 @@ def extract_zip_candidate(
 
             declared_total = 0
             seen_paths = set()
+            entry_types = {}
 
-            # Validate all entries before extracting any of them.
+            # ----------------------------------------
+            # PHASE 1: VALIDATE ALL ENTRIES
+            # ----------------------------------------
+
             for info in infos:
                 name = info.filename
 
                 validate_zip_member(name)
 
-                normalized_name = name.rstrip("/")
+                is_directory = info.is_dir()
 
-                # Prevent duplicate entries and file/directory
-                # collisions after normalizing directory slashes.
-                if normalized_name in seen_paths:
+                normalized_name = name.rstrip("/")
+                collision_key = normalized_name.casefold()
+
+                if collision_key in seen_paths:
                     raise UpdateError(
-                        "Duplicate ZIP entry rejected: "
-                        + name
+                        f"Duplicate ZIP path rejected: {name!r}"
                     )
 
-                seen_paths.add(normalized_name)
+                seen_paths.add(collision_key)
+
+                entry_types[collision_key] = is_directory
 
                 if info.flag_bits & 0x1:
                     raise UpdateError(
-                        "Encrypted ZIP entry rejected: "
-                        + name
+                        f"Encrypted ZIP entry rejected: {name!r}"
                     )
 
-                if info.file_size < 0 or info.compress_size < 0:
+                if (
+                    info.file_size < 0
+                    or info.compress_size < 0
+                ):
                     raise UpdateError(
-                        "Invalid ZIP entry size: "
-                        + name
+                        f"Invalid ZIP entry size: {name!r}"
                     )
 
                 if (
@@ -836,8 +871,7 @@ def extract_zip_candidate(
                     > DEFAULT_MAX_FILE_SIZE
                 ):
                     raise UpdateError(
-                        "Candidate file too large: "
-                        + name
+                        f"ZIP file exceeds size limit: {name!r}"
                     )
 
                 declared_total += info.file_size
@@ -856,36 +890,62 @@ def extract_zip_candidate(
 
                 file_type = stat.S_IFMT(mode)
 
-                if info.is_dir():
+                if is_directory:
                     if (
                         file_type
                         and file_type != stat.S_IFDIR
                     ):
                         raise UpdateError(
-                            "Invalid ZIP directory entry: "
-                            + name
+                            f"Invalid ZIP directory type: {name!r}"
                         )
                 elif (
                     file_type
                     and file_type != stat.S_IFREG
                 ):
                     raise UpdateError(
-                        "ZIP special/symlink entry rejected: "
-                        + name
+                        f"ZIP symlink or special file rejected: {name!r}"
                     )
 
-                if not info.is_dir() and is_secret_rel(name):
+                if (
+                    not is_directory
+                    and is_secret_rel(name)
+                ):
                     raise UpdateError(
-                        "Secret file cannot enter candidate: "
-                        + name
+                        f"Secret file rejected: {name!r}"
                     )
 
-            # Extract only after all entries pass validation.
+            # ----------------------------------------
+            # PHASE 2: REJECT FILE/DIRECTORY COLLISIONS
+            # ----------------------------------------
+
+            for name in entry_types:
+                parts = name.split("/")
+
+                for index in range(1, len(parts)):
+                    parent_key = "/".join(
+                        parts[:index]
+                    ).casefold()
+
+                    if (
+                        parent_key in entry_types
+                        and not entry_types[parent_key]
+                    ):
+                        raise UpdateError(
+                            "ZIP file/directory path collision: "
+                            + name
+                        )
+
+            # ----------------------------------------
+            # PHASE 3: EXTRACT WITH ACTUAL SIZE LIMITS
+            # ----------------------------------------
+
             actual_total = 0
 
             for info in infos:
                 name = info.filename
 
+                # The extraction root is fresh. Resolve every
+                # destination and enforce containment in that root.
                 target = safe_resolve(
                     candidate / Path(name),
                     candidate,
@@ -906,8 +966,8 @@ def extract_zip_candidate(
                 written_for_file = 0
 
                 with (
-                    z.open(info, "r") as src,
-                    target.open("xb") as dst
+                    archive.open(info, "r") as source,
+                    target.open("xb") as destination,
                 ):
                     while True:
                         remaining_file = (
@@ -920,15 +980,15 @@ def extract_zip_candidate(
                             - actual_total
                         )
 
-                        # Read at most one byte beyond a limit
-                        # to detect actual over-limit content.
                         read_limit = min(
                             remaining_file,
                             remaining_total,
-                            1024 * 1024,
+                            DEFAULT_ZIP_COPY_CHUNK_SIZE,
                         )
 
-                        chunk = src.read(
+                        # Read one byte beyond the remaining
+                        # allowance to detect excess actual data.
+                        chunk = source.read(
                             read_limit + 1
                         )
 
@@ -937,31 +997,14 @@ def extract_zip_candidate(
 
                         if len(chunk) > read_limit:
                             raise UpdateError(
-                                "Actual extracted ZIP size exceeds limit: "
+                                "Actual extracted size exceeds limit: "
                                 + name
                             )
 
-                        dst.write(chunk)
+                        destination.write(chunk)
 
                         written_for_file += len(chunk)
                         actual_total += len(chunk)
-
-                        if (
-                            written_for_file
-                            > DEFAULT_MAX_FILE_SIZE
-                        ):
-                            raise UpdateError(
-                                "Extracted file exceeds size limit: "
-                                + name
-                            )
-
-                        if (
-                            actual_total
-                            > DEFAULT_MAX_ZIP_TOTAL_SIZE
-                        ):
-                            raise UpdateError(
-                                "Actual ZIP extraction exceeds total size limit"
-                            )
 
                 if written_for_file != info.file_size:
                     raise UpdateError(
@@ -977,7 +1020,6 @@ def extract_zip_candidate(
             ignore_errors=True,
         )
         raise
-
 
 # ============================================================
 # PYTHON VALIDATION
