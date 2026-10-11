@@ -1896,10 +1896,15 @@ def source_allowed(
 
         host = parsed.hostname.lower().rstrip(".")
 
+        allowed_hosts = (
+            allowed.lower().rstrip(".")
+            for allowed in ALLOWED_SOURCE_HOSTS
+        )
+
         return any(
             host == allowed
             or host.endswith("." + allowed)
-            for allowed in ALLOWED_SOURCE_HOSTS
+            for allowed in allowed_hosts
         )
 
     except (ValueError, AttributeError):
@@ -1927,7 +1932,6 @@ def fetch_source(
 ) -> dict:
 
     if not source_allowed(url):
-
         raise UpdateError(
             "Source host is not allow-listed: "
             + url
@@ -1944,7 +1948,11 @@ def fetch_source(
         method="GET",
     )
 
-    with urllib.request.urlopen(
+    opener = urllib.request.build_opener(
+        _NoRedirectHandler()
+    )
+
+    with opener.open(
         request,
         timeout=timeout,
     ) as response:
@@ -1953,10 +1961,7 @@ def fetch_source(
             2 * 1024 * 1024 + 1
         )
 
-        if len(data) > (
-            2 * 1024 * 1024
-        ):
-
+        if len(data) > 2 * 1024 * 1024:
             raise UpdateError(
                 "Source response too large"
             )
@@ -1976,20 +1981,17 @@ def fetch_source(
                 "status",
                 200,
             ),
-            "content_type":
-                content_type,
-            "sha256":
-                hashlib.sha256(
-                    data
-                ).hexdigest(),
-            "bytes":
-                len(data),
-            "content":
-                data.decode(
-                    "utf-8",
-                    errors="replace",
-                ),
+            "content_type": content_type,
+            "sha256": hashlib.sha256(
+                data
+            ).hexdigest(),
+            "bytes": len(data),
+            "content": data.decode(
+                "utf-8",
+                errors="replace",
+            ),
         }
+
 
 
 # ============================================================
