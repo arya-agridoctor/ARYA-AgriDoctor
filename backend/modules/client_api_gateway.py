@@ -2001,4 +2001,9 @@ async def diagnose(
 ):
     return await authenticated_arya_call(
         "arya/diagnose",
+                "diagnose",
+        payload,
+        request,
+        authorization,
+    )
        
