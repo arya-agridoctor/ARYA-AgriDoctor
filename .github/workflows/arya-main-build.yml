@@ -1,3 +1,4 @@
+
 name: ARYA Main Android Build
 
 on:
@@ -29,32 +30,18 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Verify Flutter project
+      - name: Verify Flutter source
         working-directory: arya_main
         run: |
           set -euo pipefail
-
           test -f pubspec.yaml || {
             echo "ERROR: pubspec.yaml not found."
             exit 1
           }
-
           test -f lib/main.dart || {
             echo "ERROR: lib/main.dart not found."
             exit 1
           }
-
-          test -d android || {
-            echo "ERROR: Android platform directory not found."
-            exit 1
-          }
-
-          test -f android/gradlew || {
-            echo "ERROR: Android Gradle wrapper not found."
-            exit 1
-          }
-
-          echo "ARYA Main Flutter project verified."
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -68,6 +55,22 @@ jobs:
           flutter-version: "3.35.2"
           channel: stable
           cache: true
+
+      - name: Generate Android platform files
+        working-directory: arya_main
+        run: |
+          set -euo pipefail
+          if [ ! -f android/gradlew ]; then
+            echo "Android Gradle wrapper missing; generating Android platform files."
+            flutter create --platforms=android .
+          fi
+
+          if [ ! -f android/gradlew ]; then
+            echo "ERROR: Android Gradle wrapper is still missing."
+            exit 1
+          fi
+
+          chmod +x android/gradlew
 
       - name: Show Flutter version
         run: flutter --version
@@ -88,7 +91,6 @@ jobs:
         working-directory: arya_main
         run: |
           set -euo pipefail
-
           APK="build/app/outputs/flutter-apk/app-debug.apk"
 
           if [ ! -s "$APK" ]; then
