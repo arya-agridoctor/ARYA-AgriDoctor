@@ -1624,4 +1624,119 @@ def runtime_providers(
 @app.get("/internal/service/{service_id}")
 def internal_get_service(
     service_id: str,
-    internal: dict[str, str]
+    internal: dict[str, str] = Depends(require_internal_access),
+) -> dict[str, Any]:
+    service = get_service_config(service_id)
+
+    if service is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Service not found",
+        )
+
+    return {
+        "service": service,
+        "actor": internal["actor"],
+    }
+
+
+@app.get("/internal/provider/{provider_id}")
+def internal_get_provider(
+    provider_id: str,
+    internal: dict[str, str] = Depends(require_internal_access),
+) -> dict[str, Any]:
+    provider = get_provider_config(provider_id)
+
+    if provider is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Provider not found",
+        )
+
+    return {
+        "provider": redact_provider(provider),
+        "actor": internal["actor"],
+    }
+
+
+@app.get("/internal/settings")
+def internal_get_settings(
+    internal: dict[str, str] = Depends(require_internal_access),
+) -> dict[str, Any]:
+    with db_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT setting_key, setting_value, is_secret, updated_at
+            FROM runtime_settings
+            ORDER BY setting_key ASC
+            """
+        ).fetchall()
+
+    settings = []
+
+    for row in rows:
+        is_secret = bool(row["is_secret"])
+
+        settings.append(
+            {
+                "key": row["setting_key"],
+                "value": (
+                    None
+                    if is_secret
+                    else safe_json_loads(
+                        row["setting_value"],
+                        row["setting_value"],
+                    )
+                ),
+                "is_secret": is_secret,
+                "updated_at": row["updated_at"],
+            }
+        )
+
+    return {
+        "settings": settings,
+        "count": len(settings),
+        "actor": internal["actor"],
+    }
+
+
+@app.get("/internal/health")
+def internal_health(
+    internal: dict[str, str] = Depends(require_internal_access),
+) -> dict[str, Any]:
+    try:
+        with db_connection() as connection:
+            connection.execute("SELECT 1").fetchone()
+
+        return {
+            "status": "ok",
+            "service": APP_NAME,
+            "version": APP_VERSION,
+            "database": "ok",
+            "timestamp": utc_now(),
+        }
+
+    except Exception:
+        logger.exception("Internal health check failed")
+
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Internal service is unhealthy",
+        )
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    initialize_database()
+    logger.info("%s v%s started", APP_NAME, APP_VERSION)
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+        log_level=os.getenv("ARYA_OWNER_LOG_LEVEL", "info").lower(),
+    )
