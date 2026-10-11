@@ -1906,6 +1906,21 @@ def source_allowed(
         return False
 
 
+class _NoRedirectHandler(
+    urllib.request.HTTPRedirectHandler
+):
+    def redirect_request(
+        self,
+        req,
+        fp,
+        code,
+        msg,
+        headers,
+        newurl,
+    ):
+        return None
+
+
 def fetch_source(
     url: str,
     timeout: int = 20,
