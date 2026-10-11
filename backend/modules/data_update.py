@@ -1047,3 +1047,951 @@ def is_source_stale(
 
 def next_update_due(
     row: sqlite3.Row,
+) -> Optional[datetime]:
+    last_attempt = parse_datetime(
+        row["last_attempt_at"]
+    )
+
+    if last_attempt is None:
+        return datetime.now(timezone.utc)
+
+    interval_hours = max(
+        1,
+        int(row["update_interval_hours"] or 168),
+    )
+
+    due_at = last_attempt + timedelta(
+        hours=interval_hours
+    )
+
+    if due_at.tzinfo is None:
+        due_at = due_at.replace(
+            tzinfo=timezone.utc
+        )
+
+    return due_at
+
+
+# ============================================================
+# Update Source
+# ============================================================
+
+async def update_source_data(
+    source_id: str,
+    force: bool = False,
+) -> Dict[str, Any]:
+    source = get_source(source_id)
+
+    if source is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Data source not found.",
+        )
+
+    if not bool(source["enabled"]):
+        raise HTTPException(
+            status_code=409,
+            detail="Data source is disabled.",
+        )
+
+    now = datetime.now(timezone.utc)
+    due_at = next_update_due(source)
+
+    if (
+        not force
+        and due_at is not None
+        and now < due_at
+    ):
+        return {
+            "success": True,
+            "skipped": True,
+            "reason": "Update is not due yet.",
+            "source_id": source_id,
+            "next_update_due": due_at.isoformat(),
+        }
+
+    run_id = str(uuid.uuid4())
+    started_at = utc_now()
+
+    connection = get_connection()
+
+    try:
+        connection.execute(
+            """
+            INSERT INTO update_runs (
+                run_id,
+                source_id,
+                started_at,
+                status
+            )
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                run_id,
+                source_id,
+                started_at,
+                "RUNNING",
+            ),
+        )
+
+        connection.execute(
+            """
+            UPDATE data_sources
+            SET last_attempt_at = ?,
+                updated_at = ?
+            WHERE source_id = ?
+            """,
+            (
+                started_at,
+                started_at,
+                source_id,
+            ),
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
+
+    try:
+        response = await fetch_url(
+            source["url"]
+        )
+
+        content = response["content"]
+
+        parsed = parse_content(
+            content,
+            response["content_type"],
+            source["format"],
+        )
+
+        validation = validate_data(parsed)
+
+        if not validation["valid"]:
+            raise ValueError(
+                "; ".join(validation["errors"])
+            )
+
+        content_hash = calculate_hash(content)
+        content_size = len(content)
+        record_count = validation["record_count"]
+        completed_at = utc_now()
+
+        previous_hash = source["last_hash"]
+        version = (
+            str(source["version"] or "0")
+        )
+
+        try:
+            version_number = int(version)
+        except (TypeError, ValueError):
+            version_number = 0
+
+        if previous_hash != content_hash:
+            version_number += 1
+
+        new_version = str(version_number)
+
+        connection = get_connection()
+
+        try:
+            connection.execute(
+                """
+                UPDATE data_versions
+                SET active = 0
+                WHERE source_id = ?
+                """,
+                (source_id,),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO data_versions (
+                    version_id,
+                    source_id,
+                    version,
+                    content_hash,
+                    content_size,
+                    record_count,
+                    received_at,
+                    valid,
+                    active,
+                    metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 1, 1, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    source_id,
+                    new_version,
+                    content_hash,
+                    content_size,
+                    record_count,
+                    completed_at,
+                    json_dumps({
+                        "content_type": response["content_type"],
+                        "elapsed_ms": response["elapsed_ms"],
+                        "changed": previous_hash != content_hash,
+                    }),
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE data_sources
+                SET last_success_at = ?,
+                    last_error = NULL,
+                    last_http_status = ?,
+                    last_hash = ?,
+                    last_size = ?,
+                    record_count = ?,
+                    version = ?,
+                    updated_at = ?
+                WHERE source_id = ?
+                """,
+                (
+                    completed_at,
+                    response["status_code"],
+                    content_hash,
+                    content_size,
+                    record_count,
+                    new_version,
+                    completed_at,
+                    source_id,
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE update_runs
+                SET completed_at = ?,
+                    success = 1,
+                    status = 'SUCCESS',
+                    http_status = ?,
+                    content_hash = ?,
+                    content_size = ?,
+                    record_count = ?,
+                    metadata_json = ?
+                WHERE run_id = ?
+                """,
+                (
+                    completed_at,
+                    response["status_code"],
+                    content_hash,
+                    content_size,
+                    record_count,
+                    json_dumps({
+                        "content_type": response["content_type"],
+                        "elapsed_ms": response["elapsed_ms"],
+                        "changed": previous_hash != content_hash,
+                    }),
+                    run_id,
+                ),
+            )
+
+            connection.commit()
+
+        finally:
+            connection.close()
+
+        log_event(
+            "UPDATE_SUCCESS",
+            "Data source updated successfully.",
+            source_id=source_id,
+            metadata={
+                "run_id": run_id,
+                "version": new_version,
+                "content_hash": content_hash,
+                "record_count": record_count,
+            },
+        )
+
+        return {
+            "success": True,
+            "skipped": False,
+            "run_id": run_id,
+            "source_id": source_id,
+            "version": new_version,
+            "content_hash": content_hash,
+            "content_size": content_size,
+            "record_count": record_count,
+            "http_status": response["status_code"],
+            "completed_at": completed_at,
+            "changed": previous_hash != content_hash,
+        }
+
+    except Exception as exc:
+        completed_at = utc_now()
+        error_message = str(exc)[:4000]
+
+        connection = get_connection()
+
+        try:
+            connection.execute(
+                """
+                UPDATE data_sources
+                SET last_error = ?,
+                    updated_at = ?
+                WHERE source_id = ?
+                """,
+                (
+                    error_message,
+                    completed_at,
+                    source_id,
+                ),
+            )
+
+            connection.execute(
+                """
+                UPDATE update_runs
+                SET completed_at = ?,
+                    success = 0,
+                    status = 'FAILED',
+                    error = ?
+                WHERE run_id = ?
+                """,
+                (
+                    completed_at,
+                    error_message,
+                    run_id,
+                ),
+            )
+
+            connection.commit()
+
+        finally:
+            connection.close()
+
+        log_event(
+            "UPDATE_FAILED",
+            "Data source update failed.",
+            source_id=source_id,
+            severity="ERROR",
+            metadata={
+                "run_id": run_id,
+                "error": error_message,
+            },
+        )
+
+        logger.exception(
+            "Data update failed for source %s",
+            source_id,
+        )
+
+        return {
+            "success": False,
+            "skipped": False,
+            "run_id": run_id,
+            "source_id": source_id,
+            "error": error_message,
+            "completed_at": completed_at,
+        }
+
+
+# ============================================================
+# API: Health
+# ============================================================
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    connection = get_connection()
+
+    try:
+        connection.execute(
+            "SELECT 1"
+        ).fetchone()
+
+        return {
+            "success": True,
+            "service": SERVICE_NAME,
+            "version": SERVICE_VERSION,
+            "database": "ok",
+            "timestamp": utc_now(),
+        }
+
+    finally:
+        connection.close()
+
+
+# ============================================================
+# API: Sources
+# ============================================================
+
+@app.post("/sources", status_code=201)
+def api_register_source(
+    data: SourceCreate,
+) -> Dict[str, Any]:
+    try:
+        return {
+            "success": True,
+            "source": register_source(data),
+        }
+
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=str(exc),
+        ) from exc
+
+
+@app.get("/sources")
+def api_list_sources(
+    category: Optional[str] = None,
+    enabled: Optional[bool] = None,
+) -> Dict[str, Any]:
+    conditions = []
+    parameters: List[Any] = []
+
+    if category is not None:
+        conditions.append("category = ?")
+        parameters.append(category)
+
+    if enabled is not None:
+        conditions.append("enabled = ?")
+        parameters.append(int(enabled))
+
+    sql = "SELECT * FROM data_sources"
+
+    if conditions:
+        sql += " WHERE " + " AND ".join(conditions)
+
+    sql += " ORDER BY priority ASC, name ASC"
+
+    connection = get_connection()
+
+    try:
+        rows = connection.execute(
+            sql,
+            parameters,
+        ).fetchall()
+
+        return {
+            "success": True,
+            "count": len(rows),
+            "sources": [
+                source_to_dict(row)
+                for row in rows
+            ],
+        }
+
+    finally:
+        connection.close()
+
+
+@app.get("/sources/{source_id}")
+def api_get_source(
+    source_id: str,
+) -> Dict[str, Any]:
+    source = get_source(source_id)
+
+    if source is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Data source not found.",
+        )
+
+    return {
+        "success": True,
+        "source": source_to_dict(source),
+        "stale": is_source_stale(source),
+        "next_update_due": (
+            next_update_due(source).isoformat()
+            if next_update_due(source)
+            else None
+        ),
+    }
+
+
+@app.patch("/sources/{source_id}")
+def api_update_source(
+    source_id: str,
+    data: SourceUpdate,
+) -> Dict[str, Any]:
+    current = get_source(source_id)
+
+    if current is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Data source not found.",
+        )
+
+    updates = data.model_dump(
+        exclude_unset=True,
+    )
+
+    if not updates:
+        return {
+            "success": True,
+            "source": source_to_dict(current),
+        }
+
+    if "url" in updates and updates["url"] is not None:
+        try:
+            validate_external_url(updates["url"])
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=str(exc),
+            ) from exc
+
+    if "format" in updates and updates["format"] is not None:
+        updates["format"] = updates["format"].lower()
+
+    if "metadata" in updates:
+        updates["metadata_json"] = json_dumps(
+            updates.pop("metadata") or {}
+        )
+
+    allowed = {
+        "name",
+        "category",
+        "url",
+        "format",
+        "enabled",
+        "trusted",
+        "priority",
+        "update_interval_hours",
+        "stale_after_hours",
+        "metadata_json",
+    }
+
+    updates = {
+        key: value
+        for key, value in updates.items()
+        if key in allowed and value is not None
+    }
+
+    if updates:
+        updates["updated_at"] = utc_now()
+
+        assignments = ", ".join(
+            f"{key} = ?"
+            for key in updates
+        )
+
+        connection = get_connection()
+
+        try:
+            connection.execute(
+                f"""
+                UPDATE data_sources
+                SET {assignments}
+                WHERE source_id = ?
+                """,
+                [
+                    *updates.values(),
+                    source_id,
+                ],
+            )
+
+            connection.commit()
+
+        finally:
+            connection.close()
+
+    updated = get_source(source_id)
+
+    return {
+        "success": True,
+        "source": source_to_dict(updated),
+    }
+
+
+@app.delete("/sources/{source_id}")
+def api_delete_source(
+    source_id: str,
+) -> Dict[str, Any]:
+    source = get_source(source_id)
+
+    if source is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Data source not found.",
+        )
+
+    connection = get_connection()
+
+    try:
+        connection.execute(
+            """
+            DELETE FROM data_sources
+            WHERE source_id = ?
+            """,
+            (source_id,),
+        )
+
+        connection.commit()
+
+    finally:
+        connection.close()
+
+    log_event(
+        "SOURCE_DELETED",
+        "Data source deleted.",
+        source_id=source_id,
+    )
+
+    return {
+        "success": True,
+        "source_id": source_id,
+        "deleted": True,
+    }
+
+
+# ============================================================
+# API: Updates
+# ============================================================
+
+@app.post("/updates/run")
+async def api_run_update(
+    request: FetchRequest,
+) -> Dict[str, Any]:
+    return await update_source_data(
+        request.source_id,
+        force=request.force,
+    )
+
+
+@app.post("/updates/batch")
+async def api_run_batch(
+    request: UpdateBatchRequest,
+) -> Dict[str, Any]:
+    connection = get_connection()
+
+    try:
+        if request.source_ids:
+            placeholders = ",".join(
+                "?" for _ in request.source_ids
+            )
+
+            rows = connection.execute(
+                f"""
+                SELECT source_id
+                FROM data_sources
+                WHERE enabled = 1
+                  AND source_id IN ({placeholders})
+                ORDER BY priority ASC
+                """,
+                request.source_ids,
+            ).fetchall()
+
+        else:
+            rows = connection.execute(
+                """
+                SELECT source_id
+                FROM data_sources
+                WHERE enabled = 1
+                ORDER BY priority ASC
+                """
+            ).fetchall()
+
+        source_ids = [
+            row["source_id"]
+            for row in rows
+        ]
+
+    finally:
+        connection.close()
+
+    results = []
+
+    for source_id in source_ids:
+        result = await update_source_data(
+            source_id,
+            force=request.force,
+        )
+        results.append(result)
+
+    return {
+        "success": all(
+            item.get("success", False)
+            for item in results
+        ),
+        "count": len(results),
+        "results": results,
+    }
+
+
+@app.get("/updates/history")
+def api_update_history(
+    source_id: Optional[str] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    limit = max(
+        1,
+        min(limit, 1000),
+    )
+
+    connection = get_connection()
+
+    try:
+        if source_id:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM update_runs
+                WHERE source_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (source_id, limit),
+            ).fetchall()
+
+        else:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM update_runs
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        runs = []
+
+        for row in rows:
+            item = dict(row)
+            item["success"] = bool(
+                item["success"]
+            )
+            item["metadata"] = json_loads(
+                item.pop("metadata_json", "{}")
+            )
+            runs.append(item)
+
+        return {
+            "success": True,
+            "count": len(runs),
+            "runs": runs,
+        }
+
+    finally:
+        connection.close()
+
+
+# ============================================================
+# API: Versions and Events
+# ============================================================
+
+@app.get("/sources/{source_id}/versions")
+def api_source_versions(
+    source_id: str,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    limit = max(
+        1,
+        min(limit, 1000),
+    )
+
+    connection = get_connection()
+
+    try:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM data_versions
+            WHERE source_id = ?
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (source_id, limit),
+        ).fetchall()
+
+        versions = []
+
+        for row in rows:
+            item = dict(row)
+            item["valid"] = bool(item["valid"])
+            item["active"] = bool(item["active"])
+            item["metadata"] = json_loads(
+                item.pop("metadata_json", "{}")
+            )
+            versions.append(item)
+
+        return {
+            "success": True,
+            "count": len(versions),
+            "versions": versions,
+        }
+
+    finally:
+        connection.close()
+
+
+@app.get("/events")
+def api_events(
+    source_id: Optional[str] = None,
+    limit: int = 100,
+) -> Dict[str, Any]:
+    limit = max(
+        1,
+        min(limit, 1000),
+    )
+
+    connection = get_connection()
+
+    try:
+        if source_id:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM update_events
+                WHERE source_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (source_id, limit),
+            ).fetchall()
+
+        else:
+            rows = connection.execute(
+                """
+                SELECT *
+                FROM update_events
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+
+        events = []
+
+        for row in rows:
+            item = dict(row)
+            item["metadata"] = json_loads(
+                item.pop("metadata_json", "{}")
+            )
+            events.append(item)
+
+        return {
+            "success": True,
+            "count": len(events),
+            "events": events,
+        }
+
+    finally:
+        connection.close()
+
+
+# ============================================================
+# API: Stale Sources and Statistics
+# ============================================================
+
+@app.get("/sources/stale")
+def api_stale_sources() -> Dict[str, Any]:
+    connection = get_connection()
+
+    try:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM data_sources
+            WHERE enabled = 1
+            ORDER BY priority ASC
+            """
+        ).fetchall()
+
+        stale_sources = [
+            source_to_dict(row)
+            for row in rows
+            if is_source_stale(row)
+        ]
+
+        return {
+            "success": True,
+            "count": len(stale_sources),
+            "sources": stale_sources,
+        }
+
+    finally:
+        connection.close()
+
+
+@app.get("/stats")
+def api_stats() -> Dict[str, Any]:
+    connection = get_connection()
+
+    try:
+        sources = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(enabled), 0) AS enabled,
+                COALESCE(SUM(trusted), 0) AS trusted
+            FROM data_sources
+            """
+        ).fetchone()
+
+        runs = connection.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                COALESCE(SUM(success), 0) AS successful
+            FROM update_runs
+            """
+        ).fetchone()
+
+        versions = connection.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM data_versions
+            """
+        ).fetchone()
+
+        events = connection.execute(
+            """
+            SELECT COUNT(*) AS total
+            FROM update_events
+            """
+        ).fetchone()
+
+        return {
+            "success": True,
+            "service": SERVICE_NAME,
+            "version": SERVICE_VERSION,
+            "sources": {
+                "total": sources["total"],
+                "enabled": sources["enabled"],
+                "trusted": sources["trusted"],
+            },
+            "updates": {
+                "total": runs["total"],
+                "successful": runs["successful"],
+                "failed": (
+                    runs["total"] - runs["successful"]
+                ),
+            },
+            "versions": versions["total"],
+            "events": events["total"],
+            "timestamp": utc_now(),
+        }
+
+    finally:
+        connection.close()
+
+
+# ============================================================
+# Startup
+# ============================================================
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    initialize_database()
+
+    logger.info(
+        "%s v%s started",
+        SERVICE_NAME,
+        SERVICE_VERSION,
+    )
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=HOST,
+        port=PORT,
+    )
