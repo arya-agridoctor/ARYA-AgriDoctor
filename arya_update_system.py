@@ -2161,12 +2161,24 @@ def knowledge_scan(
 
 def self_test() -> dict:
     """
-    Offline tests.
+    Offline security and integrity tests.
 
-    Does NOT modify LIVE_ROOT.
+    Does not intentionally modify project files.
+    ZIP extraction is redirected to a temporary test directory.
     """
 
     failures: List[str] = []
+    skipped: List[str] = []
+
+    original_candidate_dir = CANDIDATE_DIR
+
+    def record_exception(
+        name: str,
+        exc: Exception,
+    ) -> None:
+        failures.append(
+            f"{name}: {type(exc).__name__}: {exc}"
+        )
 
     with tempfile.TemporaryDirectory(
         prefix="arya-updater-test-"
@@ -2174,238 +2186,320 @@ def self_test() -> dict:
 
         sandbox = Path(temp_dir)
 
-        live = (
-            sandbox
-            / "live"
-        )
-
-        candidate = (
-            sandbox
-            / "candidate"
-        )
+        live = sandbox / "live"
+        candidate = sandbox / "candidate"
+        symlink_root = sandbox / "symlink-test"
 
         live.mkdir()
         candidate.mkdir()
+        symlink_root.mkdir()
 
         # ----------------------------------------
-        # LIVE PROJECT
+        # LIVE PROJECT FIXTURE
         # ----------------------------------------
 
-        (
-            live
-            / "backend"
-        ).mkdir()
+        protected_file = (
+            live / "backend" / "main.py"
+        )
 
-        (
-            live
-            / "backend"
-            / "main.py"
-        ).write_text(
+        protected_file.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        protected_file.write_text(
             "print('protected')\n",
             encoding="utf-8",
         )
 
-        (
-            live
-            / "app.py"
-        ).write_text(
+        (live / "app.py").write_text(
             "VALUE = 1\n",
             encoding="utf-8",
         )
 
         # ----------------------------------------
-        # CANDIDATE
+        # CANDIDATE FIXTURE
         # ----------------------------------------
 
         (
-            candidate
-            / "backend"
-        ).mkdir()
+            candidate / "backend"
+        ).mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         (
-            candidate
-            / "backend"
-            / "main.py"
+            candidate / "backend" / "main.py"
         ).write_text(
             "print('DO NOT TOUCH')\n",
             encoding="utf-8",
         )
 
-        (
-            candidate
-            / "app.py"
-        ).write_text(
+        (candidate / "app.py").write_text(
             "VALUE = 2\n",
             encoding="utf-8",
         )
 
-        (
-            candidate
-            / "new.txt"
-        ).write_text(
+        (candidate / "new.txt").write_text(
             "new\n",
             encoding="utf-8",
         )
+
+        # Capture the test LIVE tree before running tests.
+        try:
+            original_live_manifest = tree_manifest(live)
+            original_live_digest = tree_digest(
+                original_live_manifest
+            )
+            original_protected_content = (
+                protected_file.read_bytes()
+            )
+        except Exception as exc:
+            record_exception(
+                "live fixture initialization",
+                exc,
+            )
+            original_live_manifest = {}
+            original_live_digest = None
+            original_protected_content = None
 
         # ----------------------------------------
         # MANIFEST TEST
         # ----------------------------------------
 
-        live_manifest = tree_manifest(
-            live
-        )
-
-        candidate_manifest = tree_manifest(
-            candidate
-        )
-
-        if (
-            "backend/main.py"
-            not in live_manifest
-        ):
-
-            failures.append(
-                "live manifest missed protected file"
+        try:
+            live_manifest = tree_manifest(live)
+            candidate_manifest = tree_manifest(
+                candidate
             )
 
-        if (
-            "backend/main.py"
-            not in candidate_manifest
-        ):
+            if "backend/main.py" not in live_manifest:
+                failures.append(
+                    "live manifest missed protected file"
+                )
 
-            failures.append(
-                "candidate manifest missed protected file"
+            if "backend/main.py" not in candidate_manifest:
+                failures.append(
+                    "candidate manifest missed protected file"
+                )
+
+            if "app.py" not in candidate_manifest:
+                failures.append(
+                    "candidate manifest missed app.py"
+                )
+
+        except Exception as exc:
+            record_exception(
+                "manifest test",
+                exc,
             )
-
-        if (
-            "app.py"
-            not in candidate_manifest
-        ):
-
-            failures.append(
-                "candidate manifest missed app.py"
-            )
+            live_manifest = {}
+            candidate_manifest = {}
 
         # ----------------------------------------
         # PROTECTED PATH TEST
         # ----------------------------------------
 
-        if not is_protected_rel(
-            "backend/main.py"
-        ):
+        try:
+            if not is_protected_rel(
+                "backend/main.py"
+            ):
+                failures.append(
+                    "protected path detector failed"
+                )
 
-            failures.append(
-                "protected path detector failed"
-            )
+            if is_protected_rel("app.py"):
+                failures.append(
+                    "false protected path"
+                )
 
-        if is_protected_rel(
-            "app.py"
-        ):
+            if not is_protected_rel(
+                "arya_update_system.py"
+            ):
+                failures.append(
+                    "updater protection check failed"
+                )
 
-            failures.append(
-                "false protected path"
+        except Exception as exc:
+            record_exception(
+                "protected path test",
+                exc,
             )
 
         # ----------------------------------------
-        # SOURCE TEST
+        # SOURCE ALLOW-LIST TEST
         # ----------------------------------------
 
-        if not source_allowed(
-            "https://fao.org/example"
-        ):
+        try:
+            if not source_allowed(
+                "https://fao.org/example"
+            ):
+                failures.append(
+                    "allow-list rejected trusted source"
+                )
 
-            failures.append(
-                "allow-list failed"
-            )
+            if not source_allowed(
+                "https://www.fao.org/example"
+            ):
+                failures.append(
+                    "allow-list rejected trusted subdomain"
+                )
 
-        if source_allowed(
-            "http://fao.org/example"
-        ):
+            if source_allowed(
+                "http://fao.org/example"
+            ):
+                failures.append(
+                    "non-HTTPS source accepted"
+                )
 
-            failures.append(
-                "non-HTTPS source accepted"
-            )
+            if source_allowed(
+                "https://evil.example/fao.org"
+            ):
+                failures.append(
+                    "untrusted source accepted"
+                )
 
-        if source_allowed(
-            "https://evil.example/fao.org"
-        ):
+            if source_allowed(
+                "https://fao.org:8443/example"
+            ):
+                failures.append(
+                    "source using an unexpected port accepted"
+                )
 
-            failures.append(
-                "untrusted source accepted"
+            if source_allowed(
+                "https://user:pass@fao.org/example"
+            ):
+                failures.append(
+                    "source containing URL credentials accepted"
+                )
+
+        except Exception as exc:
+            record_exception(
+                "source allow-list test",
+                exc,
             )
 
         # ----------------------------------------
         # ZIP TRAVERSAL TEST
         # ----------------------------------------
 
-        bad_zip = (
-            sandbox
-            / "bad.zip"
-        )
-
-        with zipfile.ZipFile(
-            bad_zip,
-            "w",
-        ) as z:
-
-            z.writestr(
-                "../escape.txt",
-                "bad",
-            )
+        bad_zip = sandbox / "bad.zip"
+        escape_target = sandbox / "escape.txt"
 
         try:
+            with zipfile.ZipFile(
+                bad_zip,
+                "w",
+            ) as archive:
+                archive.writestr(
+                    "../escape.txt",
+                    "bad",
+                )
 
-            extract_zip_candidate(
-                bad_zip
+            # Redirect extraction away from the real project.
+            test_candidate_dir = (
+                sandbox / "extracted_candidates"
             )
 
-            failures.append(
-                "ZIP traversal was not rejected"
+            CANDIDATE_DIR = test_candidate_dir
+
+            rejected = False
+
+            try:
+                extract_zip_candidate(bad_zip)
+
+            except UpdateError:
+                rejected = True
+
+            except Exception as exc:
+                record_exception(
+                    "ZIP traversal rejection raised an unexpected error",
+                    exc,
+                )
+                rejected = True
+
+            if not rejected:
+                failures.append(
+                    "ZIP traversal was not rejected"
+                )
+
+            if escape_target.exists():
+                failures.append(
+                    "ZIP traversal created a file outside extraction root"
+                )
+
+            if test_candidate_dir.exists():
+                remaining = list(
+                    test_candidate_dir.iterdir()
+                )
+
+                if remaining:
+                    failures.append(
+                        "failed ZIP extraction left candidate artifacts"
+                    )
+
+        except Exception as exc:
+            record_exception(
+                "ZIP traversal test",
+                exc,
             )
 
-        except UpdateError:
-            pass
+        finally:
+            CANDIDATE_DIR = original_candidate_dir
 
         # ----------------------------------------
-        # CANDIDATE ROOT ISOLATION TEST
+        # CANDIDATE ROOT / DIGEST TEST
         # ----------------------------------------
 
-        if (
-            tree_digest(
-                live_manifest
-            )
-            ==
-            tree_digest(
-                candidate_manifest
-            )
-        ):
+        try:
+            if (
+                tree_digest(live_manifest)
+                == tree_digest(candidate_manifest)
+            ):
+                failures.append(
+                    "candidate/live digest unexpectedly identical"
+                )
 
-            failures.append(
-                "candidate/live digest unexpectedly identical"
+            # Confirm the candidate is enumerated relative to
+            # its own root, not relative to LIVE_ROOT.
+            resolved_candidate = candidate.resolve()
+            resolved_live = live.resolve()
+
+            if resolved_candidate == resolved_live:
+                failures.append(
+                    "test candidate unexpectedly aliases live root"
+                )
+
+        except Exception as exc:
+            record_exception(
+                "candidate root isolation test",
+                exc,
             )
 
         # ----------------------------------------
         # SYMLINK TEST
         # ----------------------------------------
 
-        symlink_supported = True
+        symlink_path = (
+            symlink_root / "bad_link"
+        )
 
         try:
-
-            symlink_path = (
-                candidate
-                / "bad_link"
-            )
-
             symlink_path.symlink_to(
-                live / "app.py"
+                protected_file
             )
 
-            try:
+        except (
+            OSError,
+            NotImplementedError,
+        ):
+            skipped.append(
+                "symlink test: symbolic links are unavailable"
+            )
 
-                list(
-                    iter_files(candidate)
-                )
+        else:
+            try:
+                list(iter_files(symlink_root))
 
                 failures.append(
                     "candidate symlink was not rejected"
@@ -2414,47 +2508,100 @@ def self_test() -> dict:
             except UpdateError:
                 pass
 
-        except (
-            OSError,
-            NotImplementedError,
-        ):
-
-            symlink_supported = False
+            except Exception as exc:
+                record_exception(
+                    "symlink test",
+                    exc,
+                )
 
         # ----------------------------------------
         # PYTHON COMPILE TEST
         # ----------------------------------------
 
-        (
-            candidate
-            / "valid.py"
-        ).write_text(
-            "VALUE = 123\n",
-            encoding="utf-8",
-        )
+        valid_python = candidate / "valid.py"
 
-        compile_errors = (
-            validate_python_tree(
+        try:
+            valid_python.write_text(
+                "VALUE = 123\n",
+                encoding="utf-8",
+            )
+
+            compile_errors = validate_python_tree(
                 candidate
             )
-        )
 
-        if compile_errors:
+            if compile_errors:
+                failures.append(
+                    "valid Python file failed compilation: "
+                    + "; ".join(compile_errors)
+                )
 
-            failures.append(
-                "valid Python file failed compilation"
+            # Ensure syntax errors are detected as well.
+            invalid_python = candidate / "invalid.py"
+
+            invalid_python.write_text(
+                "def broken(:\n    pass\n",
+                encoding="utf-8",
+            )
+
+            invalid_errors = validate_python_tree(
+                candidate
+            )
+
+            if not any(
+                error.startswith("invalid.py:")
+                for error in invalid_errors
+            ):
+                failures.append(
+                    "invalid Python syntax was not detected"
+                )
+
+        except Exception as exc:
+            record_exception(
+                "Python compile test",
+                exc,
+            )
+
+        # ----------------------------------------
+        # LIVE TREE INTEGRITY TEST
+        # ----------------------------------------
+
+        try:
+            final_live_manifest = tree_manifest(live)
+            final_live_digest = tree_digest(
+                final_live_manifest
+            )
+
+            if (
+                original_live_digest is not None
+                and final_live_digest != original_live_digest
+            ):
+                failures.append(
+                    "self-test modified the test LIVE tree"
+                )
+
+            if (
+                original_protected_content is not None
+                and protected_file.read_bytes()
+                != original_protected_content
+            ):
+                failures.append(
+                    "protected file content changed during self-test"
+                )
+
+        except Exception as exc:
+            record_exception(
+                "live tree integrity test",
+                exc,
             )
 
     return {
-        "ok":
-            not failures,
-
-        "version":
-            VERSION,
-
-        "failures":
-            failures,
+        "ok": not failures,
+        "version": VERSION,
+        "failures": failures,
+        "skipped": skipped,
     }
+
 
 
 # ============================================================
