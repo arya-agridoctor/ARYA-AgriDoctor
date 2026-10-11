@@ -2780,4 +2780,47 @@ def knowledge_update_history(
         ).fetchall()
 
         return {
-            "history
+            "history": [
+                dict(row)
+                for row in rows
+            ],
+            "count": len(rows),
+        }
+
+    finally:
+        connection.close()
+
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    connection = db()
+
+    try:
+        connection.execute("SELECT 1").fetchone()
+
+        return {
+            "status": "ok",
+            "service": "ARYA Vision",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except Exception:
+        logger.exception("Vision health check failed")
+
+        raise HTTPException(
+            status_code=503,
+            detail="Vision service is unavailable",
+        )
+
+    finally:
+        connection.close()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        app,
+        host=os.getenv("ARYA_VISION_HOST", "0.0.0.0"),
+        port=int(os.getenv("ARYA_VISION_PORT", "8001")),
+    )
