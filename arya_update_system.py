@@ -1870,29 +1870,40 @@ def source_allowed(
     url: str,
 ) -> bool:
 
-    parsed = urllib.parse.urlparse(
-        url
-    )
+    try:
+        parsed = urllib.parse.urlsplit(url)
 
-    if (
-        parsed.scheme.lower()
-        != "https"
-    ):
-        return False
+        if parsed.scheme.lower() != "https":
+            return False
 
-    host = (
-        parsed.hostname
-        or ""
-    ).lower().rstrip(".")
+        if not parsed.hostname:
+            return False
 
-    return any(
-        host == allowed
-        or host.endswith(
-            "." + allowed
+        if (
+            parsed.username is not None
+            or parsed.password is not None
+        ):
+            return False
+
+        if parsed.port not in (None, 443):
+            return False
+
+        if parsed.fragment:
+            return False
+
+        if any(ord(ch) < 32 for ch in url):
+            return False
+
+        host = parsed.hostname.lower().rstrip(".")
+
+        return any(
+            host == allowed
+            or host.endswith("." + allowed)
+            for allowed in ALLOWED_SOURCE_HOSTS
         )
-        for allowed
-        in ALLOWED_SOURCE_HOSTS
-    )
+
+    except (ValueError, AttributeError):
+        return False
 
 
 def fetch_source(
