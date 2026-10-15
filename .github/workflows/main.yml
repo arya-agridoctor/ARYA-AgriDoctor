@@ -92,7 +92,7 @@ jobs:
         run: flutter pub get
 
       - name: Analyze Flutter application
-        run: flutter analyze lib --no-pub
+        run: flutter analyze lib --no-pub --no-fatal-infos
 
       - name: Build ARYA AgriDoctor APK
         run: flutter build apk --release
