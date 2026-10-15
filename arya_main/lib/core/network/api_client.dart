@@ -238,16 +238,14 @@ class AryaApiClient {
     return post(
       '/auth/register',
       authenticated: false,
-      body: {
-        'name': name,
-        'email': email.trim(),
-        'password': password,
-        'phone': phone,
-        'country': country,
-        'language': language,
-      },
-    );
-  }
+    body: {
+  'name': name ?? '',
+  'email': email.trim(),
+  'password': password,
+  'phone': phone ?? '',
+  'country': country ?? '',
+  'language': language,
+},
 
   Future<Map<String, dynamic>> me() async {
     return get(
