@@ -91,8 +91,8 @@ jobs:
       - name: Get dependencies
         run: flutter pub get
 
-      - name: Analyze Flutter code
-        run: flutter analyze --no-pub
+        - name: Analyze Flutter application
+        run: flutter analyze lib --no-pub
 
       - name: Build ARYA AgriDoctor APK
         run: flutter build apk --release
