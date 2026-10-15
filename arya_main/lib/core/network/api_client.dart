@@ -13,19 +13,16 @@ class AryaApiException implements Exception {
   final String message;
 
   @override
-  String toString() {
-    return 'AryaApiException($statusCode): $message';
-  }
+  String toString() => 'AryaApiException($statusCode): $message';
 }
 
 class AryaApiClient {
-  AryaApiClient({
-    String? baseUrl,
-  }) : baseUrl = (baseUrl ??
-            const String.fromEnvironment(
-              'ARYA_API_URL',
-              defaultValue: 'https://arya-agridoctor.onrender.com',
-            ))
+  AryaApiClient({String? baseUrl})
+      : baseUrl = (baseUrl ??
+                const String.fromEnvironment(
+                  'ARYA_API_URL',
+                  defaultValue: 'https://arya-agridoctor.onrender.com',
+                ))
             .trim()
             .replaceFirst(RegExp(r'/+$'), '');
 
@@ -35,7 +32,6 @@ class AryaApiClient {
 
   bool get isConfigured {
     final uri = Uri.tryParse(baseUrl);
-
     return uri != null &&
         (uri.scheme == 'https' || uri.scheme == 'http') &&
         uri.host.isNotEmpty;
@@ -80,7 +76,6 @@ class AryaApiClient {
 
     if (authenticated) {
       final token = await getToken();
-
       if (token != null && token.trim().isNotEmpty) {
         headers['Authorization'] = 'Bearer ${token.trim()}';
       }
@@ -120,17 +115,10 @@ class AryaApiClient {
     Map<String, String>? queryParameters,
     bool authenticated = true,
   }) async {
-    final uri = _buildUri(
-      path,
-      queryParameters: queryParameters,
-    );
-
     final response = await http
         .get(
-          uri,
-          headers: await _headers(
-            authenticated: authenticated,
-          ),
+          _buildUri(path, queryParameters: queryParameters),
+          headers: await _headers(authenticated: authenticated),
         )
         .timeout(const Duration(seconds: 30));
 
@@ -142,11 +130,9 @@ class AryaApiClient {
     Map<String, dynamic>? body,
     bool authenticated = true,
   }) async {
-    final uri = _buildUri(path);
-
     final response = await http
         .post(
-          uri,
+          _buildUri(path),
           headers: await _headers(
             json: true,
             authenticated: authenticated,
@@ -163,11 +149,9 @@ class AryaApiClient {
     Map<String, dynamic>? body,
     bool authenticated = true,
   }) async {
-    final uri = _buildUri(path);
-
     final response = await http
         .put(
-          uri,
+          _buildUri(path),
           headers: await _headers(
             json: true,
             authenticated: authenticated,
@@ -184,17 +168,10 @@ class AryaApiClient {
     Map<String, String>? queryParameters,
     bool authenticated = true,
   }) async {
-    final uri = _buildUri(
-      path,
-      queryParameters: queryParameters,
-    );
-
     final response = await http
         .delete(
-          uri,
-          headers: await _headers(
-            authenticated: authenticated,
-          ),
+          _buildUri(path, queryParameters: queryParameters),
+          headers: await _headers(authenticated: authenticated),
         )
         .timeout(const Duration(seconds: 30));
 
@@ -227,6 +204,36 @@ class AryaApiClient {
     return result;
   }
 
+  /// ورود به حساب کاربری.
+  ///
+  /// دسترسی OWNER باید توسط بک‌اند تعیین و تأیید شود.
+  /// این متد به‌تنهایی مجوز مدیریت ایجاد نمی‌کند.
+  Future<Map<String, dynamic>> adminLogin({
+    required String email,
+    required String password,
+  }) async {
+    // ورود از همان مسیر امن ورود عادی انجام می‌شود.
+    // نقش مدیر باید در پاسخ معتبر بک‌اند مشخص شده باشد.
+    final result = await login(
+      email: email,
+      password: password,
+    );
+
+    final user = result['user'];
+    final role = user is Map ? user['role'] : result['role'];
+
+    if (role is! String ||
+        !{'owner', 'admin', 'super_admin'}.contains(role.toLowerCase())) {
+      await clearToken();
+      throw AryaApiException(
+        statusCode: 403,
+        message: 'این حساب دسترسی مدیریت ندارد.',
+      );
+    }
+
+    return result;
+  }
+
   Future<Map<String, dynamic>> register({
     String? name,
     required String email,
@@ -238,29 +245,25 @@ class AryaApiClient {
     return post(
       '/auth/register',
       authenticated: false,
-    body: {
-  'name': name ?? '',
-  'email': email.trim(),
-  'password': password,
-  'phone': phone ?? '',
-  'country': country ?? '',
-  'language': language,
-},
+      body: {
+        'name': name?.trim() ?? '',
+        'email': email.trim(),
+        'password': password,
+        'phone': phone?.trim() ?? '',
+        'country': country?.trim() ?? '',
+        'language': language,
+      },
+    );
+  }
 
   Future<Map<String, dynamic>> me() async {
-    return get(
-      '/auth/me',
-      authenticated: true,
-    );
+    return get('/auth/me');
   }
 
   Future<void> logout() async {
     try {
       if (await isLoggedIn()) {
-        await post(
-          '/auth/logout',
-          authenticated: true,
-        );
+        await post('/auth/logout');
       }
     } finally {
       await clearToken();
@@ -303,19 +306,12 @@ class AryaApiClient {
     return get(
       '/pricing',
       authenticated: false,
-      queryParameters: {
-        'country': country,
-      },
+      queryParameters: {'country': country},
     );
   }
 
-  Future<Map<String, dynamic>> subscription(
-    int userId,
-  ) async {
-    return get(
-      '/subscriptions/$userId',
-      authenticated: true,
-    );
+  Future<Map<String, dynamic>> subscription(int userId) async {
+    return get('/subscriptions/$userId');
   }
 
   Future<Map<String, dynamic>> askAi({
@@ -344,19 +340,16 @@ class AryaApiClient {
       );
     }
 
-    if (latitude != null &&
-        (latitude < -90 || latitude > 90)) {
+    if (latitude != null && (latitude < -90 || latitude > 90)) {
       throw ArgumentError.value(latitude, 'latitude');
     }
 
-    if (longitude != null &&
-        (longitude < -180 || longitude > 180)) {
+    if (longitude != null && (longitude < -180 || longitude > 180)) {
       throw ArgumentError.value(longitude, 'longitude');
     }
 
     return post(
       '/ai/ask',
-      authenticated: true,
       body: {
         'user_id': userId,
         'question': normalizedQuestion,
@@ -366,6 +359,46 @@ class AryaApiClient {
         'language': language,
         'latitude': latitude,
         'longitude': longitude,
+      },
+    );
+  }
+
+  /// درخواست بازیابی رمز عبور.
+  ///
+  /// مسیر و فیلدها باید با endpoint واقعی بک‌اند تطبیق داده شوند.
+  Future<Map<String, dynamic>> requestPasswordReset({
+    required String email,
+  }) async {
+    return post(
+      '/auth/password/forgot',
+      authenticated: false,
+      body: {'email': email.trim()},
+    );
+  }
+
+  /// ثبت رمز جدید با توکن یک‌بارمصرف صادرشده از بک‌اند.
+  Future<Map<String, dynamic>> resetPassword({
+    required String token,
+    required String newPassword,
+  }) async {
+    if (token.trim().isEmpty) {
+      throw ArgumentError.value(token, 'token', 'Token cannot be empty.');
+    }
+
+    if (newPassword.length < 8) {
+      throw ArgumentError.value(
+        newPassword,
+        'newPassword',
+        'Password must contain at least 8 characters.',
+      );
+    }
+
+    return post(
+      '/auth/password/reset',
+      authenticated: false,
+      body: {
+        'token': token.trim(),
+        'new_password': newPassword,
       },
     );
   }
@@ -387,8 +420,7 @@ class AryaApiClient {
       decoded = null;
     }
 
-    if (response.statusCode >= 200 &&
-        response.statusCode < 300) {
+    if (response.statusCode >= 200 && response.statusCode < 300) {
       if (decoded is Map<String, dynamic>) {
         return decoded;
       }
@@ -403,7 +435,7 @@ class AryaApiClient {
       };
     }
 
-    String message = 'ARYA Backend request failed.';
+    var message = 'ARYA Backend request failed.';
 
     if (decoded is Map) {
       final detail = decoded['detail'];
@@ -415,14 +447,12 @@ class AryaApiClient {
           serverMessage.trim().isNotEmpty) {
         message = serverMessage;
       } else if (detail is List) {
-        message = detail
-            .map((item) {
-              if (item is Map && item['msg'] != null) {
-                return item['msg'].toString();
-              }
-              return item.toString();
-            })
-            .join('\n');
+        message = detail.map((item) {
+          if (item is Map && item['msg'] != null) {
+            return item['msg'].toString();
+          }
+          return item.toString();
+        }).join('\n');
       }
     }
 
