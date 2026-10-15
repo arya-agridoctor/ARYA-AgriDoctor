@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - "arya_main/**"
+      - ".github/workflows/main.yml"
       - ".github/workflows/android.yml"
 
 permissions:
@@ -45,7 +46,6 @@ jobs:
           fi
 
           echo "Flutter project found."
-          echo "Project path: arya_main"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -63,22 +63,30 @@ jobs:
       - name: Show Flutter version
         run: flutter --version
 
-      - name: Verify Android project configuration
+      - name: Prepare Android platform
         run: |
           set -euo pipefail
 
-          if [ ! -d android ]; then
-            echo "ERROR: Android project directory is missing."
-            echo "Refusing to regenerate the Android project automatically."
-            exit 1
+          if [ ! -d android ] || [ ! -f android/gradlew ]; then
+            echo "Android platform files are missing."
+            echo "Generating Android platform files with Flutter."
+
+            flutter create \
+              --platforms=android \
+              --project-name arya_main \
+              .
+          else
+            echo "Existing Android platform found."
           fi
 
           if [ ! -f android/gradlew ]; then
-            echo "ERROR: android/gradlew was not found."
+            echo "ERROR: android/gradlew is still missing."
             exit 1
           fi
 
           chmod +x android/gradlew
+
+          echo "Android platform is ready."
 
       - name: Get dependencies
         run: flutter pub get
