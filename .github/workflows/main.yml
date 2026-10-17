@@ -86,6 +86,25 @@ jobs:
 
           chmod +x android/gradlew
 
+MANIFEST="android/app/src/main/AndroidManifest.xml"
+
+if [ ! -f "$MANIFEST" ]; then
+  echo "ERROR: AndroidManifest.xml was not generated."
+  exit 1
+fi
+
+if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
+  sed -i '/<manifest[^>]*>/a\    <uses-permission android:name="android.permission.INTERNET" />' "$MANIFEST"
+  echo "Internet permission added."
+else
+  echo "Internet permission already exists."
+fi
+
+grep -q 'android.permission.INTERNET' "$MANIFEST" || {
+  echo "ERROR: Internet permission is missing."
+  exit 1
+}
+
           echo "Android platform is ready."
 
       - name: Get dependencies
