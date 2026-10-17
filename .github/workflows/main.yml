@@ -12,15 +12,17 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: arya-android-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   build:
+    name: Build and Publish ARYA APK
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     defaults:
       run:
@@ -35,20 +37,20 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ ! -f pubspec.yaml ]; then
-            echo "ERROR: arya_main/pubspec.yaml was not found."
+          test -f pubspec.yaml || {
+            echo "::error::arya_main/pubspec.yaml was not found"
             exit 1
-          fi
+          }
 
-          if [ ! -f lib/main.dart ]; then
-            echo "ERROR: arya_main/lib/main.dart was not found."
+          test -f lib/main.dart || {
+            echo "::error::arya_main/lib/main.dart was not found"
             exit 1
-          fi
+          }
 
-          echo "Flutter project found."
+          echo "Flutter project verified."
 
       - name: Setup Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -60,53 +62,50 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Show Flutter version
-        run: flutter --version
+      - name: Show environment
+        run: |
+          set -euo pipefail
+          flutter --version
+          java -version
+          echo "Repository: $GITHUB_REPOSITORY"
+          echo "Run ID: $GITHUB_RUN_ID"
+          echo "Run number: $GITHUB_RUN_NUMBER"
 
       - name: Prepare Android platform
         run: |
           set -euo pipefail
 
           if [ ! -f android/gradlew ]; then
-            echo "Android platform files are missing."
-            echo "Generating Android platform files with Flutter."
-
             flutter create \
               --platforms=android \
               --project-name arya_main \
               .
-          else
-            echo "Existing Android Gradle wrapper found."
           fi
 
-          if [ ! -f android/gradlew ]; then
-            echo "ERROR: Android Gradle wrapper is missing."
+          test -f android/gradlew || {
+            echo "::error::Android Gradle wrapper is missing"
             exit 1
-          fi
+          }
 
           chmod +x android/gradlew
 
           MANIFEST="android/app/src/main/AndroidManifest.xml"
 
-          if [ ! -f "$MANIFEST" ]; then
-            echo "ERROR: AndroidManifest.xml was not generated."
+          test -f "$MANIFEST" || {
+            echo "::error::AndroidManifest.xml is missing"
             exit 1
-          fi
+          }
 
           if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
             sed -i \
               '/<manifest[^>]*>/a\    <uses-permission android:name="android.permission.INTERNET" />' \
               "$MANIFEST"
-
-            echo "Internet permission added."
-          else
-            echo "Internet permission already exists."
           fi
 
-          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
-            echo "ERROR: Internet permission is missing."
+          grep -q 'android.permission.INTERNET' "$MANIFEST" || {
+            echo "::error::Internet permission is missing"
             exit 1
-          fi
+          }
 
           echo "Android platform is ready."
 
@@ -116,27 +115,76 @@ jobs:
       - name: Analyze Flutter application
         run: flutter analyze lib --no-pub --no-fatal-infos
 
-      - name: Build ARYA AgriDoctor APK
+      - name: Build release APK
         run: flutter build apk --release
 
-      - name: Verify APK
+      - name: Verify and identify APK
+        id: verify_apk
         run: |
           set -euo pipefail
 
           APK="build/app/outputs/flutter-apk/app-release.apk"
 
           if [ ! -s "$APK" ]; then
-            echo "ERROR: APK was not created or is empty."
+            echo "::error::Release APK is missing or empty"
             exit 1
           fi
 
-          echo "APK successfully created."
-          ls -lh "$APK"
+          echo "APK_PATH=arya_main/$APK" >> "$GITHUB_ENV"
+          echo "APK_SIZE=$(stat -c '%s' "$APK")" >> "$GITHUB_ENV"
+          echo "APK_SHA256=$(sha256sum "$APK" | cut -d ' ' -f 1)" >> "$GITHUB_ENV"
 
-      - name: Upload APK
+          ls -lh "$APK"
+          sha256sum "$APK"
+
+      - name: Upload APK artifact
+        id: upload_apk
         uses: actions/upload-artifact@v4
         with:
-          name: ARYA-AgriDoctor-APK
+          name: ARYA-AgriDoctor-APK-${{ github.run_number }}
           path: arya_main/build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
+          compression-level: 0
           retention-days: 14
+
+      - name: Verify uploaded artifact
+        if: success()
+        env:
+          ARTIFACT_ID: ${{ steps.upload_apk.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ steps.upload_apk.outputs.artifact-url }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$ARTIFACT_ID" ]; then
+            echo "::error::GitHub did not return an artifact ID"
+            exit 1
+          fi
+
+          echo "APK upload completed successfully."
+          echo "Artifact ID: $ARTIFACT_ID"
+          echo "Artifact URL: $ARTIFACT_URL"
+          echo "APK size: $APK_SIZE bytes"
+          echo "APK SHA-256: $APK_SHA256"
+
+      - name: Report download information
+        if: always()
+        env:
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          JOB_STATUS: ${{ job.status }}
+        working-directory: .
+        run: |
+          {
+            echo "## ARYA AgriDoctor APK"
+            echo ""
+            echo "- Build status: \`$JOB_STATUS\`"
+            echo "- Run number: \`$RUN_NUMBER\`"
+            echo "- Run ID: \`$RUN_ID\`"
+            echo ""
+            echo "Open the workflow run and find the Artifacts section."
+            echo "Download the APK artifact ZIP and extract app-release.apk."
+            echo ""
+            echo "Run URL:"
+            echo "https://github.com/$REPOSITORY/actions/runs/$RUN_ID"
+          } >> "$GITHUB_STEP_SUMMARY"
