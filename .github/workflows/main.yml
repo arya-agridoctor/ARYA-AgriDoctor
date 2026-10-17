@@ -67,7 +67,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [ ! -d android ] || [ ! -f android/gradlew ]; then
+          if [ ! -f android/gradlew ]; then
             echo "Android platform files are missing."
             echo "Generating Android platform files with Flutter."
 
@@ -76,34 +76,37 @@ jobs:
               --project-name arya_main \
               .
           else
-            echo "Existing Android platform found."
+            echo "Existing Android Gradle wrapper found."
           fi
 
           if [ ! -f android/gradlew ]; then
-            echo "ERROR: android/gradlew is still missing."
+            echo "ERROR: Android Gradle wrapper is missing."
             exit 1
           fi
 
           chmod +x android/gradlew
 
-MANIFEST="android/app/src/main/AndroidManifest.xml"
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
 
-if [ ! -f "$MANIFEST" ]; then
-  echo "ERROR: AndroidManifest.xml was not generated."
-  exit 1
-fi
+          if [ ! -f "$MANIFEST" ]; then
+            echo "ERROR: AndroidManifest.xml was not generated."
+            exit 1
+          fi
 
-if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
-  sed -i '/<manifest[^>]*>/a\    <uses-permission android:name="android.permission.INTERNET" />' "$MANIFEST"
-  echo "Internet permission added."
-else
-  echo "Internet permission already exists."
-fi
+          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
+            sed -i \
+              '/<manifest[^>]*>/a\    <uses-permission android:name="android.permission.INTERNET" />' \
+              "$MANIFEST"
 
-grep -q 'android.permission.INTERNET' "$MANIFEST" || {
-  echo "ERROR: Internet permission is missing."
-  exit 1
-}
+            echo "Internet permission added."
+          else
+            echo "Internet permission already exists."
+          fi
+
+          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
+            echo "ERROR: Internet permission is missing."
+            exit 1
+          fi
 
           echo "Android platform is ready."
 
