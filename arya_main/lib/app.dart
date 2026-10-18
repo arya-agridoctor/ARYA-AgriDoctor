@@ -156,7 +156,12 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
     return Scaffold(
       appBar: AppBar(
         title: Text(_titles[_selectedIndex]),
-        actions: [
+        actions: [ 
+         IconButton(
+  tooltip: 'مرکز کنترل کیفیت',
+  icon: const Icon(Icons.fact_check_outlined),
+  onPressed: _openQualityCenter,
+), 
           IconButton(
             tooltip: 'حساب کاربری',
             icon: const Icon(Icons.account_circle_outlined),
