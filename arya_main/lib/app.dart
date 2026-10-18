@@ -25,7 +25,18 @@ class AryaMainApp extends StatelessWidget {
 
 class AryaMainHomePage extends StatefulWidget {
   const AryaMainHomePage({super.key});
+Future<void> _openQualityCenter() async {
+  final baseUrl = _api.baseUrl;
 
+  await Navigator.of(context).push(
+    MaterialPageRoute(
+      builder: (_) => AryaQualityPage(
+        baseUrl: baseUrl,
+      ),
+    ),
+  );
+}
+  
   @override
   State<AryaMainHomePage> createState() => _AryaMainHomePageState();
 }
