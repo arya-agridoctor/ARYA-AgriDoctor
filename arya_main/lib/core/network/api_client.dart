@@ -45,9 +45,10 @@ class AryaApiClient {
 
     final baseUri = Uri.parse(baseUrl);
     final normalizedPath = path.startsWith('/') ? path : '/$path';
+    final basePath = baseUri.path.replaceFirst(RegExp(r'/+$'), '');
 
     final resolvedUri = baseUri.replace(
-      path: '${baseUri.path.replaceFirst(RegExp(r'/+$'), '')}$normalizedPath',
+      path: '$basePath$normalizedPath',
       query: null,
       fragment: null,
     );
@@ -76,6 +77,7 @@ class AryaApiClient {
 
     if (authenticated) {
       final token = await getToken();
+
       if (token != null && token.trim().isNotEmpty) {
         headers['Authorization'] = 'Bearer ${token.trim()}';
       }
@@ -93,7 +95,11 @@ class AryaApiClient {
     final normalizedToken = token.trim();
 
     if (normalizedToken.isEmpty) {
-      throw ArgumentError.value(token, 'token', 'Token cannot be empty.');
+      throw ArgumentError.value(
+        token,
+        'token',
+        'Token cannot be empty.',
+      );
     }
 
     final prefs = await SharedPreferences.getInstance();
@@ -182,11 +188,19 @@ class AryaApiClient {
     required String email,
     required String password,
   }) async {
+    final normalizedEmail = email.trim();
+
+    if (normalizedEmail.isEmpty || password.isEmpty) {
+      throw ArgumentError(
+        'Email and password are required.',
+      );
+    }
+
     final result = await post(
       '/auth/login',
       authenticated: false,
       body: {
-        'email': email.trim(),
+        'email': normalizedEmail,
         'password': password,
       },
     );
@@ -204,16 +218,11 @@ class AryaApiClient {
     return result;
   }
 
-  /// ورود به حساب کاربری.
-  ///
-  /// دسترسی OWNER باید توسط بک‌اند تعیین و تأیید شود.
-  /// این متد به‌تنهایی مجوز مدیریت ایجاد نمی‌کند.
+  /// ورود مدیریتی؛ مجوز مدیریت فقط با تأیید نقش معتبر انجام می‌شود.
   Future<Map<String, dynamic>> adminLogin({
     required String email,
     required String password,
   }) async {
-    // ورود از همان مسیر امن ورود عادی انجام می‌شود.
-    // نقش مدیر باید در پاسخ معتبر بک‌اند مشخص شده باشد.
     final result = await login(
       email: email,
       password: password,
@@ -223,8 +232,11 @@ class AryaApiClient {
     final role = user is Map ? user['role'] : result['role'];
 
     if (role is! String ||
-        !{'owner', 'admin', 'super_admin'}.contains(role.toLowerCase())) {
+        !{'owner', 'admin', 'super_admin'}.contains(
+          role.toLowerCase(),
+        )) {
       await clearToken();
+
       throw AryaApiException(
         statusCode: 403,
         message: 'این حساب دسترسی مدیریت ندارد.',
@@ -242,6 +254,20 @@ class AryaApiClient {
     String? country,
     String language = 'fa',
   }) async {
+    if (email.trim().isEmpty || password.isEmpty) {
+      throw ArgumentError(
+        'Email and password are required.',
+      );
+    }
+
+    if (password.length < 8) {
+      throw ArgumentError.value(
+        password,
+        'password',
+        'Password must contain at least 8 characters.',
+      );
+    }
+
     return post(
       '/auth/register',
       authenticated: false,
@@ -300,22 +326,30 @@ class AryaApiClient {
     }
   }
 
- Future<Map<String, dynamic>> pricing({
-  required String country,
-}) async {
-  return get(
-    '/pricing',
-    authenticated: false,
-  );
-} 
+  /// دریافت تعرفه‌های فعال بک‌اند.
+  ///
+  /// پارامتر country برای حفظ سازگاری با فراخوانی‌های فعلی نگه داشته شده؛
+  /// API فعلی /pricing در OpenAPI پارامتر کشور تعریف نکرده است.
+  Future<Map<String, dynamic>> pricing({
+    required String country,
+  }) async {
+    return get(
+      '/pricing',
+      authenticated: false,
+    );
+  }
 
-Future<Map<String, dynamic>> subscription(int userId) async {
-  return get(
-    '/subscriptions',
-    authenticated: true,
-  );
-}
+  /// دریافت اشتراک کاربر احراز هویت‌شده.
+  ///
+  /// شناسه کاربر در URL ارسال نمی‌شود؛ مسیر مستند بک‌اند /subscriptions است.
+  Future<Map<String, dynamic>> subscription(int userId) async {
+    return get(
+      '/subscriptions',
+      authenticated: true,
+    );
+  }
 
+  /// ارسال سؤال به موتور اصلی تحلیل هوش مصنوعی.
   Future<Map<String, dynamic>> askAi({
     required int userId,
     required String question,
@@ -342,49 +376,76 @@ Future<Map<String, dynamic>> subscription(int userId) async {
       );
     }
 
-    if (latitude != null && (latitude < -90 || latitude > 90)) {
-      throw ArgumentError.value(latitude, 'latitude');
+    if (latitude != null &&
+        (!latitude.isFinite || latitude < -90 || latitude > 90)) {
+      throw ArgumentError.value(
+        latitude,
+        'latitude',
+        'Latitude must be between -90 and 90.',
+      );
     }
 
-    if (longitude != null && (longitude < -180 || longitude > 180)) {
-      throw ArgumentError.value(longitude, 'longitude');
+    if (longitude != null &&
+        (!longitude.isFinite || longitude < -180 || longitude > 180)) {
+      throw ArgumentError.value(
+        longitude,
+        'longitude',
+        'Longitude must be between -180 and 180.',
+      );
     }
 
     return post(
-      '/ai/ask',
+      '/ai/analyze',
+      authenticated: true,
       body: {
-        'user_id': userId,
-        'question': normalizedQuestion,
-        'farm_id': farmId,
-        'crop': crop,
-        'region': region,
+        'prompt': normalizedQuestion,
         'language': language,
-        'latitude': latitude,
-        'longitude': longitude,
+        'context': {
+          'user_id': userId,
+          'farm_id': farmId,
+          'crop': crop,
+          'region': region,
+          'latitude': latitude,
+          'longitude': longitude,
+        },
       },
     );
   }
 
   /// درخواست بازیابی رمز عبور.
-  ///
-  /// مسیر و فیلدها باید با endpoint واقعی بک‌اند تطبیق داده شوند.
   Future<Map<String, dynamic>> requestPasswordReset({
     required String email,
   }) async {
+    final normalizedEmail = email.trim();
+
+    if (normalizedEmail.isEmpty) {
+      throw ArgumentError.value(
+        email,
+        'email',
+        'Email cannot be empty.',
+      );
+    }
+
     return post(
-    '/auth/password-reset/request',
+      '/auth/password-reset/request',
       authenticated: false,
-      body: {'email': email.trim()},
+      body: {
+        'email': normalizedEmail,
+      },
     );
   }
 
-  /// ثبت رمز جدید با توکن یک‌بارمصرف صادرشده از بک‌اند.
+  /// ثبت رمز جدید با توکن صادرشده از بک‌اند.
   Future<Map<String, dynamic>> resetPassword({
     required String token,
     required String newPassword,
   }) async {
     if (token.trim().isEmpty) {
-      throw ArgumentError.value(token, 'token', 'Token cannot be empty.');
+      throw ArgumentError.value(
+        token,
+        'token',
+        'Token cannot be empty.',
+      );
     }
 
     if (newPassword.length < 8) {
@@ -396,7 +457,7 @@ Future<Map<String, dynamic>> subscription(int userId) async {
     }
 
     return post(
-    '/auth/password-reset/confirm',
+      '/auth/password-reset/confirm',
       authenticated: false,
       body: {
         'token': token.trim(),
@@ -417,12 +478,15 @@ Future<Map<String, dynamic>> subscription(int userId) async {
     dynamic decoded;
 
     try {
-      decoded = jsonDecode(utf8.decode(response.bodyBytes));
+      decoded = jsonDecode(
+        utf8.decode(response.bodyBytes),
+      );
     } catch (_) {
       decoded = null;
     }
 
-    if (response.statusCode >= 200 && response.statusCode < 300) {
+    if (response.statusCode >= 200 &&
+        response.statusCode < 300) {
       if (decoded is Map<String, dynamic>) {
         return decoded;
       }
@@ -451,8 +515,18 @@ Future<Map<String, dynamic>> subscription(int userId) async {
       } else if (detail is List) {
         message = detail.map((item) {
           if (item is Map && item['msg'] != null) {
-            return item['msg'].toString();
+            final field = item['loc'];
+            final fieldName = field is List && field.isNotEmpty
+                ? field.last.toString()
+                : '';
+
+            final description = item['msg'].toString();
+
+            return fieldName.isEmpty
+                ? description
+                : '$fieldName: $description';
           }
+
           return item.toString();
         }).join('\n');
       }
