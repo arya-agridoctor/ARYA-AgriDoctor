@@ -300,19 +300,21 @@ class AryaApiClient {
     }
   }
 
-  Future<Map<String, dynamic>> pricing({
-    required String country,
-  }) async {
-    return get(
-      '/pricing',
-      authenticated: false,
-      queryParameters: {'country': country},
-    );
-  }
+ Future<Map<String, dynamic>> pricing({
+  required String country,
+}) async {
+  return get(
+    '/pricing',
+    authenticated: false,
+  );
+} 
 
-  Future<Map<String, dynamic>> subscription(int userId) async {
-    return get('/subscriptions/$userId');
-  }
+Future<Map<String, dynamic>> subscription(int userId) async {
+  return get(
+    '/subscriptions',
+    authenticated: true,
+  );
+}
 
   Future<Map<String, dynamic>> askAi({
     required int userId,
