@@ -1,7 +1,6 @@
 import 'package:flutter/material.dart';
 
 import 'core/network/api_client.dart';
-
 import 'features/diagnostics/arya_quality_page.dart';
 
 class AryaMainApp extends StatelessWidget {
@@ -16,7 +15,9 @@ class AryaMainApp extends StatelessWidget {
         useMaterial3: true,
         colorSchemeSeed: Colors.green,
         scaffoldBackgroundColor: const Color(0xFFF5F8F5),
-        appBarTheme: const AppBarTheme(centerTitle: true),
+        appBarTheme: const AppBarTheme(
+          centerTitle: true,
+        ),
       ),
       home: const AryaMainHomePage(),
     );
@@ -25,18 +26,7 @@ class AryaMainApp extends StatelessWidget {
 
 class AryaMainHomePage extends StatefulWidget {
   const AryaMainHomePage({super.key});
-Future<void> _openQualityCenter() async {
-  final baseUrl = _api.baseUrl;
 
-  await Navigator.of(context).push(
-    MaterialPageRoute(
-      builder: (_) => AryaQualityPage(
-        baseUrl: baseUrl,
-      ),
-    ),
-  );
-}
-  
   @override
   State<AryaMainHomePage> createState() => _AryaMainHomePageState();
 }
@@ -47,6 +37,7 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
   int _selectedIndex = 0;
   bool _loading = true;
   bool _loggedIn = false;
+
   Map<String, dynamic>? _user;
   String? _error;
 
@@ -64,10 +55,12 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
   }
 
   Future<void> _initialize() async {
-    setState(() {
-      _loading = true;
-      _error = null;
-    });
+    if (mounted) {
+      setState(() {
+        _loading = true;
+        _error = null;
+      });
+    }
 
     try {
       final loggedIn = await _api.isLoggedIn();
@@ -77,14 +70,15 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
 
         setState(() {
           _loggedIn = false;
+          _user = null;
           _loading = false;
         });
+
         return;
       }
 
       final result = await _api.me();
 
-      // /auth/me ممکن است اطلاعات کاربر را داخل user برگرداند.
       final userData = result['user'];
 
       final normalizedUser = userData is Map
@@ -97,6 +91,7 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
         _loggedIn = true;
         _user = normalizedUser;
         _loading = false;
+        _error = null;
       });
     } catch (e) {
       await _api.clearToken();
@@ -105,6 +100,7 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
 
       setState(() {
         _loggedIn = false;
+        _user = null;
         _loading = false;
         _error = e.toString();
       });
@@ -126,6 +122,8 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
   Future<void> _logout() async {
     try {
       await _api.logout();
+    } catch (_) {
+      await _api.clearToken();
     } finally {
       if (!mounted) return;
 
@@ -133,15 +131,31 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
         _loggedIn = false;
         _user = null;
         _selectedIndex = 0;
+        _error = null;
       });
     }
+  }
+
+  // باز کردن مرکز کنترل کیفیت
+  Future<void> _openQualityCenter() async {
+    if (!mounted) return;
+
+    await Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => AryaQualityPage(
+          baseUrl: _api.baseUrl,
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     if (_loading) {
       return const Scaffold(
-        body: Center(child: CircularProgressIndicator()),
+        body: Center(
+          child: CircularProgressIndicator(),
+        ),
       );
     }
 
@@ -156,12 +170,12 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
     return Scaffold(
       appBar: AppBar(
         title: Text(_titles[_selectedIndex]),
-        actions: [ 
-         IconButton(
-  tooltip: 'مرکز کنترل کیفیت',
-  icon: const Icon(Icons.fact_check_outlined),
-  onPressed: _openQualityCenter,
-), 
+        actions: [
+          IconButton(
+            tooltip: 'مرکز کنترل کیفیت',
+            icon: const Icon(Icons.fact_check_outlined),
+            onPressed: _openQualityCenter,
+          ),
           IconButton(
             tooltip: 'حساب کاربری',
             icon: const Icon(Icons.account_circle_outlined),
@@ -190,15 +204,26 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
               setState(() => _selectedIndex = 1);
             },
           ),
-          _FarmTab(api: _api, user: _user),
-          _AiTab(api: _api, user: _user),
-          _SupportTab(api: _api, user: _user),
+          _FarmTab(
+            api: _api,
+            user: _user,
+          ),
+          _AiTab(
+            api: _api,
+            user: _user,
+          ),
+          _SupportTab(
+            api: _api,
+            user: _user,
+          ),
         ],
       ),
       bottomNavigationBar: NavigationBar(
         selectedIndex: _selectedIndex,
         onDestinationSelected: (index) {
-          setState(() => _selectedIndex = index);
+          setState(() {
+            _selectedIndex = index;
+          });
         },
         destinations: const [
           NavigationDestination(
@@ -227,6 +252,10 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
   }
 }
 
+// ============================================================
+// WELCOME PAGE
+// ============================================================
+
 class AryaWelcomePage extends StatelessWidget {
   const AryaWelcomePage({
     super.key,
@@ -247,7 +276,9 @@ class AryaWelcomePage extends StatelessWidget {
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(24),
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 500),
+              constraints: const BoxConstraints(
+                maxWidth: 500,
+              ),
               child: Column(
                 children: [
                   const SizedBox(height: 40),
@@ -315,8 +346,15 @@ class AryaWelcomePage extends StatelessWidget {
   }
 }
 
+// ============================================================
+// LOGIN PAGE
+// ============================================================
+
 class AryaLoginPage extends StatefulWidget {
-  const AryaLoginPage({super.key, required this.api});
+  const AryaLoginPage({
+    super.key,
+    required this.api,
+  });
 
   final AryaApiClient api;
 
@@ -330,6 +368,7 @@ class _AryaLoginPageState extends State<AryaLoginPage> {
 
   bool _loading = false;
   bool _obscurePassword = true;
+
   String? _error;
 
   @override
@@ -344,7 +383,9 @@ class _AryaLoginPageState extends State<AryaLoginPage> {
     final password = _passwordController.text;
 
     if (email.isEmpty || password.isEmpty) {
-      setState(() => _error = 'ایمیل و رمز عبور را وارد کنید.');
+      setState(() {
+        _error = 'ایمیل و رمز عبور را وارد کنید.';
+      });
       return;
     }
 
@@ -354,7 +395,10 @@ class _AryaLoginPageState extends State<AryaLoginPage> {
     });
 
     try {
-      await widget.api.login(email: email, password: password);
+      await widget.api.login(
+        email: email,
+        password: password,
+      );
 
       if (!mounted) return;
 
@@ -372,17 +416,24 @@ class _AryaLoginPageState extends State<AryaLoginPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('ورود به ARYA')),
+      appBar: AppBar(
+        title: const Text('ورود به ARYA'),
+      ),
       body: SafeArea(
         child: Center(
           child: SingleChildScrollView(
             padding: const EdgeInsets.all(24),
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 500),
+              constraints: const BoxConstraints(
+                maxWidth: 500,
+              ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Icon(Icons.lock_outline, size: 64),
+                  const Icon(
+                    Icons.lock_outline,
+                    size: 64,
+                  ),
                   const SizedBox(height: 24),
                   const Text(
                     'ورود به حساب کاربری',
@@ -477,8 +528,15 @@ class _AryaLoginPageState extends State<AryaLoginPage> {
   }
 }
 
+// ============================================================
+// REGISTER PAGE
+// ============================================================
+
 class AryaRegisterPage extends StatefulWidget {
-  const AryaRegisterPage({super.key, required this.api});
+  const AryaRegisterPage({
+    super.key,
+    required this.api,
+  });
 
   final AryaApiClient api;
 
@@ -509,12 +567,16 @@ class _AryaRegisterPageState extends State<AryaRegisterPage> {
     final password = _passwordController.text;
 
     if (email.isEmpty || password.isEmpty) {
-      setState(() => _error = 'ایمیل و رمز عبور الزامی است.');
+      setState(() {
+        _error = 'ایمیل و رمز عبور الزامی است.';
+      });
       return;
     }
 
     if (password.length < 8) {
-      setState(() => _error = 'رمز عبور باید حداقل ۸ کاراکتر باشد.');
+      setState(() {
+        _error = 'رمز عبور باید حداقل ۸ کاراکتر باشد.';
+      });
       return;
     }
 
@@ -536,7 +598,9 @@ class _AryaRegisterPageState extends State<AryaRegisterPage> {
 
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-          content: Text('حساب با موفقیت ایجاد شد. اکنون وارد شوید.'),
+          content: Text(
+            'حساب با موفقیت ایجاد شد. اکنون وارد شوید.',
+          ),
         ),
       );
 
@@ -554,13 +618,17 @@ class _AryaRegisterPageState extends State<AryaRegisterPage> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('ثبت‌نام')),
+      appBar: AppBar(
+        title: const Text('ثبت‌نام'),
+      ),
       body: SafeArea(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
           child: Center(
             child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 500),
+              constraints: const BoxConstraints(
+                maxWidth: 500,
+              ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -605,7 +673,9 @@ class _AryaRegisterPageState extends State<AryaRegisterPage> {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  const Text('رمز عبور حداقل ۸ کاراکتر باشد.'),
+                  const Text(
+                    'رمز عبور حداقل ۸ کاراکتر باشد.',
+                  ),
                   const SizedBox(height: 16),
                   if (_error != null)
                     Text(
@@ -640,6 +710,10 @@ class _AryaRegisterPageState extends State<AryaRegisterPage> {
     );
   }
 }
+
+// ============================================================
+// HOME TAB
+// ============================================================
 
 class _HomeTab extends StatelessWidget {
   const _HomeTab({
@@ -725,6 +799,10 @@ class _HomeTab extends StatelessWidget {
   }
 }
 
+// ============================================================
+// FARM TAB
+// ============================================================
+
 class _FarmTab extends StatelessWidget {
   const _FarmTab({
     required this.api,
@@ -740,15 +818,17 @@ class _FarmTab extends StatelessWidget {
 
     if (userId == null) {
       return const Center(
-        child: Text('اطلاعات کاربر هنوز آماده نیست.'),
+        child: Text(
+          'اطلاعات کاربر هنوز آماده نیست.',
+        ),
       );
     }
 
-  return FutureBuilder<Map<String, dynamic>>(
-  future: api.get(
-    '/farms',
-    authenticated: true,
-  ),
+    return FutureBuilder<Map<String, dynamic>>(
+      future: api.get(
+        '/farms',
+        authenticated: true,
+      ),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(
@@ -820,8 +900,14 @@ class _FarmTab extends StatelessWidget {
   }
 }
 
+// ============================================================
+// EMPTY FARM VIEW
+// ============================================================
+
 class _EmptyFarmView extends StatelessWidget {
-  const _EmptyFarmView({required this.onAdd});
+  const _EmptyFarmView({
+    required this.onAdd,
+  });
 
   final VoidCallback onAdd;
 
@@ -863,6 +949,10 @@ class _EmptyFarmView extends StatelessWidget {
     );
   }
 }
+
+// ============================================================
+// AI TAB
+// ============================================================
 
 class _AiTab extends StatefulWidget {
   const _AiTab({
@@ -948,11 +1038,11 @@ class _AiTabState extends State<_AiTab> {
         language: 'fa',
       );
 
-     final answer = result['answer'] ??
-    result['response'] ??
-    result['message'] ??
-    result['text'] ??
-    'پاسخی از ARYA دریافت نشد.'; 
+      final answer = result['answer'] ??
+          result['response'] ??
+          result['message'] ??
+          result['text'] ??
+          'پاسخی از ARYA دریافت نشد.';
 
       if (!mounted) return;
 
@@ -963,6 +1053,7 @@ class _AiTabState extends State<_AiTab> {
             isUser: false,
           ),
         );
+
         _loading = false;
       });
     } catch (e) {
@@ -975,6 +1066,7 @@ class _AiTabState extends State<_AiTab> {
             isUser: false,
           ),
         );
+
         _loading = false;
       });
     }
@@ -1011,7 +1103,9 @@ class _AiTabState extends State<_AiTab> {
                     ? Alignment.centerRight
                     : Alignment.centerLeft,
                 child: Container(
-                  constraints: const BoxConstraints(maxWidth: 600),
+                  constraints: const BoxConstraints(
+                    maxWidth: 600,
+                  ),
                   margin: const EdgeInsets.only(bottom: 12),
                   padding: const EdgeInsets.all(14),
                   decoration: BoxDecoration(
@@ -1079,6 +1173,10 @@ class _AiTabState extends State<_AiTab> {
   }
 }
 
+// ============================================================
+// AI MESSAGE MODEL
+// ============================================================
+
 class _AiMessage {
   const _AiMessage({
     required this.text,
@@ -1088,6 +1186,10 @@ class _AiMessage {
   final String text;
   final bool isUser;
 }
+
+// ============================================================
+// SUPPORT TAB
+// ============================================================
 
 class _SupportTab extends StatelessWidget {
   const _SupportTab({
@@ -1110,7 +1212,9 @@ class _SupportTab extends StatelessWidget {
             ),
             title: const Text(
               'پشتیبانی ARYA',
-              style: TextStyle(fontWeight: FontWeight.bold),
+              style: TextStyle(
+                fontWeight: FontWeight.bold,
+              ),
             ),
             subtitle: const Text(
               'راهنمای استفاده و ارتباط با پشتیبانی',
@@ -1141,7 +1245,9 @@ class _SupportTab extends StatelessWidget {
           child: ListTile(
             leading: const Icon(Icons.feedback_outlined),
             title: const Text('ارسال پیشنهاد یا مشکل'),
-            subtitle: const Text('ارسال بازخورد برای تیم ARYA'),
+            subtitle: const Text(
+              'ارسال بازخورد برای تیم ARYA',
+            ),
             onTap: () {
               _showComingSoon(
                 context,
@@ -1166,6 +1272,10 @@ class _SupportTab extends StatelessWidget {
     );
   }
 }
+
+// ============================================================
+// ACCOUNT PAGE
+// ============================================================
 
 class AryaAccountPage extends StatelessWidget {
   const AryaAccountPage({
@@ -1240,97 +1350,4 @@ class AryaAccountPage extends StatelessWidget {
                   return AlertDialog(
                     title: const Text('خروج از حساب'),
                     content: const Text(
-                      'آیا می‌خواهید از حساب کاربری خارج شوید؟',
-                    ),
-                    actions: [
-                      TextButton(
-                        onPressed: () {
-                          Navigator.pop(context, false);
-                        },
-                        child: const Text('انصراف'),
-                      ),
-                      FilledButton(
-                        onPressed: () {
-                          Navigator.pop(context, true);
-                        },
-                        child: const Text('خروج'),
-                      ),
-                    ],
-                  );
-                },
-              );
-
-              if (confirmed == true) {
-                await onLogout();
-
-                if (context.mounted) {
-                  Navigator.pop(context);
-                }
-              }
-            },
-            icon: const Icon(Icons.logout),
-            label: const Text('خروج از حساب'),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _ModuleCard extends StatelessWidget {
-  const _ModuleCard({
-    required this.icon,
-    required this.title,
-    required this.description,
-    required this.onTap,
-  });
-
-  final IconData icon;
-  final String title;
-  final String description;
-  final VoidCallback onTap;
-
-  @override
-  Widget build(BuildContext context) {
-    return Card(
-      child: ListTile(
-        onTap: onTap,
-        leading: CircleAvatar(
-          child: Icon(icon),
-        ),
-        title: Text(
-          title,
-          style: const TextStyle(
-            fontWeight: FontWeight.bold,
-          ),
-        ),
-        subtitle: Text(description),
-        trailing: const Icon(
-          Icons.arrow_forward_ios,
-          size: 16,
-        ),
-      ),
-    );
-  }
-}
-
-int? _readInt(dynamic value) {
-  if (value is int) {
-    return value;
-  }
-
-  return int.tryParse(
-    value?.toString() ?? '',
-  );
-}
-
-void _showComingSoon(
-  BuildContext context,
-  String message,
-) {
-  ScaffoldMessenger.of(context).showSnackBar(
-    SnackBar(
-      content: Text(message),
-    ),
-  );
-}
+                     
