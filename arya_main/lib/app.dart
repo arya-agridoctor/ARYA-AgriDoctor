@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 
 import 'core/network/api_client.dart';
 
+import 'features/diagnostics/arya_quality_page.dart';
+
 class AryaMainApp extends StatelessWidget {
   const AryaMainApp({super.key});
 
