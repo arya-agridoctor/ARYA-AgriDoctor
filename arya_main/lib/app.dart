@@ -930,10 +930,11 @@ class _AiTabState extends State<_AiTab> {
         language: 'fa',
       );
 
-      final answer = result['answer'] ??
-          result['response'] ??
-          result['message'] ??
-          'پاسخی از ARYA دریافت نشد.';
+     final answer = result['answer'] ??
+    result['response'] ??
+    result['message'] ??
+    result['text'] ??
+    'پاسخی از ARYA دریافت نشد.'; 
 
       if (!mounted) return;
 
