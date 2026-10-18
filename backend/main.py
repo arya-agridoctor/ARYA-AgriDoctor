@@ -526,6 +526,8 @@ def init_db():
     conn = db()
 
     try:
+        conn.execute("PRAGMA journal_mode=WAL")
+
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS schema_meta(
