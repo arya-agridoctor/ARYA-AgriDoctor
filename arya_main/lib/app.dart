@@ -751,7 +751,7 @@ class _FarmTab extends StatelessWidget {
         }
 
         final data = snapshot.data ?? {};
-        final farms = data['farms'];
+        final farms = data['data'];
 
         if (farms is! List || farms.isEmpty) {
           return _EmptyFarmView(
