@@ -370,7 +370,7 @@ class AryaApiClient {
     required String email,
   }) async {
     return post(
-      '/auth/password/forgot',
+    '/auth/password/reset/request',
       authenticated: false,
       body: {'email': email.trim()},
     );
@@ -394,7 +394,7 @@ class AryaApiClient {
     }
 
     return post(
-      '/auth/password/reset',
+    '/auth/password/reset/confirm',
       authenticated: false,
       body: {
         'token': token.trim(),
