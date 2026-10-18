@@ -726,11 +726,11 @@ class _FarmTab extends StatelessWidget {
       );
     }
 
-    return FutureBuilder<Map<String, dynamic>>(
-      future: api.get(
-        '/farms/$userId',
-        authenticated: true,
-      ),
+  return FutureBuilder<Map<String, dynamic>>(
+  future: api.get(
+    '/farms',
+    authenticated: true,
+  ),
       builder: (context, snapshot) {
         if (snapshot.connectionState == ConnectionState.waiting) {
           return const Center(
