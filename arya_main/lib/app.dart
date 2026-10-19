@@ -1628,10 +1628,10 @@ class _AryaFeedbackPageState extends State<AryaFeedbackPage> {
           ),
           const SizedBox(height: 8),
           DropdownButtonFormField<String>(
-            initialValue: selectedValue,
-            decoration: const InputDecoration(
-              prefixIcon: Icon(Icons.category_outlined),
-            ),
+          initialValue: _category,
+          decoration: const InputDecoration(
+          prefixIcon: Icon(Icons.category_outlined),
+  ),
             items: const [
               DropdownMenuItem(
                 value: 'مشکل فنی',
