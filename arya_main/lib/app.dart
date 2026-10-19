@@ -6,6 +6,10 @@ import 'features/diagnostics/arya_quality_page.dart';
 const Color _aryaGreen = Color(0xFF237A45);
 const Color _aryaBackground = Color(0xFFF5F8F5);
 
+// ============================================================
+// APPLICATION
+// ============================================================
+
 class AryaMainApp extends StatelessWidget {
   const AryaMainApp({super.key});
 
@@ -43,7 +47,7 @@ class AryaMainApp extends StatelessWidget {
 }
 
 // ============================================================
-// MAIN APPLICATION
+// MAIN APPLICATION PAGE
 // ============================================================
 
 class AryaMainHomePage extends StatefulWidget {
@@ -60,6 +64,7 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
   bool _loading = true;
   bool _loggedIn = false;
   bool _initializationError = false;
+  bool _initializing = false;
 
   Map<String, dynamic>? _user;
 
@@ -77,6 +82,10 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
   }
 
   Future<void> _initialize() async {
+    if (_initializing) return;
+
+    _initializing = true;
+
     if (mounted) {
       setState(() {
         _loading = true;
@@ -117,8 +126,9 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
         _loggedIn = true;
         _user = userData;
         _loading = false;
+        _initializationError = false;
       });
-    } catch (_) {
+    } catch (e) {
       if (!mounted) return;
 
       setState(() {
@@ -127,6 +137,8 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
         _loading = false;
         _initializationError = true;
       });
+    } finally {
+      _initializing = false;
     }
   }
 
@@ -136,6 +148,8 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
         builder: (_) => AryaLoginPage(api: _api),
       ),
     );
+
+    if (!mounted) return;
 
     if (result == true) {
       await _initialize();
@@ -149,7 +163,9 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
       ),
     );
 
-    if (result == true && mounted) {
+    if (!mounted) return;
+
+    if (result == true) {
       await _openLogin();
     }
   }
@@ -158,7 +174,11 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
     try {
       await _api.logout();
     } catch (_) {
-      await _api.clearToken();
+      try {
+        await _api.clearToken();
+      } catch (_) {
+        // وضعیت رابط کاربری در ادامه پاک می‌شود.
+      }
     }
 
     if (!mounted) return;
@@ -167,6 +187,7 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
       _loggedIn = false;
       _user = null;
       _selectedIndex = 0;
+      _initializationError = false;
     });
   }
 
@@ -244,7 +265,10 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
             onOpenFarm: _openFarm,
           ),
           _FarmTab(api: _api),
-          _AiTab(api: _api, user: _user),
+          _AiTab(
+            api: _api,
+            user: _user,
+          ),
           _SupportTab(api: _api),
         ],
       ),
@@ -283,7 +307,7 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
 }
 
 // ============================================================
-// WELCOME
+// WELCOME PAGE
 // ============================================================
 
 class AryaWelcomePage extends StatelessWidget {
@@ -383,7 +407,7 @@ class AryaWelcomePage extends StatelessWidget {
 }
 
 // ============================================================
-// LOGIN
+// LOGIN PAGE
 // ============================================================
 
 class AryaLoginPage extends StatefulWidget {
@@ -415,6 +439,8 @@ class _AryaLoginPageState extends State<AryaLoginPage> {
   }
 
   Future<void> _login() async {
+    if (_loading) return;
+
     final email = _emailController.text.trim();
     final password = _passwordController.text;
 
@@ -464,7 +490,10 @@ class _AryaLoginPageState extends State<AryaLoginPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Icon(Icons.lock_outline, size: 64),
+                  const Icon(
+                    Icons.lock_outline,
+                    size: 64,
+                  ),
                   const SizedBox(height: 20),
                   const Text(
                     'ورود به حساب کاربری',
@@ -571,7 +600,7 @@ class _AryaLoginPageState extends State<AryaLoginPage> {
 }
 
 // ============================================================
-// REGISTER
+// REGISTER PAGE
 // ============================================================
 
 class AryaRegisterPage extends StatefulWidget {
@@ -609,6 +638,8 @@ class _AryaRegisterPageState extends State<AryaRegisterPage> {
   }
 
   Future<void> _register() async {
+    if (_loading) return;
+
     final name = _nameController.text.trim();
     final email = _emailController.text.trim();
     final phone = _phoneController.text.trim();
@@ -622,7 +653,7 @@ class _AryaRegisterPageState extends State<AryaRegisterPage> {
       return;
     }
 
-    if (!email.contains('@') || !email.contains('.')) {
+    if (!RegExp(r'^[^@\s]+@[^@\s]+\.[^@\s]+$').hasMatch(email)) {
       setState(() {
         _error = 'قالب ایمیل را بررسی کنید.';
       });
@@ -691,7 +722,10 @@ class _AryaRegisterPageState extends State<AryaRegisterPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  const Icon(Icons.person_add_alt_1, size: 60),
+                  const Icon(
+                    Icons.person_add_alt_1,
+                    size: 60,
+                  ),
                   const SizedBox(height: 20),
                   TextField(
                     controller: _nameController,
@@ -748,6 +782,7 @@ class _AryaRegisterPageState extends State<AryaRegisterPage> {
                     controller: _confirmPasswordController,
                     obscureText: true,
                     textDirection: TextDirection.ltr,
+                    onSubmitted: (_) => _register(),
                     decoration: const InputDecoration(
                       labelText: 'تکرار رمز عبور',
                       prefixIcon: Icon(Icons.lock_reset_outlined),
@@ -957,7 +992,7 @@ class _FarmTabState extends State<_FarmTab> {
     try {
       await _farmsFuture;
     } catch (_) {
-      // خطا در FutureBuilder نمایش داده می‌شود.
+      // خطا توسط FutureBuilder نمایش داده می‌شود.
     }
   }
 
@@ -982,7 +1017,8 @@ class _FarmTabState extends State<_FarmTab> {
           );
         }
 
-        final response = snapshot.data ?? {};
+        final response = snapshot.data ?? <String, dynamic>{};
+
         final rawFarms =
             response['data'] ?? response['farms'] ?? response['items'];
 
@@ -991,12 +1027,10 @@ class _FarmTabState extends State<_FarmTab> {
         if (farms.isEmpty) {
           return _EmptyFarmView(
             onAskAi: () {
-              ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(
-                  content: Text(
-                    'برای راهنمایی دربارهٔ ثبت مزرعه، از بخش ARYA AI سؤال کنید.',
-                  ),
-                ),
+              _showInfo(
+                context,
+                'راهنمای ثبت مزرعه',
+                'برای ثبت واقعی مزرعه باید فرم ثبت اطلاعات به مسیر مربوطه در API متصل شود. فعلاً می‌توانید اطلاعات موردنیاز را از ARYA AI بپرسید.',
               );
             },
           );
@@ -1015,7 +1049,9 @@ class _FarmTabState extends State<_FarmTab> {
                 ),
               ),
               const SizedBox(height: 8),
-              const Text('برای به‌روزرسانی، صفحه را به پایین بکشید.'),
+              const Text(
+                'برای به‌روزرسانی، صفحه را به پایین بکشید.',
+              ),
               const SizedBox(height: 12),
               ...farms.map((farm) {
                 final map = farm is Map
@@ -1091,7 +1127,7 @@ class _EmptyFarmView extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             const Text(
-              'اگر امکان ثبت مزرعه در سرور فعال باشد، می‌توانیم فرم ثبت را به آن متصل کنیم. فعلاً می‌توانید دربارهٔ اطلاعات موردنیاز مزرعه از ARYA AI سؤال کنید.',
+              'در این صفحه مزارع دریافت‌شده از سرور نمایش داده می‌شوند. برای ثبت مزرعه، اتصال فرم ثبت به API لازم است.',
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 20),
@@ -1139,7 +1175,9 @@ class _AiTabState extends State<_AiTab> {
     _messages.add(
       const _AiMessage(
         text:
-            'سلام، من ARYA AgriDoctor هستم.\n\nمی‌توانم در موضوعات کشاورزی راهنمایی کنم. لطفاً سؤال خود را همراه با نام گیاه، منطقه، سن گیاه و علائم بنویسید.\n\nبرای انتخاب روش درمان، اطلاعات دقیق و در صورت امکان نتیجهٔ آزمایش یا تصویر گیاه اهمیت دارد.',
+            'سلام، من ARYA AgriDoctor هستم.\n\n'
+            'می‌توانم در موضوعات کشاورزی راهنمایی کنم. لطفاً سؤال خود را همراه با نام گیاه، منطقه، سن گیاه و علائم بنویسید.\n\n'
+            'برای انتخاب روش درمان، اطلاعات دقیق و در صورت امکان نتیجهٔ آزمایش یا تصویر گیاه اهمیت دارد.',
         isUser: false,
       ),
     );
@@ -1166,7 +1204,8 @@ class _AiTabState extends State<_AiTab> {
         _messages.add(
           const _AiMessage(
             text:
-                'شناسهٔ عددی کاربر در اطلاعات حساب پیدا نشد. لطفاً اطلاعات حساب و قرارداد API بررسی شود.',
+                'شناسهٔ عددی کاربر در اطلاعات حساب پیدا نشد. '
+                'برای ارسال سؤال، قالب شناسهٔ کاربر و قرارداد API باید بررسی شود.',
             isUser: false,
           ),
         );
@@ -1208,6 +1247,7 @@ class _AiTabState extends State<_AiTab> {
             isUser: false,
           ),
         );
+
         _loading = false;
       });
     } catch (e) {
@@ -1216,12 +1256,14 @@ class _AiTabState extends State<_AiTab> {
       setState(() {
         _messages.add(
           _AiMessage(
-            text: 'ارتباط با سرویس هوش مصنوعی انجام نشد.\n\n'
+            text:
+                'ارتباط با سرویس هوش مصنوعی انجام نشد.\n\n'
                 '${_friendlyError(e)}\n\n'
-                'اتصال اینترنت، اعتبار حساب و وضعیت سرور باید بررسی شود.',
+                'اتصال اینترنت، اعتبار حساب و وضعیت سرور را بررسی کنید.',
             isUser: false,
           ),
         );
+
         _loading = false;
       });
     }
@@ -1233,17 +1275,28 @@ class _AiTabState extends State<_AiTab> {
     dynamic value = response['answer'] ??
         response['response'] ??
         response['message'] ??
-        response['text'];
+        response['text'] ??
+        response['result'];
 
     if (value is Map) {
       value = value['text'] ??
           value['answer'] ??
           value['content'] ??
-          value.toString();
+          value['message'];
     }
 
     if (value is List) {
-      return value.map((item) => item.toString()).join('\n');
+      return value.map((item) {
+        if (item is Map) {
+          return (item['text'] ??
+                  item['content'] ??
+                  item['answer'] ??
+                  item.toString())
+              .toString();
+        }
+
+        return item.toString();
+      }).join('\n');
     }
 
     if (value == null || value.toString().trim().isEmpty) {
@@ -1255,7 +1308,7 @@ class _AiTabState extends State<_AiTab> {
 
   void _scrollToBottom() {
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scrollController.hasClients) return;
+      if (!mounted || !_scrollController.hasClients) return;
 
       _scrollController.animateTo(
         _scrollController.position.maxScrollExtent,
@@ -1319,7 +1372,9 @@ class _AiTabState extends State<_AiTab> {
                             .surfaceContainerHighest,
                     borderRadius: BorderRadius.circular(16),
                   ),
-                  child: SelectableText(message.text),
+                  child: SelectableText(
+                    message.text,
+                  ),
                 ),
               );
             },
@@ -1333,7 +1388,9 @@ class _AiTabState extends State<_AiTab> {
                 SizedBox(
                   width: 18,
                   height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
+                  child: CircularProgressIndicator(
+                    strokeWidth: 2,
+                  ),
                 ),
                 SizedBox(width: 10),
                 Text('ARYA در حال بررسی سؤال است...'),
@@ -1402,7 +1459,7 @@ class _AiTabState extends State<_AiTab> {
 }
 
 // ============================================================
-// AI MESSAGE
+// AI MESSAGE MODEL
 // ============================================================
 
 class _AiMessage {
@@ -1581,7 +1638,6 @@ class _AryaFeedbackPageState extends State<AryaFeedbackPage> {
       return;
     }
 
-    // ارسال واقعی گزارش تا زمان اتصال به endpoint بازخورد فعال نیست.
     showDialog<void>(
       context: context,
       builder: (dialogContext) {
@@ -1589,7 +1645,7 @@ class _AryaFeedbackPageState extends State<AryaFeedbackPage> {
           title: const Text('گزارش آماده است'),
           content: Text(
             'نوع گزارش: $_category\n\n'
-            'توضیحات شما ثبت شده است، اما هنوز به سرور ارسال نشده؛ '
+            'توضیحات شما در این صفحه آماده شده است، اما هنوز به سرور ارسال نشده؛ '
             'اتصال به endpoint بازخورد API لازم است.',
           ),
           actions: [
@@ -1617,8 +1673,6 @@ class _AryaFeedbackPageState extends State<AryaFeedbackPage> {
             style: TextStyle(fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 8),
-
-          // اصلاح‌شده: مقدار اولیه و قالب‌بندی صحیح Dropdown.
           DropdownButtonFormField<String>(
             initialValue: _category,
             isExpanded: true,
@@ -1652,7 +1706,6 @@ class _AryaFeedbackPageState extends State<AryaFeedbackPage> {
               });
             },
           ),
-
           const SizedBox(height: 16),
           TextField(
             controller: _messageController,
@@ -1714,7 +1767,10 @@ class AryaAccountPage extends StatelessWidget {
           const SizedBox(height: 12),
           const CircleAvatar(
             radius: 44,
-            child: Icon(Icons.person, size: 46),
+            child: Icon(
+              Icons.person,
+              size: 46,
+            ),
           ),
           const SizedBox(height: 16),
           Text(
@@ -1830,7 +1886,7 @@ class AryaAccountPage extends StatelessWidget {
 }
 
 // ============================================================
-// REUSABLE WIDGETS
+// ACCOUNT INFO TILE
 // ============================================================
 
 class _AccountInfoTile extends StatelessWidget {
@@ -1853,6 +1909,10 @@ class _AccountInfoTile extends StatelessWidget {
     );
   }
 }
+
+// ============================================================
+// MODULE CARD
+// ============================================================
 
 class _ModuleCard extends StatelessWidget {
   const _ModuleCard({
@@ -1881,7 +1941,9 @@ class _ModuleCard extends StatelessWidget {
         ),
         title: Text(
           title,
-          style: const TextStyle(fontWeight: FontWeight.bold),
+          style: const TextStyle(
+            fontWeight: FontWeight.bold,
+          ),
         ),
         subtitle: Padding(
           padding: const EdgeInsets.only(top: 4),
@@ -1893,6 +1955,10 @@ class _ModuleCard extends StatelessWidget {
     );
   }
 }
+
+// ============================================================
+// SUGGESTION CHIP
+// ============================================================
 
 class _SuggestionChip extends StatelessWidget {
   const _SuggestionChip({
@@ -1914,6 +1980,10 @@ class _SuggestionChip extends StatelessWidget {
     );
   }
 }
+
+// ============================================================
+// ERROR PANEL
+// ============================================================
 
 class _ErrorPanel extends StatelessWidget {
   const _ErrorPanel({
@@ -1940,6 +2010,10 @@ class _ErrorPanel extends StatelessWidget {
     );
   }
 }
+
+// ============================================================
+// STATE MESSAGE
+// ============================================================
 
 class _StateMessage extends StatelessWidget {
   const _StateMessage({
@@ -2001,7 +2075,11 @@ class _StateMessage extends StatelessWidget {
 int? _readInt(dynamic value) {
   if (value is int) return value;
   if (value is num) return value.toInt();
-  if (value is String) return int.tryParse(value.trim());
+
+  if (value is String) {
+    return int.tryParse(value.trim());
+  }
+
   return null;
 }
 
@@ -2022,15 +2100,17 @@ String? _firstNonEmpty(
 
 String _friendlyError(Object error) {
   final text = error.toString();
+  final lower = text.toLowerCase();
 
-  if (text.contains('SocketException') ||
-      text.contains('Failed host lookup') ||
-      text.contains('Connection refused')) {
+  if (lower.contains('socketexception') ||
+      lower.contains('failed host lookup') ||
+      lower.contains('connection refused') ||
+      lower.contains('network is unreachable')) {
     return 'اتصال به سرور برقرار نشد. اینترنت و آدرس سرور را بررسی کنید.';
   }
 
-  if (text.contains('TimeoutException') ||
-      text.toLowerCase().contains('timeout')) {
+  if (lower.contains('timeoutexception') ||
+      lower.contains('timeout')) {
     return 'پاسخ سرور دیر رسید. چند لحظه بعد دوباره تلاش کنید.';
   }
 
@@ -2079,7 +2159,9 @@ void _showInfo(
         ),
         actions: [
           TextButton(
-            onPressed: () => Navigator.of(dialogContext).pop(),
+            onPressed: () {
+              Navigator.of(dialogContext).pop();
+            },
             child: const Text('بستن'),
           ),
         ],
