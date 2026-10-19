@@ -152,17 +152,6 @@ class AryaQualityCenter {
   final Duration timeout;
 
   static const String _tokenKey = 'arya_access_token';
-
-  static const Map<String, String> _safeGetEndpoints = {
-    'health': '/health',
-    'pricing': '/pricing',
-    'farms': '/farms',
-    'weather': '/weather',
-    'subscriptions': '/subscriptions',
-    'support': '/support',
-    'recommendations': '/recommendations',
-  };
-
   bool get isConfigured {
     final uri = Uri.tryParse(baseUrl);
 
