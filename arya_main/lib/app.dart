@@ -101,9 +101,9 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
 
       final response = await _api.me();
 
-      Map<String, dynamic> userData;
-
       final rawUser = response['user'];
+
+      final Map<String, dynamic> userData;
 
       if (rawUser is Map) {
         userData = Map<String, dynamic>.from(rawUser);
@@ -121,7 +121,6 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
     } catch (_) {
       if (!mounted) return;
 
-      // خطای موقت شبکه نباید الزاماً باعث حذف توکن شود.
       setState(() {
         _loggedIn = false;
         _user = null;
@@ -150,7 +149,7 @@ class _AryaMainHomePageState extends State<AryaMainHomePage> {
       ),
     );
 
-    if (result == true) {
+    if (result == true && mounted) {
       await _openLogin();
     }
   }
@@ -830,9 +829,7 @@ class _HomeTab extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  name.isEmpty
-                      ? 'به ARYA خوش آمدید'
-                      : 'سلام $name',
+                  name.isEmpty ? 'به ARYA خوش آمدید' : 'سلام $name',
                   style: const TextStyle(
                     fontSize: 23,
                     fontWeight: FontWeight.bold,
@@ -956,6 +953,7 @@ class _FarmTabState extends State<_FarmTab> {
 
   Future<void> _refresh() async {
     setState(_loadFarms);
+
     try {
       await _farmsFuture;
     } catch (_) {
@@ -985,9 +983,8 @@ class _FarmTabState extends State<_FarmTab> {
         }
 
         final response = snapshot.data ?? {};
-        final rawFarms = response['data'] ??
-            response['farms'] ??
-            response['items'];
+        final rawFarms =
+            response['data'] ?? response['farms'] ?? response['items'];
 
         final farms = rawFarms is List ? rawFarms : <dynamic>[];
 
@@ -1046,9 +1043,7 @@ class _FarmTabState extends State<_FarmTab> {
                     ),
                     title: Text(farmName),
                     subtitle: Text(
-                      area == null
-                          ? location
-                          : '$location\nمساحت: $area',
+                      area == null ? location : '$location\nمساحت: $area',
                     ),
                     isThreeLine: area != null,
                   ),
@@ -1162,7 +1157,9 @@ class _AiTabState extends State<_AiTab> {
 
     if (question.isEmpty || _loading) return;
 
-    final userId = _readInt(widget.user?['id']);
+    final userId = _readInt(
+      widget.user?['id'] ?? widget.user?['user_id'],
+    );
 
     if (userId == null) {
       setState(() {
@@ -1460,9 +1457,7 @@ class _SupportTab extends StatelessWidget {
           child: ListTile(
             leading: const Icon(Icons.language),
             title: const Text('زبان برنامه'),
-            subtitle: const Text(
-              'زبان فعلی: فارسی',
-            ),
+            subtitle: const Text('زبان فعلی: فارسی'),
             onTap: () {
               _showInfo(
                 context,
@@ -1476,9 +1471,7 @@ class _SupportTab extends StatelessWidget {
           child: ListTile(
             leading: const Icon(Icons.feedback_outlined),
             title: const Text('ارسال پیشنهاد یا مشکل'),
-            subtitle: const Text(
-              'ثبت توضیحات برای بررسی تیم فنی',
-            ),
+            subtitle: const Text('ثبت توضیحات برای بررسی تیم فنی'),
             onTap: () {
               Navigator.of(context).push(
                 MaterialPageRoute(
@@ -1492,9 +1485,7 @@ class _SupportTab extends StatelessWidget {
           child: ListTile(
             leading: const Icon(Icons.fact_check_outlined),
             title: const Text('مرکز کنترل کیفیت'),
-            subtitle: const Text(
-              'بررسی وضعیت سرویس‌ها و اتصال',
-            ),
+            subtitle: const Text('بررسی وضعیت سرویس‌ها و اتصال'),
             onTap: () {
               Navigator.of(context).push(
                 MaterialPageRoute(
@@ -1510,9 +1501,7 @@ class _SupportTab extends StatelessWidget {
           child: ListTile(
             leading: const Icon(Icons.help_outline),
             title: const Text('راهنمای استفاده'),
-            subtitle: const Text(
-              'اطلاعات لازم برای دریافت پاسخ دقیق‌تر',
-            ),
+            subtitle: const Text('اطلاعات لازم برای دریافت پاسخ دقیق‌تر'),
             onTap: () {
               _showInfo(
                 context,
@@ -1592,15 +1581,16 @@ class _AryaFeedbackPageState extends State<AryaFeedbackPage> {
       return;
     }
 
-    // این صفحه فعلاً اطلاعات را در رابط کاربری دریافت می‌کند.
-    // ارسال واقعی باید پس از تطبیق با endpoint بازخورد در API انجام شود.
+    // ارسال واقعی گزارش تا زمان اتصال به endpoint بازخورد فعال نیست.
     showDialog<void>(
       context: context,
       builder: (dialogContext) {
         return AlertDialog(
           title: const Text('گزارش آماده است'),
-          content: const Text(
-            'فرم شما تکمیل شد، اما ارسال به سرور هنوز به اتصال endpoint بازخورد نیاز دارد.',
+          content: Text(
+            'نوع گزارش: $_category\n\n'
+            'توضیحات شما ثبت شده است، اما هنوز به سرور ارسال نشده؛ '
+            'اتصال به endpoint بازخورد API لازم است.',
           ),
           actions: [
             TextButton(
@@ -1627,36 +1617,42 @@ class _AryaFeedbackPageState extends State<AryaFeedbackPage> {
             style: TextStyle(fontWeight: FontWeight.bold),
           ),
           const SizedBox(height: 8),
+
+          // اصلاح‌شده: مقدار اولیه و قالب‌بندی صحیح Dropdown.
           DropdownButtonFormField<String>(
-          initialValue: _category,
-          decoration: const InputDecoration(
-          prefixIcon: Icon(Icons.category_outlined),
-  ),
+            initialValue: _category,
+            isExpanded: true,
+            decoration: const InputDecoration(
+              labelText: 'دسته‌بندی گزارش',
+              prefixIcon: Icon(Icons.category_outlined),
+            ),
             items: const [
-              DropdownMenuItem(
+              DropdownMenuItem<String>(
                 value: 'مشکل فنی',
                 child: Text('مشکل فنی'),
               ),
-              DropdownMenuItem(
+              DropdownMenuItem<String>(
                 value: 'پیشنهاد',
                 child: Text('پیشنهاد'),
               ),
-              DropdownMenuItem(
+              DropdownMenuItem<String>(
                 value: 'مشکل پاسخ هوش مصنوعی',
                 child: Text('مشکل پاسخ هوش مصنوعی'),
               ),
-              DropdownMenuItem(
+              DropdownMenuItem<String>(
                 value: 'مشکل حساب کاربری',
                 child: Text('مشکل حساب کاربری'),
               ),
             ],
             onChanged: (value) {
               if (value == null) return;
+
               setState(() {
                 _category = value;
               });
             },
           ),
+
           const SizedBox(height: 16),
           TextField(
             controller: _messageController,
@@ -1877,8 +1873,7 @@ class _ModuleCard extends StatelessWidget {
       child: ListTile(
         contentPadding: const EdgeInsets.all(14),
         leading: CircleAvatar(
-          backgroundColor:
-              Theme.of(context).colorScheme.primaryContainer,
+          backgroundColor: Theme.of(context).colorScheme.primaryContainer,
           child: Icon(
             icon,
             color: Theme.of(context).colorScheme.primary,
