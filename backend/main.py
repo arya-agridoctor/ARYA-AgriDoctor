@@ -3935,29 +3935,20 @@ def feedback_message(
 # PAYMENTS / PRICING
 # ============================================================
 
-def pricing_for(
-    country: str,
-    user_number: int,
-):
-    if (
-        country or ""
-    ).strip().lower() in (
-        "iran",
-        "ir",
-        "ایران",
-    ):
+def pricing_for(country: str, user_number: int):
+    country = (country or "").strip().lower()
+
+    if country in ("iran", "ir", "ایران"):
         if user_number <= 100:
-            return 500000, "IRR"
+            return 5_000_000, "IRR"
         if user_number <= 600:
-            return 800000, "IRR"
-        return 1200000, "IRR"
+            return 8_000_000, "IRR"
+        return 12_000_000, "IRR"
 
     if user_number <= 100:
         return 10, "USDT"
-
     if user_number <= 600:
         return 15, "USDT"
-
     return 20, "USDT"
 
 
