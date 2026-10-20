@@ -3992,38 +3992,49 @@ def create_payment(
     x: PaymentIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(
-        authorization
+    user = current_user(authorization)
+
+    country = (user["country"] or "").strip().lower()
+    is_iran = country in ("iran", "ir", "ایران")
+
+    method = (x.method or "").strip().lower()
+
+    if is_iran:
+        if method != "bank_transfer":
+            raise HTTPException(
+                status_code=400,
+                detail="Iranian users must use bank transfer",
+            )
+        currency = "IRR"
+    else:
+        if method != "usdt":
+            raise HTTPException(
+                status_code=400,
+                detail="International users must use USDT",
+            )
+        currency = "USDT"
+
+    number_row = q(
+        """
+        SELECT COUNT(*) AS n
+        FROM users
+        WHERE role='user' AND id<=?
+        """,
+        (user["id"],),
+        one=True,
     )
 
-    method = x.method.lower()
-    currency = x.currency.upper()
+    user_number = max(1, int(number_row["n"]))
 
-    if method == "bank_transfer":
-        if user["country"].lower() not in (
-            "iran",
-            "ir",
-            "ایران",
-        ):
-            raise HTTPException(
-                400,
-                "bank transfer is restricted to Iran",
-            )
+    amount, expected_currency = pricing_for(
+        user["country"],
+        user_number,
+    )
 
-    if method == "usdt":
-        if currency != "USDT":
-            raise HTTPException(
-                400,
-                "USDT payment requires USDT currency",
-            )
-
-    if method not in (
-        "bank_transfer",
-        "usdt",
-    ):
+    if currency != expected_currency:
         raise HTTPException(
-            400,
-            "unsupported payment method",
+            status_code=400,
+            detail="Invalid payment currency",
         )
 
     destination = q(
@@ -4036,14 +4047,17 @@ def create_payment(
         ORDER BY id DESC
         LIMIT 1
         """,
-        (
-            method,
-            currency,
-        ),
+        (method, currency),
         one=True,
     )
 
-    pid = q(
+    if not destination:
+        raise HTTPException(
+            status_code=503,
+            detail="No active payment destination is configured",
+        )
+
+    payment_id = q(
         """
         INSERT INTO payments(
             user_id,
@@ -4061,29 +4075,28 @@ def create_payment(
         """,
         (
             user["id"],
-            x.amount,
+            amount,
             currency,
             method,
             x.reference,
             x.note,
             "pending",
-            destination[
-                "destination"
-            ]
-            if destination
-            else "",
-            destination[
-                "network"
-            ]
-            if destination
-            else "",
+            destination["destination"],
+            destination["network"],
             now_iso(),
         ),
     )
 
+    audit(
+        user["id"],
+        "payment_create",
+        "payments",
+        payment_id,
+    )
+
     return q(
         "SELECT * FROM payments WHERE id=?",
-        (pid,),
+        (payment_id,),
         one=True,
     )
 
@@ -4120,88 +4133,93 @@ def list_payments(
     )
 
 
-@app.post(
-    "/owner/payments/{payment_id}/approve"
-)
+@app.post("/owner/payments/{payment_id}/approve")
 def approve_payment(
     payment_id: int,
     x: PaymentDecisionIn,
     authorization: Optional[str] = Header(None),
 ):
-    owner = current_user(
-        authorization
-    )
-
+    owner = current_user(authorization)
     require_owner(owner)
 
-    payment = q(
-        """
-        SELECT *
-        FROM payments
-        WHERE id=?
-        """,
-        (payment_id,),
-        one=True,
-    )
+    conn = db()
 
-    if not payment:
-        raise HTTPException(
-            404,
-            "payment not found",
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        payment = conn.execute(
+            "SELECT * FROM payments WHERE id=?",
+            (payment_id,),
+        ).fetchone()
+
+        if not payment:
+            raise HTTPException(
+                status_code=404,
+                detail="Payment not found",
+            )
+
+        if payment["status"] != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="Payment has already been processed",
+            )
+
+        now = datetime.now(timezone.utc)
+        expires = now + timedelta(days=30)
+
+        conn.execute(
+            """
+            UPDATE payments
+            SET status='approved',
+                approved_by=?,
+                approved_at=?,
+                note=?
+            WHERE id=? AND status='pending'
+            """,
+            (
+                owner["id"],
+                now.isoformat(),
+                x.note,
+                payment_id,
+            ),
         )
 
-    q(
-        """
-        UPDATE payments
-        SET status='approved',
-            approved_by=?,
-            approved_at=?,
-            note=?
-        WHERE id=?
-        """,
-        (
-            owner["id"],
-            now_iso(),
-            x.note,
-            payment_id,
-        ),
-    )
-
-    starts = datetime.now(
-        timezone.utc
-    )
-
-    expires = starts + timedelta(
-        days=30
-    )
-
-    q(
-        """
-        INSERT INTO subscriptions(
-            user_id,
-            plan,
-            amount,
-            currency,
-            starts_at,
-            expires_at,
-            status,
-            payment_id,
-            created_at
+        conn.execute(
+            """
+            INSERT INTO subscriptions(
+                user_id,
+                plan,
+                amount,
+                currency,
+                starts_at,
+                expires_at,
+                status,
+                payment_id,
+                created_at
+            )
+            VALUES(?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                payment["user_id"],
+                "standard",
+                payment["amount"],
+                payment["currency"],
+                now.isoformat(),
+                expires.isoformat(),
+                "active",
+                payment_id,
+                now.isoformat(),
+            ),
         )
-        VALUES(?,?,?,?,?,?,?,?,?)
-        """,
-        (
-            payment["user_id"],
-            "standard",
-            payment["amount"],
-            payment["currency"],
-            starts.isoformat(),
-            expires.isoformat(),
-            "active",
-            payment_id,
-            now_iso(),
-        ),
-    )
+
+        conn.commit()
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
     audit(
         owner["id"],
