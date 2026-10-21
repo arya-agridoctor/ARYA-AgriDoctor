@@ -4143,19 +4143,27 @@ def list_payments(
 @app.post("/owner/payments/{payment_id}/approve")
 def approve_payment(
     payment_id: int,
-    x: PaymentDecisionIn,
     authorization: Optional[str] = Header(None),
 ):
     owner = current_user(authorization)
-    require_owner(owner)
 
-    conn = db()
+    if owner["role"] != "owner":
+        raise HTTPException(
+            status_code=403,
+            detail="Owner access required",
+        )
+
+    conn = get_db()
 
     try:
         conn.execute("BEGIN IMMEDIATE")
 
         payment = conn.execute(
-            "SELECT * FROM payments WHERE id=?",
+            """
+            SELECT *
+            FROM payments
+            WHERE id = ?
+            """,
             (payment_id,),
         ).fetchone()
 
@@ -4168,58 +4176,57 @@ def approve_payment(
         if payment["status"] != "pending":
             raise HTTPException(
                 status_code=409,
-                detail="Payment has already been processed",
+                detail="Payment is not pending",
             )
-
-        now = datetime.now(timezone.utc)
-        expires = now + timedelta(days=30)
 
         conn.execute(
             """
             UPDATE payments
-            SET status='approved',
-                approved_by=?,
-                approved_at=?,
-                note=?
-            WHERE id=? AND status='pending'
+            SET status = 'approved'
+            WHERE id = ? AND status = 'pending'
             """,
-            (
-                owner["id"],
-                now.isoformat(),
-                x.note,
-                payment_id,
-            ),
+            (payment_id,),
         )
+
+        if conn.execute("SELECT changes()").fetchone()[0] != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Payment status changed",
+            )
 
         conn.execute(
             """
-            INSERT INTO subscriptions(
+            INSERT INTO subscriptions (
                 user_id,
-                plan,
-                amount,
-                currency,
-                starts_at,
-                expires_at,
                 status,
-                payment_id,
-                created_at
+                starts_at,
+                expires_at
             )
-            VALUES(?,?,?,?,?,?,?,?,?)
+            VALUES (
+                ?,
+                'active',
+                ?,
+                ?
+            )
             """,
             (
                 payment["user_id"],
-                "standard",
-                payment["amount"],
-                payment["currency"],
-                now.isoformat(),
-                expires.isoformat(),
-                "active",
-                payment_id,
-                now.isoformat(),
+                now_iso(),
+                (
+                    datetime.now(timezone.utc)
+                    + timedelta(days=30)
+                ).isoformat(),
             ),
         )
 
         conn.commit()
+
+        return {
+            "ok": True,
+            "payment_id": payment_id,
+            "status": "approved",
+            "subscription_days": 30,
+        }
 
     except Exception:
         conn.rollback()
@@ -4228,54 +4235,75 @@ def approve_payment(
     finally:
         conn.close()
 
-    audit(
-        owner["id"],
-        "payment_approve",
-        "payments",
-        payment_id,
-    )
 
-    return {
-        "ok": True,
-        "payment_id": payment_id,
-        "subscription_days": 30,
-    }
-
-
-@app.post(
-    "/owner/payments/{payment_id}/reject"
-)
+@app.post("/owner/payments/{payment_id}/reject")
 def reject_payment(
     payment_id: int,
-    x: PaymentDecisionIn,
     authorization: Optional[str] = Header(None),
 ):
-    owner = current_user(
-        authorization
-    )
+    owner = current_user(authorization)
 
-    require_owner(owner)
+    if owner["role"] != "owner":
+        raise HTTPException(
+            status_code=403,
+            detail="Owner access required",
+        )
 
-    q(
-        """
-        UPDATE payments
-        SET status='rejected',
-            approved_by=?,
-            approved_at=?,
-            note=?
-        WHERE id=?
-        """,
-        (
-            owner["id"],
-            now_iso(),
-            x.note,
-            payment_id,
-        ),
-    )
+    conn = get_db()
 
-    return {
-        "ok": True
-    }
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+
+        payment = conn.execute(
+            """
+            SELECT id, status
+            FROM payments
+            WHERE id = ?
+            """,
+            (payment_id,),
+        ).fetchone()
+
+        if not payment:
+            raise HTTPException(
+                status_code=404,
+                detail="Payment not found",
+            )
+
+        if payment["status"] != "pending":
+            raise HTTPException(
+                status_code=409,
+                detail="Payment is not pending",
+            )
+
+        conn.execute(
+            """
+            UPDATE payments
+            SET status = 'rejected'
+            WHERE id = ? AND status = 'pending'
+            """,
+            (payment_id,),
+        )
+
+        if conn.execute("SELECT changes()").fetchone()[0] != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Payment status changed",
+            )
+
+        conn.commit()
+
+        return {
+            "ok": True,
+            "payment_id": payment_id,
+            "status": "rejected",
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
 
 # ============================================================
