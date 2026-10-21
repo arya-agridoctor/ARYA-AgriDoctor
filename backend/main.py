@@ -4558,92 +4558,112 @@ def activate(
     x: ActivationIn,
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(
-        authorization
-    )
+    user = current_user(authorization)
 
-    row = q(
-        """
-        SELECT *
-        FROM activation_codes
-        WHERE code_hash=?
-          AND used=0
-        """,
-        (
-            token_hash(x.code),
-        ),
-        one=True,
-    )
+    conn = get_db()
 
-    if not row:
-        raise HTTPException(
-            400,
-            "invalid activation code",
-        )
+    try:
+        conn.execute("BEGIN IMMEDIATE")
 
-    if row["expires_at"]:
-        if datetime.fromisoformat(
-            row["expires_at"]
-        ) < datetime.now(
-            timezone.utc
-        ):
+        row = conn.execute(
+            """
+            SELECT *
+            FROM activation_codes
+            WHERE code_hash = ?
+              AND used = 0
+            LIMIT 1
+            """,
+            (token_hash(x.code),),
+        ).fetchone()
+
+        if not row:
             raise HTTPException(
-                400,
-                "activation expired",
+                status_code=400,
+                detail="Invalid or already used activation code",
             )
 
-    q(
-        """
-        UPDATE activation_codes
-        SET used=1,
-            user_id=?
-        WHERE id=?
-        """,
-        (
-            user["id"],
-            row["id"],
-        ),
-    )
+        if row["expires_at"]:
+            try:
+                code_expires = datetime.fromisoformat(
+                    row["expires_at"].replace("Z", "+00:00")
+                )
 
-    starts = datetime.now(
-        timezone.utc
-    )
+                if code_expires.tzinfo is None:
+                    code_expires = code_expires.replace(
+                        tzinfo=timezone.utc
+                    )
 
-    expires = starts + timedelta(
-        days=30
-    )
+            except (ValueError, TypeError):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid activation expiry",
+                )
 
-    q(
-        """
-        INSERT INTO subscriptions(
-            user_id,
-            plan,
-            amount,
-            currency,
-            starts_at,
-            expires_at,
-            status,
-            created_at
+            if code_expires <= datetime.now(timezone.utc):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Activation code expired",
+                )
+
+        changed = conn.execute(
+            """
+            UPDATE activation_codes
+            SET used = 1,
+                user_id = ?
+            WHERE id = ?
+              AND used = 0
+            """,
+            (user["id"], row["id"]),
         )
-        VALUES(?,?,?,?,?,?,?,?)
-        """,
-        (
-            user["id"],
-            row["plan"] or "standard",
-            0,
-            "",
-            starts.isoformat(),
-            expires.isoformat(),
-            "active",
-            now_iso(),
-        ),
-    )
 
-    return {
-        "ok": True,
-        "expires_at":
-            expires.isoformat(),
-    }
+        if changed.rowcount != 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Activation code already used",
+            )
+
+        starts = datetime.now(timezone.utc)
+        expires = starts + timedelta(days=30)
+
+        conn.execute(
+            """
+            INSERT INTO subscriptions (
+                user_id,
+                plan,
+                amount,
+                currency,
+                starts_at,
+                expires_at,
+                status,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user["id"],
+                row["plan"] or "standard",
+                0,
+                "",
+                starts.isoformat(),
+                expires.isoformat(),
+                "active",
+                now_iso(),
+            ),
+        )
+
+        conn.commit()
+
+        return {
+            "ok": True,
+            "expires_at": expires.isoformat(),
+        }
+
+    except Exception:
+        conn.rollback()
+        raise
+
+    finally:
+        conn.close()
 
 
 # ============================================================
