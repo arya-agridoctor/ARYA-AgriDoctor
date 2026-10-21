@@ -3956,26 +3956,30 @@ def pricing_for(country: str, user_number: int):
 def pricing(
     authorization: Optional[str] = Header(None),
 ):
-    user = current_user(
-        authorization
-    )
+    user = current_user(authorization)
 
-    count_row = q(
-        """
-        SELECT COUNT(*) n
-        FROM users
-        WHERE role='user'
-        """,
-        one=True,
-    )
-
-    number = int(
-        count_row["n"]
-    )
+    if user["role"] == "owner":
+        number = 1
+    else:
+        row = q(
+            """
+            SELECT COUNT(*) AS n
+            FROM users
+            WHERE role='user' AND id<=?
+            """,
+            (user["id"],),
+            one=True,
+        )
+        number = max(1, int(row["n"]))
 
     amount, currency = pricing_for(
         user["country"],
         number,
+    )
+
+    is_iran = (
+        (user["country"] or "").strip().lower()
+        in ("iran", "ir", "ایران")
     )
 
     return {
@@ -3983,7 +3987,10 @@ def pricing(
         "amount": amount,
         "currency": currency,
         "iran_method": "bank_transfer",
-        "international_method": "USDT",
+        "international_method": "usdt",
+        "required_method": (
+            "bank_transfer" if is_iran else "usdt"
+        ),
     }
 
 
