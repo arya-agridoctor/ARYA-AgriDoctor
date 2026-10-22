@@ -112,9 +112,28 @@ class AryaApiClient {
   }
 
   Future<bool> isLoggedIn() async {
-    final token = await getToken();
-    return token != null && token.trim().isNotEmpty;
+  final token = await getToken();
+
+  if (token == null || token.trim().isEmpty) {
+    return false;
   }
+
+  try {
+    await me();
+    return true;
+  } on AryaApiException catch (e) {
+    if (e.statusCode == 401 || e.statusCode == 403) {
+      await clearToken();
+      return false;
+    }
+
+    // خطای موقت سرور نباید باعث حذف توکن شود.
+    return false;
+  } catch (_) {
+    // قطع اینترنت یا خطای ارتباطی؛ توکن را حذف نکن.
+    return false;
+  }
+}
 
   Future<Map<String, dynamic>> get(
     String path, {
