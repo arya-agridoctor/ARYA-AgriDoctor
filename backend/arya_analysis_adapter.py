@@ -565,44 +565,47 @@ def _normalize_context(
 # Main analysis function
 # ------------------------------------------------------------
 
+# ------------------------------------------------------------
+# Main analysis function
+# ------------------------------------------------------------
+
 def run_analysis(
     prompt: str = "",
     context: Optional[Dict[str, Any]] = None,
     language: str = "fa",
 ) -> Dict[str, Any]:
     """
-    Run the agricultural analysis engine.
+    Run the specialist agricultural engine with recovery support.
 
-    Public error responses do not expose exception strings,
-    filesystem paths, or traceback data.
+    Preserve the original engine response whenever possible.
+    If the engine fails or returns no useful answer, provide
+    targeted follow-up questions instead of a generic dead end.
     """
+
+    prompt_text = ""
+    safe_context: Dict[str, Any] = {}
+    effective_language = DEFAULT_LANGUAGE
+    normalized: Dict[str, Any] = {}
 
     try:
         prompt_text = _validate_prompt(prompt)
 
-        if context is not None and not isinstance(
-            context,
-            dict,
-        ):
+        if context is not None and not isinstance(context, dict):
             context = _as_dict(context)
 
-        safe_context = _sanitize_context_value(
+        safe_context_value = _sanitize_context_value(
             context or {}
         )
 
-        if not isinstance(safe_context, dict):
+        if not isinstance(safe_context_value, dict):
             return _error_response(
                 "invalid_context",
                 "ساختار اطلاعات تحلیل معتبر نیست.",
             )
 
-        normalized = _normalize_context(
-            safe_context
-        )
+        safe_context = safe_context_value
+        normalized = _normalize_context(safe_context)
 
-        # Explicit language parameter takes precedence only when
-        # it is actually provided and non-empty. Otherwise use the
-        # language contained in the context.
         effective_language = _normalize_language(
             language
             if _safe_text(language)
@@ -626,8 +629,6 @@ def run_analysis(
             ),
         }
 
-        # Only pass keyword arguments supported by the
-        # ARYA analysis engine's established interface.
         result = analyze_agriculture(
             crop=normalized.get("crop"),
             plant=normalized.get("plant"),
@@ -644,16 +645,92 @@ def run_analysis(
             extra_data=extra_data,
         )
 
-        if result is None:
-            return _error_response(
-                "empty_result",
-                "موتور تحلیل نتیجه‌ای برنگرداند.",
+        if isinstance(result, dict):
+            output = _attach_adapter_metadata(result)
+
+            if output["ok"]:
+                recovery = build_recovery_response(
+                    prompt=user_question or prompt_text,
+                    context=safe_context,
+                    language=effective_language,
+                    specialist_result=result,
+                )
+
+                if isinstance(recovery, dict):
+                    # Keep every original engine field intact.
+                    output["recovery"] = recovery
+
+                    # Expose the useful answer at the top level
+                    # for clients that display a single answer.
+                    answer = _safe_text(
+                        recovery.get("answer")
+                    )
+
+                    if answer:
+                        output["answer"] = answer
+
+                    output["needs_more_information"] = bool(
+                        recovery.get("needs_more_information", False)
+                    )
+
+                    questions = recovery.get(
+                        "follow_up_questions",
+                        [],
+                    )
+
+                    output["follow_up_questions"] = (
+                        questions
+                        if isinstance(questions, list)
+                        else []
+                    )
+
+                    output["response_source"] = (
+                        recovery.get("source", "specialist_engine")
+                    )
+
+                return output
+
+            logger.warning(
+                "Specialist engine reported failure; "
+                "attempting recovery. status=%s",
+                _safe_engine_status(result),
             )
 
-        if not isinstance(result, dict):
-            # Preserve compatibility with non-dictionary engine
-            # results, but do not claim that the result is a
-            # structured agricultural diagnosis.
+            recovery = build_recovery_response(
+                prompt=user_question or prompt_text,
+                context=safe_context,
+                language=effective_language,
+                specialist_result=result,
+            )
+
+            output["recovery"] = recovery
+
+            if isinstance(recovery, dict):
+                output["answer"] = _safe_text(
+                    recovery.get("answer")
+                )
+                output["needs_more_information"] = bool(
+                    recovery.get("needs_more_information", True)
+                )
+
+                questions = recovery.get(
+                    "follow_up_questions",
+                    [],
+                )
+
+                output["follow_up_questions"] = (
+                    questions if isinstance(questions, list) else []
+                )
+
+                output["response_source"] = recovery.get(
+                    "source",
+                    "recovery",
+                )
+
+            return output
+
+        if result is not None:
+            # Preserve non-dictionary engine results for compatibility.
             return {
                 "ok": True,
                 "engine": ENGINE_NAME,
@@ -665,19 +742,46 @@ def run_analysis(
                 },
             }
 
-        output = _attach_adapter_metadata(result)
+        logger.warning(
+            "Specialist engine returned an empty result; "
+            "attempting recovery."
+        )
 
-        if not output["ok"]:
-            logger.warning(
-                "Agricultural analysis engine reported a failure. "
-                "status=%s",
-                _safe_engine_status(result),
-            )
+        recovery = build_recovery_response(
+            prompt=(
+                normalized.get("user_question")
+                or prompt_text
+            ),
+            context=safe_context,
+            language=effective_language,
+            specialist_result=None,
+        )
 
-        return output
+        return {
+            "ok": False,
+            "engine": ENGINE_NAME,
+            "status": "empty_result",
+            "message": "موتور تحلیل نتیجه‌ای برنگرداند.",
+            "answer": _safe_text(
+                recovery.get("answer")
+                if isinstance(recovery, dict)
+                else ""
+            ),
+            "recovery": recovery,
+            "needs_more_information": True,
+            "follow_up_questions": (
+                recovery.get("follow_up_questions", [])
+                if isinstance(recovery, dict)
+                else []
+            ),
+            "response_source": "recovery",
+            "adapter": {
+                "name": ADAPTER_NAME,
+                "version": ADAPTER_VERSION,
+            },
+        }
 
     except ValueError as exc:
-        # Validation messages originate from this adapter.
         return _error_response(
             "invalid_input",
             str(exc),
@@ -688,20 +792,65 @@ def run_analysis(
             "Analysis engine signature or input type mismatch."
         )
 
-        return _error_response(
+        recovery = build_recovery_response(
+            prompt=prompt_text,
+            context=safe_context,
+            language=effective_language,
+            specialist_result=None,
+        )
+
+        response = _error_response(
             "engine_signature_error",
             "امضای موتور تحلیل یا نوع ورودی با Adapter سازگار نیست.",
         )
+        response["recovery"] = recovery
+        response["answer"] = _safe_text(
+            recovery.get("answer")
+            if isinstance(recovery, dict)
+            else ""
+        )
+        response["response_source"] = "recovery"
+        return response
 
     except Exception:
         logger.exception(
             "Unexpected error while running agricultural analysis."
         )
 
-        return _error_response(
-            "error",
-            "در اجرای تحلیل خطایی رخ داد. لطفاً بعداً دوباره تلاش کنید.",
+        try:
+            recovery = build_recovery_response(
+                prompt=prompt_text,
+                context=safe_context,
+                language=effective_language,
+                specialist_result=None,
+            )
+        except Exception:
+            logger.exception(
+                "Agricultural recovery module also failed."
+            )
+            recovery = {}
+
+        response = _error_response(
+            "engine_error",
+            "موتور تحلیل در دسترس نیست؛ اطلاعات بیشتری ارائه کنید "
+            "یا کمی بعد دوباره تلاش کنید.",
         )
+
+        response["recovery"] = recovery
+        response["answer"] = _safe_text(
+            recovery.get("answer")
+            if isinstance(recovery, dict)
+            else ""
+        )
+        response["needs_more_information"] = True
+        response["follow_up_questions"] = (
+            recovery.get("follow_up_questions", [])
+            if isinstance(recovery, dict)
+            else []
+        )
+        response["response_source"] = "recovery"
+
+        return response
 
 
 # ------------------------------------------------------------
